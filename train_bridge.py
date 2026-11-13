@@ -350,11 +350,13 @@ class EnViS2STSystem(nn.Module):
 # ==============================================================================
 
 class RealStreamingSpeechPipeline:
-    """Nạp dữ liệu âm thanh thật trực tuyến En-Vi không tốn ổ cứng."""
+    """Nạp dữ liệu âm thanh thật trực tuyến En-Vi với căn chỉnh song song bằng trường 'id' (FLoRes)."""
     def __init__(self, split='train', max_sec=15.0):
         self.split = split
         self.max_sec = max_sec
         self.is_online = False
+        self._parallel_pairs = []  # Danh sách cặp (en_item, vi_item) đã căn chỉnh song song
+        self._pair_index = 0
         try:
             import soundfile
         except ImportError:
@@ -375,12 +377,38 @@ class RealStreamingSpeechPipeline:
                 self.ds_vi = self.ds_vi.cast_column('audio', Audio(decode=False))
             except Exception:
                 pass
-            self.iter_en = iter(self.ds_en)
-            self.iter_vi = iter(self.ds_vi)
             self.is_online = True
             print("✓ Kết nối dữ liệu thật thành công qua Streaming!")
+            # Căn chỉnh song song En-Vi bằng trường 'id' (mỗi id ↔ 1 câu FLoRes duy nhất)
+            self._build_parallel_pairs()
         except Exception as e:
             print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu âm học chuẩn xác.")
+            self.is_online = False
+
+    def _build_parallel_pairs(self):
+        """Buffer toàn bộ Vi items theo 'id', rồi match từng En item → cặp song song chính xác."""
+        print("🔗 Đang căn chỉnh song song En-Vi bằng trường 'id' (FLoRes sentence ID)...")
+        vi_by_id = {}
+        count_vi = 0
+        for item in self.ds_vi:
+            fid = item.get('id')
+            if fid is not None and fid not in vi_by_id:
+                vi_by_id[fid] = item
+                count_vi += 1
+        print(f"   → Đã nạp {count_vi} câu Vi (unique ID).")
+
+        pairs = []
+        count_en = 0
+        for item in self.ds_en:
+            fid = item.get('id')
+            if fid is not None and fid in vi_by_id:
+                pairs.append((item, vi_by_id[fid]))
+                count_en += 1
+        self._parallel_pairs = pairs
+        self._pair_index = 0
+        print(f"   → Căn chỉnh thành công {len(pairs)} cặp song song En↔Vi!")
+        if len(pairs) == 0:
+            print("[Cảnh báo] Không tìm được cặp song song nào! Kiểm tra trường 'id' trong dataset.")
             self.is_online = False
 
     def _extract_audio_tensor(self, audio_data):
@@ -416,11 +444,13 @@ class RealStreamingSpeechPipeline:
         transcripts = []
         en_transcripts = []
 
-        if self.is_online:
+        if self.is_online and self._parallel_pairs:
             for _ in range(batch_size):
                 try:
-                    item_en = next(self.iter_en)
-                    item_vi = next(self.iter_vi)
+                    if self._pair_index >= len(self._parallel_pairs):
+                        self._pair_index = 0  # Wrap-around khi hết dữ liệu
+                    item_en, item_vi = self._parallel_pairs[self._pair_index]
+                    self._pair_index += 1
                     w_en = self._extract_audio_tensor(item_en['audio'])
                     w_vi = self._extract_audio_tensor(item_vi['audio'])
                     src_waves.append(w_en)
@@ -428,10 +458,9 @@ class RealStreamingSpeechPipeline:
                     transcripts.append(item_vi.get('transcription', 'xin chào việt nam'))
                     en_transcripts.append(item_en.get('transcription', 'hello world'))
                 except Exception as ex:
-                    print(f"[Data Info] Thử nạp lại luồng stream ({ex})...")
-                    self.iter_en = iter(self.ds_en)
-                    self.iter_vi = iter(self.ds_vi)
-                    break
+                    print(f"[Data Info] Lỗi nạp cặp song song ({ex}), bỏ qua...")
+                    self._pair_index += 1
+                    continue
 
         # Fallback tạo sóng âm hài chuẩn nếu mạng nghẽn hoặc offline
         while len(src_waves) < batch_size:

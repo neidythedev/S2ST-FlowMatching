@@ -27,8 +27,13 @@ import wave
 from collections import Counter
 from pathlib import Path
 
-# Tắt toàn bộ các cảnh báo không cần thiết từ transformers
+# Tắt toàn bộ các cảnh báo không cần thiết từ transformers và HuggingFace
 warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 
 # ==============================================================================
 # RUNTIME RESILIENCE: TORCHAUDIO IN-MEMORY MOCK (PYTHON 3.13 ABI GUARD)
