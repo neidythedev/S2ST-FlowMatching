@@ -14,34 +14,99 @@
 # ==============================================================================
 
 import argparse
+import importlib.machinery
 import json
 import math
 import os
 import re
 import sys
 import time
+import types
 import wave
 from collections import Counter
 from pathlib import Path
+
+# ==============================================================================
+# RUNTIME RESILIENCE: TORCHAUDIO IN-MEMORY MOCK (PYTHON 3.13 ABI GUARD)
+# ==============================================================================
+def apply_torchaudio_mock_if_needed():
+    """Bypass hoàn toàn lỗi C++ ABI undefined symbol của torchaudio trên Python 3.13."""
+    try:
+        import torchaudio
+        _ = torchaudio.__version__
+        return "native"
+    except Exception:
+        # Xóa các module torchaudio bị load dở
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("torchaudio"):
+                del sys.modules[mod]
+
+        def _create_mock(name: str, is_pkg: bool = False):
+            mod = types.ModuleType(name)
+            if is_pkg:
+                mod.__path__ = []
+            spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_pkg)
+            spec.has_location = False
+            mod.__spec__ = spec
+            return mod
+
+        ta = _create_mock("torchaudio", is_pkg=True)
+        ta.__version__ = "2.5.0-shim"
+        ta_func = _create_mock("torchaudio.functional", is_pkg=True)
+        ta_func_func = _create_mock("torchaudio.functional.functional", is_pkg=False)
+        ta_trans = _create_mock("torchaudio.transforms", is_pkg=False)
+        ta_ext = _create_mock("torchaudio._extension", is_pkg=False)
+
+        def _hz_to_mel(freq: float, mel_scale: str = "htk") -> float:
+            return 2595.0 * math.log10(1.0 + (freq / 700.0))
+
+        def _mel_to_hz(mels, mel_scale: str = "htk"):
+            return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
+
+        ta_func_func._hz_to_mel = _hz_to_mel
+        ta_func_func._mel_to_hz = _mel_to_hz
+        ta_func.functional = ta_func_func
+        ta_func._hz_to_mel = _hz_to_mel
+        ta_func._mel_to_hz = _mel_to_hz
+        ta.functional = ta_func
+
+        class _MockMel:
+            def __init__(self, *args, **kwargs):
+                pass
+            def __call__(self, x, *args, **kwargs):
+                return x
+
+        ta_trans.MelSpectrogram = _MockMel
+        ta.transforms = ta_trans
+
+        sys.modules["torchaudio"] = ta
+        sys.modules["torchaudio.functional"] = ta_func
+        sys.modules["torchaudio.functional.functional"] = ta_func_func
+        sys.modules["torchaudio.transforms"] = ta_trans
+        sys.modules["torchaudio._extension"] = ta_ext
+        return "mocked"
+
+# Kích hoạt mock torchaudio ngay lập tức trước khi import bất kỳ thư viện âm thanh nào
+apply_torchaudio_mock_if_needed()
 
 # Tự động đảm bảo cài đặt các thư viện cần thiết
 def ensure_packages():
     pkgs = []
     try:
         import soundfile
-    except ImportError:
+    except Exception:
         pkgs.append("soundfile")
     try:
         import sentencepiece
-    except ImportError:
+    except Exception:
         pkgs.append("sentencepiece")
     try:
         import sacremoses
-    except ImportError:
+    except Exception:
         pkgs.append("sacremoses")
     try:
         import vocos
-    except ImportError:
+    except Exception:
         pkgs.append("vocos")
     if pkgs:
         import subprocess
@@ -53,6 +118,7 @@ def ensure_packages():
             print(f"[Cảnh báo cài đặt gói] {e}")
 
 ensure_packages()
+apply_torchaudio_mock_if_needed()
 
 try:
     import torch

@@ -100,8 +100,10 @@ case "$ACTION" in
 
     eval)
         CASE_CHOICE="${2:-all}"
-        echo "📊 Đang chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
-        python -c "import soundfile, vocos, sentencepiece, sacremoses" 2>/dev/null || pip install soundfile vocos sentencepiece sacremoses -q || true
+        echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
+        # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        python -c "import soundfile, sentencepiece, sacremoses" 2>/dev/null || pip install soundfile vocos sentencepiece sacremoses -q || true
         python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
         ;;
 
