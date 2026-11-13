@@ -22,9 +22,13 @@ import re
 import sys
 import time
 import types
+import warnings
 import wave
 from collections import Counter
 from pathlib import Path
+
+# Tắt toàn bộ các cảnh báo không cần thiết từ transformers
+warnings.filterwarnings("ignore")
 
 # ==============================================================================
 # RUNTIME RESILIENCE: TORCHAUDIO IN-MEMORY MOCK (PYTHON 3.13 ABI GUARD)
@@ -276,19 +280,12 @@ def transcribe_vi_audio(wav_tensor, sample_rate, asr_feat, asr_tok, asr_mod, dev
         in_feats = in_proc.input_features.to(device)
         in_mask = in_proc.attention_mask.to(device) if "attention_mask" in in_proc else None
         
-        forced_ids = None
-        try:
-            forced_ids = asr_tok.get_decoder_prompt_ids(language="vi", task="transcribe")
-        except Exception:
-            pass
-        
         with torch.no_grad():
-            gen_kwargs = {"max_new_tokens": 128}
-            if forced_ids is not None:
-                gen_kwargs["forced_decoder_ids"] = forced_ids
-            else:
-                gen_kwargs["language"] = "vi"
-                gen_kwargs["task"] = "transcribe"
+            gen_kwargs = {
+                "max_new_tokens": 128,
+                "language": "vi",
+                "task": "transcribe"
+            }
             if in_mask is not None:
                 gen_kwargs["attention_mask"] = in_mask
             gen_tokens = asr_mod.generate(in_feats, **gen_kwargs)
@@ -524,19 +521,12 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools=Non
         in_feats = in_proc.input_features.to(device)
         in_mask = in_proc.attention_mask.to(device) if "attention_mask" in in_proc else None
 
-        forced_ids = None
-        try:
-            forced_ids = asr_tokenizer.get_decoder_prompt_ids(language="en", task="transcribe")
-        except Exception:
-            pass
-
         with torch.no_grad():
-            gen_kwargs = {"max_new_tokens": 128}
-            if forced_ids is not None:
-                gen_kwargs["forced_decoder_ids"] = forced_ids
-            else:
-                gen_kwargs["language"] = "en"
-                gen_kwargs["task"] = "transcribe"
+            gen_kwargs = {
+                "max_new_tokens": 128,
+                "language": "en",
+                "task": "transcribe"
+            }
             if in_mask is not None:
                 gen_kwargs["attention_mask"] = in_mask
             gen_tokens = asr_model.generate(in_feats, **gen_kwargs)

@@ -365,10 +365,16 @@ class RealStreamingSpeechPipeline:
                 pass
 
         try:
-            from datasets import load_dataset
+            from datasets import load_dataset, Audio
             print(f"📡 Đang kết nối Streaming Google FLEURS (En-US & Vi-VN, split='{split}')...")
             self.ds_en = load_dataset('google/fleurs', 'en_us', split=split, streaming=True)
             self.ds_vi = load_dataset('google/fleurs', 'vi_vn', split=split, streaming=True)
+            # Tắt tự động decode qua torchcodec để soundfile giải mã trực tiếp từ raw bytes
+            try:
+                self.ds_en = self.ds_en.cast_column('audio', Audio(decode=False))
+                self.ds_vi = self.ds_vi.cast_column('audio', Audio(decode=False))
+            except Exception:
+                pass
             self.iter_en = iter(self.ds_en)
             self.iter_vi = iter(self.ds_vi)
             self.is_online = True
@@ -376,6 +382,32 @@ class RealStreamingSpeechPipeline:
         except Exception as e:
             print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu âm học chuẩn xác.")
             self.is_online = False
+
+    def _extract_audio_tensor(self, audio_data):
+        import io
+        import soundfile as sf
+        if isinstance(audio_data, dict):
+            if "bytes" in audio_data and audio_data["bytes"]:
+                arr, sr = sf.read(io.BytesIO(audio_data["bytes"]))
+                if arr.ndim > 1:
+                    arr = arr.mean(axis=-1)
+                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+            if "array" in audio_data and audio_data["array"] is not None:
+                arr = audio_data["array"]
+                if hasattr(arr, "ndim") and arr.ndim > 1:
+                    arr = arr.mean(axis=-1)
+                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+            if "path" in audio_data and os.path.exists(audio_data["path"]):
+                arr, sr = sf.read(audio_data["path"])
+                if arr.ndim > 1:
+                    arr = arr.mean(axis=-1)
+                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+        elif isinstance(audio_data, str) and os.path.exists(audio_data):
+            arr, sr = sf.read(audio_data)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+        raise ValueError("Không tìm thấy audio hợp lệ")
 
     def fetch_batch(self, batch_size=4, return_en_text=False):
         src_waves = []
@@ -388,16 +420,14 @@ class RealStreamingSpeechPipeline:
                 try:
                     item_en = next(self.iter_en)
                     item_vi = next(self.iter_vi)
-                    arr_en = item_en['audio']['array']
-                    arr_vi = item_vi['audio']['array']
-                    w_en = torch.from_numpy(arr_en).float()[:int(16000 * self.max_sec)]
-                    w_vi = torch.from_numpy(arr_vi).float()[:int(16000 * self.max_sec)]
+                    w_en = self._extract_audio_tensor(item_en['audio'])
+                    w_vi = self._extract_audio_tensor(item_vi['audio'])
                     src_waves.append(w_en)
                     tgt_waves.append(w_vi)
                     transcripts.append(item_vi.get('transcription', 'xin chào việt nam'))
                     en_transcripts.append(item_en.get('transcription', 'hello world'))
                 except Exception as ex:
-                    print(f"[Data Info] Đang nạp lại stream ({ex})...")
+                    print(f"[Data Info] Thử nạp lại luồng stream ({ex})...")
                     self.iter_en = iter(self.ds_en)
                     self.iter_vi = iter(self.ds_vi)
                     break
