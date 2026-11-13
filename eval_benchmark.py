@@ -66,6 +66,17 @@ def load_vocos(device):
     """Nạp Vocos 24kHz để giải mã 100-mel sang waveform."""
     try:
         from vocos import Vocos
+    except ImportError:
+        try:
+            import subprocess
+            print("⏳ Đang tự động cài vocos để giải mã âm thanh 24kHz...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "vocos", "soundfile", "-q"])
+            from vocos import Vocos
+        except Exception:
+            pass
+
+    try:
+        from vocos import Vocos
         Vocos.load_state_dict = lambda self, state_dict, **kwargs: nn.Module.load_state_dict(self, state_dict, strict=False)
         vocos = Vocos.from_pretrained('charactr/vocos-mel-24khz').to(device).eval()
         print("✓ Đã nạp thành công Pretrained Vocos 24kHz.")
@@ -243,9 +254,25 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
     asr_proc = WhisperProcessor.from_pretrained("openai/whisper-small")
     asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device).eval()
 
-    # Nạp MT Opus-MT
-    mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-vi")
-    mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-vi").to(device).eval()
+    # Nạp MT Opus-MT (tự động đảm bảo sentencepiece và sacremoses)
+    try:
+        import sentencepiece
+    except ImportError:
+        try:
+            import subprocess
+            print("⏳ Đang tự động cài sentencepiece & sacremoses cho Opus-MT...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "sentencepiece", "sacremoses", "-q"])
+        except Exception as e:
+            print(f"[Cảnh báo cài đặt] {e}")
+
+    try:
+        from transformers import MarianTokenizer, MarianMTModel
+        mt_tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-vi")
+        mt_model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-vi").to(device).eval()
+    except Exception:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-vi")
+        mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-vi").to(device).eval()
 
     # Nạp TTS MMS-TTS-Vie
     tts_tok = AutoTokenizer.from_pretrained("facebook/mms-tts-vie")
