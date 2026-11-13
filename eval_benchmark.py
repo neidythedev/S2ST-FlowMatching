@@ -151,11 +151,13 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
         # Giải mã Vocos
         gen_wav = None
-        gen_duration = 0.0
         if vocos is not None:
             with torch.no_grad():
                 gen_wav = vocos.decode(gen_mel.float()).squeeze().cpu()
             gen_duration = len(gen_wav) / 24000.0
+        else:
+            # Fallback tính duration trực tiếp từ số frame Mel (hop=256, sr=24000)
+            gen_duration = (gen_mel.shape[-1] * 256.0) / 24000.0
 
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
