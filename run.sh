@@ -73,13 +73,20 @@ case "$ACTION" in
         echo "✓ Đồng bộ hoàn tất lên Google Drive!"
         ;;
 
+    eval)
+        CASE_CHOICE="${2:-1}"
+        echo "📊 Đang chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
+        python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
+        ;;
+
     *)
         echo "=========================================================="
-        echo "💡 CÚ PHÁP CHUẨN ĐÚNG 3 LỆNH DUY NHẤT:"
-        echo "  bash run.sh start [tên_exp]   -> Chạy huấn luyện ngầm"
-        echo "  bash run.sh logs [tên_exp]    -> Xem log trực tiếp"
-        echo "  bash run.sh stop [tên_exp]    -> Dừng huấn luyện"
-        echo "  bash run.sh sync [tên_exp]    -> Đẩy checkpoint lên Drive"
+        echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH:"
+        echo "  bash run.sh start [tên_exp]    -> Chạy huấn luyện ngầm"
+        echo "  bash run.sh logs [tên_exp]     -> Xem log trực tiếp"
+        echo "  bash run.sh eval [1|2|3|4|all] -> Chạy benchmark đo metric"
+        echo "  bash run.sh stop [tên_exp]     -> Dừng huấn luyện"
+        echo "  bash run.sh sync [tên_exp]     -> Đẩy checkpoint lên Drive"
         echo "=========================================================="
         exit 1
         ;;
