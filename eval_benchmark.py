@@ -416,6 +416,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
         results.append({
             "sample_id": idx + 1,
+            "ref_en_text": en_texts[0] if en_texts else "",
             "ref_text": ref_text,
             "asr_transcribed_vi": asr_transcribed_vi,
             "rtf": round(rtf, 4),
@@ -617,6 +618,225 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools=Non
 
     return summary
 
+def generate_audio_gallery_html(output_dir):
+    """Tạo trang web dashboard HTML cho phép người dùng nghe trực tiếp toàn bộ các audio samples."""
+    html_path = os.path.join(output_dir, "index.html")
+    
+    c0_json = os.path.join(output_dir, "case_0", "metrics.json")
+    c4_json = os.path.join(output_dir, "case_4", "metrics.json")
+    
+    samples_c0 = {}
+    if os.path.exists(c0_json):
+        try:
+            with open(c0_json, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                for s in d.get("samples", []):
+                    samples_c0[s["sample_id"]] = s
+        except Exception:
+            pass
+
+    samples_c4 = {}
+    if os.path.exists(c4_json):
+        try:
+            with open(c4_json, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                for s in d.get("samples", []):
+                    samples_c4[s["sample_id"]] = s
+        except Exception:
+            pass
+
+    sample_ids = sorted(list(set(list(samples_c0.keys()) + list(samples_c4.keys()))))
+    if not sample_ids:
+        sample_ids = list(range(1, 11))
+
+    rows_html = []
+    for sid in sample_ids:
+        s0 = samples_c0.get(sid, {})
+        s4 = samples_c4.get(sid, {})
+        
+        ref_en = s0.get("asr_en") or s4.get("ref_en_text") or "English speech sample"
+        ref_vi = s0.get("ref_vi_text") or s4.get("ref_text") or "Câu dịch tiếng Việt chuẩn"
+        mt_vi = s0.get("mt_vi", "")
+        c4_asr = s4.get("asr_transcribed_vi", "")
+        
+        src_wav = f"case_0/wavs/sample_{sid:03d}_src.wav"
+        if not os.path.exists(os.path.join(output_dir, src_wav)):
+            src_wav = f"case_4/wavs/sample_{sid:03d}_src.wav"
+            
+        tgt_wav = f"case_0/wavs/sample_{sid:03d}_tgt.wav"
+        if not os.path.exists(os.path.join(output_dir, tgt_wav)):
+            tgt_wav = f"case_4/wavs/sample_{sid:03d}_tgt.wav"
+            
+        c0_wav = f"case_0/wavs/sample_{sid:03d}_case0_cascaded.wav"
+        c4_wav = f"case_4/wavs/sample_{sid:03d}_case4_gen.wav"
+
+        rows_html.append(f"""
+        <tr>
+            <td class="id-col"><b>#{sid:02d}</b></td>
+            <td>
+                <div class="audio-box">
+                    <span class="badge badge-src">🇺🇸 Tiếng Anh đầu vào</span>
+                    <audio controls preload="none" src="{src_wav}"></audio>
+                    <p class="transcript">"{ref_en}"</p>
+                </div>
+            </td>
+            <td>
+                <div class="audio-box">
+                    <span class="badge badge-c0">⚙️ Cascaded Baseline</span>
+                    <audio controls preload="none" src="{c0_wav}"></audio>
+                    <p class="transcript">MT: "{mt_vi}"</p>
+                    <span class="metric-pill">RTF: {s0.get('rtf', 0.0):.4f} | BLEU: {s0.get('asr_bleu', 0.0):.1f}</span>
+                </div>
+            </td>
+            <td>
+                <div class="audio-box">
+                    <span class="badge badge-c4">✨ Đề xuất (Flow Matching)</span>
+                    <audio controls preload="none" src="{c4_wav}"></audio>
+                    <p class="transcript">ASR: "{c4_asr}"</p>
+                    <span class="metric-pill highlight">RTF: {s4.get('rtf', 0.0):.4f} | SECS: {s4.get('secs_timbre', 0.0):.4f} | BLEU: {s4.get('asr_bleu', 0.0):.1f}</span>
+                </div>
+            </td>
+            <td>
+                <div class="audio-box">
+                    <span class="badge badge-tgt">🎯 Tiếng Việt chuẩn (FLEURS)</span>
+                    <audio controls preload="none" src="{tgt_wav}"></audio>
+                    <p class="transcript">"{ref_vi}"</p>
+                </div>
+            </td>
+        </tr>
+        """)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎧 Trình Nghe & So Sánh Mẫu Dịch Tiếng Nói (S2ST En-Vi)</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0b0f19;
+            color: #f1f5f9;
+            margin: 0;
+            padding: 24px;
+        }}
+        h1 {{
+            color: #38bdf8;
+            margin-bottom: 8px;
+            font-size: 24px;
+        }}
+        p.subtitle {{
+            color: #94a3b8;
+            margin-top: 0;
+            margin-bottom: 24px;
+            font-size: 14px;
+        }}
+        .table-container {{
+            overflow-x: auto;
+            background: #1e293b;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+            border: 1px solid #334155;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }}
+        th {{
+            background: #0f172a;
+            color: #cbd5e1;
+            padding: 14px 16px;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-bottom: 2px solid #334155;
+        }}
+        td {{
+            padding: 16px;
+            border-bottom: 1px solid #334155;
+            vertical-align: top;
+        }}
+        tr:hover td {{
+            background-color: #1e293b;
+        }}
+        .id-col {{
+            color: #38bdf8;
+            font-size: 16px;
+            text-align: center;
+            width: 40px;
+        }}
+        .audio-box {{
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 240px;
+        }}
+        audio {{
+            width: 100%;
+            height: 36px;
+            border-radius: 6px;
+        }}
+        .transcript {{
+            margin: 0;
+            font-size: 13px;
+            color: #cbd5e1;
+            line-height: 1.4;
+            font-style: italic;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            width: fit-content;
+        }}
+        .badge-src {{ background: #334155; color: #94a3b8; }}
+        .badge-c0 {{ background: #475569; color: #f8fafc; }}
+        .badge-c4 {{ background: #0284c7; color: #ffffff; }}
+        .badge-tgt {{ background: #059669; color: #ffffff; }}
+        .metric-pill {{
+            font-size: 11px;
+            color: #94a3b8;
+            background: #0f172a;
+            padding: 4px 8px;
+            border-radius: 4px;
+            width: fit-content;
+            font-family: monospace;
+        }}
+        .metric-pill.highlight {{
+            color: #38bdf8;
+            border: 1px solid #0284c7;
+        }}
+    </style>
+</head>
+<body>
+    <h1>🎧 Bảng Nghe Thử & Đối Chứng Mẫu Dịch Tiếng Nói S2ST (Google FLEURS En-Vi)</h1>
+    <p class="subtitle">So sánh trực tiếp chất lượng âm sắc và độ chuẩn xác ngữ nghĩa giữa Cascaded Baseline và Mô hình đề xuất (Flow Matching).</p>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>1. Giọng Anh nguồn (FLEURS Input)</th>
+                    <th>2. Cascaded Baseline (Whisper + Opus + MMS)</th>
+                    <th>3. Mô hình đề xuất (ToneAware Bridge + CFM)</th>
+                    <th>4. Giọng Việt tham chiếu (Target FLEURS)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows_html)}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"🌐 Trình nghe thử audio trực quan đã được tạo tại: {html_path}\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline Benchmark S2ST: Pretrained Baseline vs Proposed System")
     parser.add_argument("--case", type=str, default="1",
@@ -708,6 +928,7 @@ def main():
                 note = "Thử nghiệm S2ST"
             f.write(f"| **{s['case_name']}** | {s['avg_rtf']:.4f} | {s['avg_mel_l1_error']:.4f} | {s['avg_secs_timbre']:.4f} | {s.get('avg_asr_bleu', 0.0):.2f} | {note} |\n")
     print(f"📁 Báo cáo tổng hợp đã lưu tại: {summary_md_path}\n")
+    generate_audio_gallery_html(args.output_dir)
 
 if __name__ == "__main__":
     main()

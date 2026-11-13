@@ -83,9 +83,12 @@ case "$ACTION" in
         ;;
 
     sync)
-        echo "☁️ Đang đồng bộ Checkpoints & Logs lên Google Drive..."
+        echo "☁️ Đang đồng bộ Checkpoints, Logs & Âm thanh outputs lên Google Drive..."
         rclone copy checkpoints/ "gdrive:runs/${EXP_NAME}/checkpoints/" -P || true
         rclone copy "$LOG_DIR" "gdrive:runs/${EXP_NAME}/logs/" -P || true
+        if [ -d "outputs" ]; then
+            rclone copy outputs/ "gdrive:runs/${EXP_NAME}/outputs/" -P || true
+        fi
         echo "✓ Đồng bộ hoàn tất lên Google Drive!"
         ;;
 
