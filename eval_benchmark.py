@@ -364,7 +364,7 @@ def main():
                         help="Tập dữ liệu kiểm thử Google FLEURS: 'test' (mặc định), 'validation', hoặc 'train'")
     parser.add_argument("--bridge-ckpt", type=str, default="checkpoints/bridge-best.pth",
                         help="Đường dẫn checkpoint của Bridge")
-    parser.add_argument("--cfm-ckpt", type=str, default="",
+    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth",
                         help="Đường dẫn checkpoint của CFM")
     parser.add_argument("--num-samples", type=int, default=10,
                         help="Số lượng mẫu test để đánh giá nhanh")
