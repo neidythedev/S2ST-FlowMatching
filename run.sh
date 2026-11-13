@@ -26,7 +26,14 @@ case "$ACTION" in
             sleep 1
         fi
 
-        # 3. Khởi chạy ngầm độc lập (detached background)
+        # 3. Kiểm tra checkpoint cũ để tự động nối tiếp (--resume)
+        EXTRA_ARGS=""
+        if [ -f "checkpoints/${EXP_NAME}-last.pth" ] || [ -f "checkpoints/model-last.pth" ]; then
+            echo "⚡ Phát hiện Checkpoint lưu trước đó -> Tự động nối tiếp huấn luyện (--resume)!"
+            EXTRA_ARGS="--resume"
+        fi
+
+        # 4. Khởi chạy ngầm độc lập (detached background)
         if [[ "$EXP_NAME" == *"cfm"* ]]; then
             SCRIPT="train_cfm.py"
             CONFIG="configs/stage1_cfm.yaml"
@@ -39,6 +46,7 @@ case "$ACTION" in
         nohup python -u "$SCRIPT" \
             --config "$CONFIG" \
             --exp-name "$EXP_NAME" \
+            $EXTRA_ARGS \
             > "$LOG_FILE" 2>&1 &
         
         echo $! > "$PID_FILE"
@@ -79,6 +87,15 @@ case "$ACTION" in
         rclone copy checkpoints/ "gdrive:runs/${EXP_NAME}/checkpoints/" -P || true
         rclone copy "$LOG_DIR" "gdrive:runs/${EXP_NAME}/logs/" -P || true
         echo "✓ Đồng bộ hoàn tất lên Google Drive!"
+        ;;
+
+    restore)
+        echo "📥 Đang tải Checkpoints từ Google Drive về máy Molab..."
+        if [ -f "tools/setup_rclone.py" ] && [ -f ".env" ] && [ ! -f "$HOME/.config/rclone/rclone.conf" ]; then
+            python tools/setup_rclone.py >/dev/null 2>&1 || true
+        fi
+        rclone copy "gdrive:runs/${EXP_NAME}/checkpoints/" checkpoints/ -P || true
+        echo "✓ Khôi phục Checkpoints thành công từ Google Drive!"
         ;;
 
     eval)
