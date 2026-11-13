@@ -282,10 +282,22 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
         t_start = time.perf_counter()
 
         # 1. ASR: Audio 16k -> English Text
-        in_feats = asr_feat_extractor(src_w.numpy(), sampling_rate=16000, return_tensors="pt").input_features.to(device)
+        in_proc = asr_feat_extractor(
+            src_w.numpy(),
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding="max_length"
+        )
+        in_feats = in_proc.input_features.to(device)
+        if in_feats.shape[-1] < 3000:
+            in_feats = F.pad(in_feats, (0, 3000 - in_feats.shape[-1]))
+        elif in_feats.shape[-1] > 3000:
+            in_feats = in_feats[:, :, :3000]
+
+        forced_ids = asr_tokenizer.get_decoder_prompt_ids(language="english", task="transcribe")
         with torch.no_grad():
-            gen_tokens = asr_model.generate(in_feats, language="en", task="transcribe")
-        pred_en_text = asr_tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+            gen_tokens = asr_model.generate(in_feats, forced_decoder_ids=forced_ids, max_new_tokens=128)
+        pred_en_text = asr_tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0].strip()
 
         # 2. MT: English Text -> Vietnamese Text
         mt_inputs = mt_tok(pred_en_text, return_tensors="pt").to(device)
