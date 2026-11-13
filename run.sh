@@ -30,6 +30,7 @@ case "$ACTION" in
         echo "🚀 Đang khởi chạy '$EXP_NAME' trong tiến trình ngầm..."
         nohup python -u train_bridge.py \
             --config configs/stage2_bridge.yaml \
+            --exp-name "$EXP_NAME" \
             > "$LOG_FILE" 2>&1 &
         
         echo $! > "$PID_FILE"
@@ -83,3 +84,4 @@ case "$ACTION" in
         exit 1
         ;;
 esac
+

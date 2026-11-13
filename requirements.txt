@@ -1,0 +1,6 @@
+torch
+vocos
+transformers
+datasets
+soundfile
+pyyaml
