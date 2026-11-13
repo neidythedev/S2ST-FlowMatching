@@ -1,0 +1,47 @@
+# ==============================================================================
+# CẤU HÌNH HUẤN LUYỆN TONE-AWARE BRIDGE (EN -> VI S2ST)
+# Tuân thủ quy chuẩn SKILL2.md cho Molab GPU Runtime
+# ==============================================================================
+
+model:
+  whisper_model: "openai/whisper-small"
+  encoder_dim: 768
+  bridge_dim: 512
+  bridge_layers: 6
+  bridge_heads: 8
+  n_mels: 100
+  spk_dim: 192
+  decoder_hidden: 384
+  use_tone_head: true
+  num_tones: 6
+
+loss_weights:
+  cfm_weight: 1.0
+  tone_weight: 0.2
+  dur_weight: 0.1
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  learning_rate: 2.0e-4
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  epochs: 20
+  warmup_steps: 150
+  max_grad_norm: 1.0
+  bf16: true
+  save_interval_steps: 250
+  log_interval_steps: 20
+
+data:
+  dataset_name: "google/fleurs"
+  src_lang: "en_us"
+  tgt_lang: "vi_vn"
+  sample_rate_src: 16000
+  sample_rate_tgt: 24000
+  max_audio_sec: 12.0
+  streaming: true
+
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
