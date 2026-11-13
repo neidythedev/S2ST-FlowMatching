@@ -341,14 +341,15 @@ class EnViS2STSystem(nn.Module):
 
 class RealStreamingSpeechPipeline:
     """Nạp dữ liệu âm thanh thật trực tuyến En-Vi không tốn ổ cứng."""
-    def __init__(self, max_sec=6.0):
+    def __init__(self, split='train', max_sec=6.0):
+        self.split = split
         self.max_sec = max_sec
         self.is_online = False
         try:
             from datasets import load_dataset
-            print("📡 Đang kết nối Streaming Google FLEURS (En-US & Vi-VN)...")
-            self.ds_en = load_dataset('google/fleurs', 'en_us', split='train', streaming=True)
-            self.ds_vi = load_dataset('google/fleurs', 'vi_vn', split='train', streaming=True)
+            print(f"📡 Đang kết nối Streaming Google FLEURS (En-US & Vi-VN, split='{split}')...")
+            self.ds_en = load_dataset('google/fleurs', 'en_us', split=split, streaming=True)
+            self.ds_vi = load_dataset('google/fleurs', 'vi_vn', split=split, streaming=True)
             self.iter_en = iter(self.ds_en)
             self.iter_vi = iter(self.ds_vi)
             self.is_online = True

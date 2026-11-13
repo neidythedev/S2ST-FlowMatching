@@ -107,11 +107,12 @@ case "$ACTION" in
     *)
         echo "=========================================================="
         echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH:"
-        echo "  bash run.sh start [tên_exp]    -> Chạy huấn luyện ngầm"
-        echo "  bash run.sh logs [tên_exp]     -> Xem log trực tiếp"
-        echo "  bash run.sh eval [1|2|3|4|all] -> Chạy benchmark đo metric"
-        echo "  bash run.sh stop [tên_exp]     -> Dừng huấn luyện"
-        echo "  bash run.sh sync [tên_exp]     -> Đẩy checkpoint lên Drive"
+        echo "  bash run.sh start [tên_exp]      -> Chạy huấn luyện ngầm"
+        echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"
+        echo "  bash run.sh eval [0|1|2|3|4|all] -> Chạy benchmark đo metric (0: Pretrained Baseline)"
+        echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
+        echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
+        echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"
         echo "=========================================================="
         exit 1
         ;;

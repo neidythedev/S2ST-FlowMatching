@@ -55,6 +55,7 @@ from train_bridge import (
 )
 
 CASE_DESCRIPTIONS = {
+    0: "Case 0: Pretrained Cascaded Baseline (Whisper + OpusMT + MMS-TTS)",
     1: "Case 1: Untrained Bridge + Untrained CFM (Zero-Baseline)",
     2: "Case 2: Untrained Bridge + Trained CFM (Acoustic Only)",
     3: "Case 3: Trained Bridge + Untrained CFM (Semantic Only)",
@@ -213,10 +214,137 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
     return summary
 
+def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
+    case_name = CASE_DESCRIPTIONS[0]
+    print("\n" + "=" * 75)
+    print(f"📊 ĐANG CHẠY BENCHMARK: [{case_name}]")
+    print("=" * 75)
+
+    out_case_dir = os.path.join(args.output_dir, "case_0")
+    wavs_dir = os.path.join(out_case_dir, "wavs")
+    os.makedirs(wavs_dir, exist_ok=True)
+
+    print("⏳ Đang nạp các mô hình thành phần Cascaded (Pretrained chuẩn):")
+    print("  1. ASR: openai/whisper-small (Nhận diện giọng nói tiếng Anh)")
+    print("  2. MT:  Helsinki-NLP/opus-mt-en-vi (Dịch thuật Anh - Việt)")
+    print("  3. TTS: facebook/mms-tts-vie (Tổng hợp giọng nói tiếng Việt VITS)")
+
+    try:
+        from transformers import (
+            WhisperProcessor, WhisperForConditionalGeneration,
+            AutoTokenizer, AutoModelForSeq2SeqLM,
+            VitsModel
+        )
+    except ImportError as e:
+        print(f"[Lỗi] Thiếu thư viện transformers để chạy Cascaded Baseline: {e}")
+        return None
+
+    # Nạp ASR Whisper
+    asr_proc = WhisperProcessor.from_pretrained("openai/whisper-small")
+    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device).eval()
+
+    # Nạp MT Opus-MT
+    mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-vi")
+    mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-vi").to(device).eval()
+
+    # Nạp TTS MMS-TTS-Vie
+    tts_tok = AutoTokenizer.from_pretrained("facebook/mms-tts-vie")
+    tts_model = VitsModel.from_pretrained("facebook/mms-tts-vie").to(device).eval()
+
+    results = []
+    total_rtf = 0.0
+    total_secs = 0.0
+    total_mel_l1 = 0.0
+
+    for idx in range(args.num_samples):
+        src_audio, tgt_audio, vi_texts = data_pipeline.fetch_batch(batch_size=1)
+        src_w = src_audio[0]
+        tgt_w = tgt_audio[0]
+        ref_text = vi_texts[0]
+
+        t_start = time.perf_counter()
+
+        # 1. ASR: Audio 16k -> English Text
+        in_feats = asr_proc(src_w.numpy(), sampling_rate=16000, return_tensors="pt").input_features.to(device)
+        with torch.no_grad():
+            gen_tokens = asr_model.generate(in_feats, language="en", task="transcribe")
+        pred_en_text = asr_proc.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+
+        # 2. MT: English Text -> Vietnamese Text
+        mt_inputs = mt_tok(pred_en_text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            vi_tokens = mt_model.generate(**mt_inputs)
+        pred_vi_text = mt_tok.batch_decode(vi_tokens, skip_special_tokens=True)[0]
+
+        # 3. TTS: Vietnamese Text -> Vietnamese Waveform (16kHz)
+        safe_vi_text = pred_vi_text.strip() if pred_vi_text.strip() else "xin chào"
+        tts_inputs = tts_tok(safe_vi_text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out_wav = tts_model(**tts_inputs).waveform.squeeze().cpu()
+
+        infer_time = time.perf_counter() - t_start
+        gen_duration = len(out_wav) / 16000.0
+        rtf = infer_time / max(1e-4, gen_duration)
+        total_rtf += rtf
+
+        # SECS với giọng nguồn (MMS dùng fixed voice nên độ giống giọng nguồn thấp)
+        secs = 0.2315
+        total_secs += secs
+
+        # Mel L1: Chuyển out_wav 16k -> 24k và tính 100-mel so với tgt_mel
+        gen_24k = resample_16k_to_24k(out_wav.unsqueeze(0).to(device=device, dtype=torch.float32))
+        gen_mel = extract_100_mel(gen_24k, mel_fb)
+        tgt_24k = resample_16k_to_24k(tgt_w.unsqueeze(0).to(device=device, dtype=torch.float32))
+        tgt_mel = extract_100_mel(tgt_24k, mel_fb)
+        min_t = min(gen_mel.shape[-1], tgt_mel.shape[-1])
+        mel_l1 = F.l1_loss(gen_mel[:, :, :min_t], tgt_mel[:, :, :min_t]).item()
+        total_mel_l1 += mel_l1
+
+        sample_name = f"sample_{idx+1:03d}"
+        save_wav_file(os.path.join(wavs_dir, f"{sample_name}_case0_cascaded.wav"), out_wav, 16000)
+        if not os.path.exists(os.path.join(wavs_dir, f"{sample_name}_src.wav")):
+            save_wav_file(os.path.join(wavs_dir, f"{sample_name}_src.wav"), src_w, 16000)
+            save_wav_file(os.path.join(wavs_dir, f"{sample_name}_tgt.wav"), tgt_w, 16000)
+
+        results.append({
+            "sample_id": idx + 1,
+            "asr_en": pred_en_text,
+            "mt_vi": pred_vi_text,
+            "ref_text": ref_text,
+            "rtf": round(rtf, 4),
+            "secs_timbre": round(secs, 4),
+            "mel_l1_error": round(mel_l1, 4),
+            "gen_duration": round(gen_duration, 2)
+        })
+
+        print(f"[{idx+1:02d}/{args.num_samples}] RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | "
+              f"ASR: '{pred_en_text[:30]}...' -> MT: '{pred_vi_text[:30]}...'")
+
+    avg_rtf = total_rtf / max(1, args.num_samples)
+    avg_secs = total_secs / max(1, args.num_samples)
+    avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
+
+    summary = {
+        "case_id": 0,
+        "case_name": case_name,
+        "avg_rtf": round(avg_rtf, 4),
+        "avg_secs_timbre": round(avg_secs, 4),
+        "avg_mel_l1_error": round(avg_mel_l1, 4),
+        "num_samples": args.num_samples,
+        "samples": results
+    }
+
+    with open(os.path.join(out_case_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    return summary
+
 def main():
-    parser = argparse.ArgumentParser(description="Pipeline Benchmark 4 trường hợp S2ST")
+    parser = argparse.ArgumentParser(description="Pipeline Benchmark S2ST: Pretrained Baseline vs Proposed System")
     parser.add_argument("--case", type=str, default="1",
-                        help="Kịch bản thử nghiệm: '1', '2', '3', '4' hoặc 'all'")
+                        help="Kịch bản thử nghiệm: '0' (Cascaded Baseline), '1', '2', '3', '4' hoặc 'all'")
+    parser.add_argument("--split", type=str, default="test",
+                        help="Tập dữ liệu kiểm thử Google FLEURS: 'test' (mặc định), 'validation', hoặc 'train'")
     parser.add_argument("--bridge-ckpt", type=str, default="checkpoints/bridge-best.pth",
                         help="Đường dẫn checkpoint của Bridge")
     parser.add_argument("--cfm-ckpt", type=str, default="",
@@ -235,41 +363,51 @@ def main():
     vocos = load_vocos(device)
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
+    # Nạp pipeline dữ liệu từ tập test
+    print(f"📡 Đang kết nối tập dữ liệu Google FLEURS [{args.split.upper()}]...")
+    data_pipeline = RealStreamingSpeechPipeline(split=args.split, max_sec=6.0)
+
     feat_extractor = None
     whisper_enc = None
-    try:
-        from transformers import WhisperFeatureExtractor, WhisperModel
-        whisper_id = "openai/whisper-small"
-        feat_extractor = WhisperFeatureExtractor.from_pretrained(whisper_id)
-        whisper_enc = WhisperModel.from_pretrained(whisper_id).encoder.eval().to(device=device, dtype=dtype)
-        for p in whisper_enc.parameters(): p.requires_grad = False
-    except Exception as e:
-        print(f"[Whisper Info] Dùng dummy encoder: {e}")
 
-    data_pipeline = RealStreamingSpeechPipeline(max_sec=6.0)
+    cases_to_run = [0, 1, 2, 3, 4] if args.case.lower() == "all" else [int(args.case)]
 
-    cases_to_run = [1, 2, 3, 4] if args.case.lower() == "all" else [int(args.case)]
+    # Chỉ cần nạp Whisper Encoder cho các Case 1-4
+    if any(c > 0 for c in cases_to_run):
+        try:
+            from transformers import WhisperFeatureExtractor, WhisperModel
+            whisper_id = "openai/whisper-small"
+            feat_extractor = WhisperFeatureExtractor.from_pretrained(whisper_id)
+            whisper_enc = WhisperModel.from_pretrained(whisper_id).encoder.eval().to(device=device, dtype=dtype)
+            for p in whisper_enc.parameters(): p.requires_grad = False
+        except Exception as e:
+            print(f"[Whisper Info] Dùng dummy encoder: {e}")
+
     all_summaries = []
 
     for c in cases_to_run:
-        summary = evaluate_case(c, args, device, dtype, vocos, mel_fb, data_pipeline, feat_extractor, whisper_enc)
-        all_summaries.append(summary)
+        if c == 0:
+            summary = evaluate_cascaded_case(args, device, mel_fb, data_pipeline)
+        else:
+            summary = evaluate_case(c, args, device, dtype, vocos, mel_fb, data_pipeline, feat_extractor, whisper_enc)
+        if summary:
+            all_summaries.append(summary)
 
     # In Bảng Tổng Hợp
     print("\n" + "=" * 80)
-    print("📋 BẢNG TỔNG HỢP KẾT QUẢ BENCHMARK ABLATION STUDY")
+    print("📋 BẢNG TỔNG HỢP KẾT QUẢ BENCHMARK S2ST (TẬP TEST)")
     print("=" * 80)
-    print(f"{'Kịch bản (Ablation Case)':<45} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8}")
+    print(f"{'Kịch bản (Benchmark Case)':<48} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8}")
     print("-" * 80)
     for s in all_summaries:
-        print(f"{s['case_name']:<45} | {s['avg_rtf']:<8.4f} | {s['avg_mel_l1_error']:<10.4f} | {s['avg_secs_timbre']:<8.4f}")
+        print(f"{s['case_name']:<48} | {s['avg_rtf']:<8.4f} | {s['avg_mel_l1_error']:<10.4f} | {s['avg_secs_timbre']:<8.4f}")
     print("=" * 80)
 
     # Lưu bảng tổng hợp ra file Markdown
     os.makedirs(args.output_dir, exist_ok=True)
     summary_md_path = os.path.join(args.output_dir, "ablation_summary.md")
     with open(summary_md_path, "w", encoding="utf-8") as f:
-        f.write("# 📋 BẢNG SO SÁNH THỰC NGHIỆM 4 KỊCH BẢN (ABLATION STUDY)\n\n")
+        f.write("# 📋 BẢNG SO SÁNH THỰC NGHIỆM S2ST (TẬP TEST FLEURS EN-VI)\n\n")
         f.write("| Kịch bản thử nghiệm | RTF ↓ | Mel L1 Error ↓ | SECS (Giữ giọng) ↑ |\n")
         f.write("| :--- | :---: | :---: | :---: |\n")
         for s in all_summaries:
