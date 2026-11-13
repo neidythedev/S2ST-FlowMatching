@@ -13,16 +13,37 @@ import math
 import os
 import sys
 import time
+import wave
 from pathlib import Path
 
 try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    import soundfile as sf
 except ImportError as e:
     print(f"[Fatal Error] Thiếu thư viện: {e}")
     sys.exit(1)
+
+def save_wav_file(path, audio_tensor, sample_rate=24000):
+    """Lưu file WAV 16-bit PCM thuần Python bằng thư viện chuẩn wave (không cần cài soundfile)."""
+    try:
+        import soundfile as sf
+        sf.write(path, audio_tensor.numpy(), sample_rate)
+    except ImportError:
+        if hasattr(audio_tensor, "cpu"):
+            audio_tensor = audio_tensor.cpu()
+        if hasattr(audio_tensor, "numpy"):
+            arr = audio_tensor.numpy()
+        else:
+            arr = audio_tensor
+        import numpy as np
+        arr_clipped = np.clip(arr, -1.0, 1.0)
+        int16_data = (arr_clipped * 32767.0).astype(np.int16)
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(int16_data.tobytes())
 
 from train_bridge import (
     EnViS2STSystem,
@@ -155,10 +176,10 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
         sample_name = f"sample_{idx+1:03d}"
         if gen_wav is not None:
-            sf.write(os.path.join(wavs_dir, f"{sample_name}_case{case_num}_gen.wav"), gen_wav.numpy(), 24000)
+            save_wav_file(os.path.join(wavs_dir, f"{sample_name}_case{case_num}_gen.wav"), gen_wav, 24000)
             if not os.path.exists(os.path.join(wavs_dir, f"{sample_name}_src.wav")):
-                sf.write(os.path.join(wavs_dir, f"{sample_name}_src.wav"), src_w.numpy(), 16000)
-                sf.write(os.path.join(wavs_dir, f"{sample_name}_tgt.wav"), tgt_w.numpy(), 16000)
+                save_wav_file(os.path.join(wavs_dir, f"{sample_name}_src.wav"), src_w, 16000)
+                save_wav_file(os.path.join(wavs_dir, f"{sample_name}_tgt.wav"), tgt_w, 16000)
 
         results.append({
             "sample_id": idx + 1,
@@ -255,3 +276,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
