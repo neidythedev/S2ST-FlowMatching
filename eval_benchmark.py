@@ -66,23 +66,12 @@ def load_vocos(device):
     """Nạp Vocos 24kHz để giải mã 100-mel sang waveform."""
     try:
         from vocos import Vocos
-    except ImportError:
-        try:
-            import subprocess
-            print("⏳ Đang tự động cài vocos để giải mã âm thanh 24kHz...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "vocos", "soundfile", "-q"])
-            from vocos import Vocos
-        except Exception:
-            pass
-
-    try:
-        from vocos import Vocos
         Vocos.load_state_dict = lambda self, state_dict, **kwargs: nn.Module.load_state_dict(self, state_dict, strict=False)
         vocos = Vocos.from_pretrained('charactr/vocos-mel-24khz').to(device).eval()
         print("✓ Đã nạp thành công Pretrained Vocos 24kHz.")
         return vocos
     except Exception as e:
-        print(f"[Vocos Cảnh báo] Không thể nạp vocos ({e}). Sẽ chỉ lưu Mel tensor.")
+        print(f"[Vocos Cảnh báo] Không thể nạp vocos ({e}). Sẽ tính duration từ Mel frames.")
         return None
 
 def compute_cosine_similarity(vec_a, vec_b):
