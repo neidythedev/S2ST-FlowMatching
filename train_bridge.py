@@ -351,7 +351,7 @@ class EnViS2STSystem(nn.Module):
 
 class RealStreamingSpeechPipeline:
     """Nạp dữ liệu âm thanh thật trực tuyến En-Vi không tốn ổ cứng."""
-    def __init__(self, split='train', max_sec=6.0):
+    def __init__(self, split='train', max_sec=15.0):
         self.split = split
         self.max_sec = max_sec
         self.is_online = False
@@ -386,27 +386,28 @@ class RealStreamingSpeechPipeline:
     def _extract_audio_tensor(self, audio_data):
         import io
         import soundfile as sf
+        limit = int(16000 * self.max_sec) if self.max_sec else None
         if isinstance(audio_data, dict):
             if "bytes" in audio_data and audio_data["bytes"]:
                 arr, sr = sf.read(io.BytesIO(audio_data["bytes"]))
                 if arr.ndim > 1:
                     arr = arr.mean(axis=-1)
-                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+                return torch.from_numpy(arr).float()[:limit]
             if "array" in audio_data and audio_data["array"] is not None:
                 arr = audio_data["array"]
                 if hasattr(arr, "ndim") and arr.ndim > 1:
                     arr = arr.mean(axis=-1)
-                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+                return torch.from_numpy(arr).float()[:limit]
             if "path" in audio_data and os.path.exists(audio_data["path"]):
                 arr, sr = sf.read(audio_data["path"])
                 if arr.ndim > 1:
                     arr = arr.mean(axis=-1)
-                return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+                return torch.from_numpy(arr).float()[:limit]
         elif isinstance(audio_data, str) and os.path.exists(audio_data):
             arr, sr = sf.read(audio_data)
             if arr.ndim > 1:
                 arr = arr.mean(axis=-1)
-            return torch.from_numpy(arr).float()[:int(16000 * self.max_sec)]
+            return torch.from_numpy(arr).float()[:limit]
         raise ValueError("Không tìm thấy audio hợp lệ")
 
     def fetch_batch(self, batch_size=4, return_en_text=False):

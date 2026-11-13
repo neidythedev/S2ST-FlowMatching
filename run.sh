@@ -106,7 +106,7 @@ case "$ACTION" in
         echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
         # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
-        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses sacrebleu -q 2>/dev/null || true
         python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
         ;;
 

@@ -112,6 +112,10 @@ def ensure_packages():
         import vocos
     except Exception:
         pkgs.append("vocos")
+    try:
+        import sacrebleu
+    except Exception:
+        pkgs.append("sacrebleu")
     if pkgs:
         import subprocess
         print(f"⏳ Đang tự động kiểm tra và cài đặt: {', '.join(pkgs)}...")
@@ -195,7 +199,7 @@ def compute_cosine_similarity(vec_a, vec_b):
     return (a * b).sum(dim=-1).mean().item()
 
 def compute_sentence_bleu(hyp_str, ref_str):
-    """Tính điểm BLEU (0 -> 100) giữa câu dịch và câu tham chiếu chuẩn quốc tế."""
+    """Tính điểm BLEU (0 -> 100) chuẩn SacreBLEU giữa câu dịch và câu tham chiếu quốc tế."""
     hyp_clean = str(hyp_str).lower().strip()
     ref_clean = str(ref_str).lower().strip()
     if not hyp_clean or not ref_clean:
@@ -204,11 +208,12 @@ def compute_sentence_bleu(hyp_str, ref_str):
     # Ưu tiên dùng sacrebleu nếu đã cài
     try:
         import sacrebleu
-        return round(sacrebleu.sentence_bleu(hyp_clean, [ref_clean]).score, 2)
+        score = sacrebleu.sentence_bleu(hyp_clean, [ref_clean], smooth_method="exp").score
+        return round(float(score), 2)
     except Exception:
         pass
     
-    # Fallback thuần Python tính BLEU-4 chuẩn xác
+    # Fallback thuần Python tính BLEU với smoothing chuẩn
     hyp_tokens = re.findall(r'\w+', hyp_clean)
     ref_tokens = re.findall(r'\w+', ref_clean)
     len_hyp = len(hyp_tokens)
@@ -219,23 +224,24 @@ def compute_sentence_bleu(hyp_str, ref_str):
     # Brevity Penalty
     bp = 1.0 if len_hyp >= len_ref else math.exp(1.0 - (len_ref / max(1, len_hyp)))
     
-    log_p_sum = 0.0
-    valid_ng = 0
-    for n in range(1, 5):
-        if len_hyp < n:
-            break
+    max_order = min(4, len_hyp)
+    if max_order == 0:
+        return 0.0
+        
+    precisions = []
+    for n in range(1, max_order + 1):
         hyp_ng = [tuple(hyp_tokens[i:i+n]) for i in range(len_hyp - n + 1)]
         ref_ng = [tuple(ref_tokens[i:i+n]) for i in range(len_ref - n + 1)]
         hyp_counts = Counter(hyp_ng)
         ref_counts = Counter(ref_ng)
         clipped = sum(min(count, ref_counts[ng]) for ng, count in hyp_counts.items())
         total_ng = len(hyp_ng)
-        precision = (clipped + 0.1) / (total_ng + 0.1)
-        log_p_sum += 0.25 * math.log(precision)
-        valid_ng += 1
+        if clipped > 0:
+            precisions.append(clipped / total_ng)
+        else:
+            precisions.append(0.1 / total_ng)
     
-    if valid_ng == 0:
-        return 0.0
+    log_p_sum = sum(math.log(p) for p in precisions) / len(precisions)
     bleu = bp * math.exp(log_p_sum) * 100.0
     return round(min(100.0, max(0.0, bleu)), 2)
 
@@ -426,7 +432,13 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
             "gen_duration": round(gen_duration, 2)
         })
 
-        print(f"[{idx+1:02d}/{args.num_samples}] RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
+        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] ------------------------------------------")
+        if en_texts and en_texts[0]:
+            print(f"  🇬🇧 Input Text (En): {en_texts[0]}")
+        if asr_transcribed_vi:
+            print(f"  🎙️ Synthesized ASR: {asr_transcribed_vi}")
+        print(f"  🎯 Reference (Vi) : {ref_text}")
+        print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = total_secs / max(1, args.num_samples)
@@ -594,8 +606,12 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools=Non
             "gen_duration": round(gen_duration, 2)
         })
 
-        print(f"[{idx+1:02d}/{args.num_samples}] RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | ASR-BLEU: {bleu:.2f} | "
-              f"MT: '{pred_vi_text[:25]}...' -> ASR: '{asr_transcribed_vi[:25]}...'")
+        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] ------------------------------------------")
+        print(f"  🇬🇧 Input ASR (En) : {pred_en_text}")
+        print(f"  🇻🇳 Output MT (Vi) : {pred_vi_text}")
+        print(f"  🎙️ Synthesized ASR: {asr_transcribed_vi}")
+        print(f"  🎯 Reference (Vi) : {ref_vi_text}")
+        print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | ASR-BLEU: {bleu:.2f}")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = total_secs / max(1, args.num_samples)
@@ -853,6 +869,8 @@ def main():
                         help="Thư mục xuất file âm thanh và báo cáo")
     parser.add_argument("--num-steps", type=int, default=25,
                         help="Số bước ODE của CFM (mặc định 25)")
+    parser.add_argument("--max-sec", type=float, default=15.0,
+                        help="Độ dài tối đa của file âm thanh (giây). Mặc định 15.0s để dịch trọn vẹn cả câu.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -863,7 +881,7 @@ def main():
 
     # Nạp pipeline dữ liệu từ tập test
     print(f"📡 Đang kết nối tập dữ liệu Google FLEURS [{args.split.upper()}]...")
-    data_pipeline = RealStreamingSpeechPipeline(split=args.split, max_sec=6.0)
+    data_pipeline = RealStreamingSpeechPipeline(split=args.split, max_sec=args.max_sec)
 
     # Nạp mô hình phiên âm tiếng Việt dùng chung để đo ASR-BLEU
     vi_asr_tools = load_vietnamese_asr(device)
