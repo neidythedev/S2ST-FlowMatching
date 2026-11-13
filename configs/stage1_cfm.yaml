@@ -1,0 +1,36 @@
+# ==============================================================================
+# CẤU HÌNH HUẤN LUYỆN STAGE 1: OT-CFM TARGET DECODER (TIẾNG VIỆT)
+# Tuân thủ quy chuẩn SKILL2.md cho Molab GPU Runtime
+# ==============================================================================
+
+model:
+  whisper_model: "openai/whisper-small"
+  encoder_dim: 768
+  cond_dim: 512
+  n_mels: 100
+  spk_dim: 192
+  decoder_hidden: 384
+  num_res_blocks: 4
+
+training:
+  batch_size: 4
+  learning_rate: 2.0e-4
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  epochs: 25
+  steps_per_epoch: 30
+  val_steps: 6
+  max_grad_norm: 1.0
+  bf16: true
+
+data:
+  dataset_name: "google/fleurs"
+  lang: "vi_vn"
+  sample_rate: 24000
+  sample_rate_whisper: 16000
+  max_audio_sec: 10.0
+  streaming: true
+
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"

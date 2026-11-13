@@ -27,9 +27,17 @@ case "$ACTION" in
         fi
 
         # 3. Khởi chạy ngầm độc lập (detached background)
-        echo "🚀 Đang khởi chạy '$EXP_NAME' trong tiến trình ngầm..."
-        nohup python -u train_bridge.py \
-            --config configs/stage2_bridge.yaml \
+        if [[ "$EXP_NAME" == *"cfm"* ]]; then
+            SCRIPT="train_cfm.py"
+            CONFIG="configs/stage1_cfm.yaml"
+        else
+            SCRIPT="train_bridge.py"
+            CONFIG="configs/stage2_bridge.yaml"
+        fi
+
+        echo "🚀 Đang khởi chạy '$EXP_NAME' (Script: $SCRIPT, Config: $CONFIG)..."
+        nohup python -u "$SCRIPT" \
+            --config "$CONFIG" \
             --exp-name "$EXP_NAME" \
             > "$LOG_FILE" 2>&1 &
         
