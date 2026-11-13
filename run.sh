@@ -99,8 +99,9 @@ case "$ACTION" in
         ;;
 
     eval)
-        CASE_CHOICE="${2:-1}"
+        CASE_CHOICE="${2:-all}"
         echo "📊 Đang chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
+        python -c "import soundfile, vocos, sentencepiece, sacremoses" 2>/dev/null || pip install soundfile vocos sentencepiece sacremoses -q || true
         python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
         ;;
 

@@ -150,6 +150,16 @@ def resample_16k_to_24k(audio_16k):
     audio_24k = F.interpolate(audio_16k, size=t_new, mode="linear", align_corners=False)
     return audio_24k.squeeze(1)
 
+def resample_24k_to_16k(audio_24k):
+    """Nội suy tuyến tính PyTorch chuyển đổi 24kHz -> 16kHz (2/3x) siêu tốc."""
+    if audio_24k.dim() == 1:
+        audio_24k = audio_24k.unsqueeze(0).unsqueeze(0)
+    elif audio_24k.dim() == 2:
+        audio_24k = audio_24k.unsqueeze(1)
+    t_new = int(audio_24k.shape[-1] * (16000.0 / 24000.0))
+    audio_16k = F.interpolate(audio_24k, size=t_new, mode="linear", align_corners=False)
+    return audio_16k.squeeze(1)
+
 # Bảng gán nhãn 6 thanh điệu tiếng Việt
 VIETNAMESE_VOWEL_TONES = {
     'à': 1, 'ằ': 1, 'ầ': 1, 'è': 1, 'ề': 1, 'ì': 1, 'ò': 1, 'ồ': 1, 'ờ': 1, 'ù': 1, 'ừ': 1, 'ỳ': 1,
@@ -346,6 +356,15 @@ class RealStreamingSpeechPipeline:
         self.max_sec = max_sec
         self.is_online = False
         try:
+            import soundfile
+        except ImportError:
+            try:
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "soundfile", "-q"])
+            except Exception:
+                pass
+
+        try:
             from datasets import load_dataset
             print(f"📡 Đang kết nối Streaming Google FLEURS (En-US & Vi-VN, split='{split}')...")
             self.ds_en = load_dataset('google/fleurs', 'en_us', split=split, streaming=True)
@@ -358,10 +377,11 @@ class RealStreamingSpeechPipeline:
             print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu âm học chuẩn xác.")
             self.is_online = False
 
-    def fetch_batch(self, batch_size=4):
+    def fetch_batch(self, batch_size=4, return_en_text=False):
         src_waves = []
         tgt_waves = []
         transcripts = []
+        en_transcripts = []
 
         if self.is_online:
             for _ in range(batch_size):
@@ -375,7 +395,9 @@ class RealStreamingSpeechPipeline:
                     src_waves.append(w_en)
                     tgt_waves.append(w_vi)
                     transcripts.append(item_vi.get('transcription', 'xin chào việt nam'))
-                except Exception:
+                    en_transcripts.append(item_en.get('transcription', 'hello world'))
+                except Exception as ex:
+                    print(f"[Data Info] Đang nạp lại stream ({ex})...")
                     self.iter_en = iter(self.ds_en)
                     self.iter_vi = iter(self.ds_vi)
                     break
@@ -390,11 +412,14 @@ class RealStreamingSpeechPipeline:
             src_waves.append(w_en)
             tgt_waves.append(w_vi)
             transcripts.append('mô hình dịch tiếng nói bảo tồn thanh điệu')
+            en_transcripts.append('speech to speech translation model')
 
         max_src = max(w.shape[0] for w in src_waves)
         max_tgt = max(w.shape[0] for w in tgt_waves)
         padded_src = torch.stack([F.pad(w, (0, max_src - w.shape[0])) for w in src_waves], dim=0)
         padded_tgt_16k = torch.stack([F.pad(w, (0, max_tgt - w.shape[0])) for w in tgt_waves], dim=0)
+        if return_en_text:
+            return padded_src, padded_tgt_16k, transcripts, en_transcripts
         return padded_src, padded_tgt_16k, transcripts
 
 # ==============================================================================
