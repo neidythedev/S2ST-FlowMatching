@@ -506,10 +506,25 @@ def main():
 
             # Trích xuất Whisper Latents từ audio tiếng Anh
             if feat_extractor is not None and whisper_enc is not None:
-                in_proc = feat_extractor(src_audio_16k.numpy(), sampling_rate=16000, return_tensors='pt', padding=True)
+                in_proc = feat_extractor(
+                    src_audio_16k.numpy(),
+                    sampling_rate=16000,
+                    return_tensors='pt',
+                    padding="max_length"
+                )
                 feats = in_proc.input_features.to(device=device, dtype=dtype)
+                # Đảm bảo mel features đúng chuẩn 3000 frames cho Whisper
+                if feats.shape[-1] < 3000:
+                    feats = F.pad(feats, (0, 3000 - feats.shape[-1]))
+                elif feats.shape[-1] > 3000:
+                    feats = feats[:, :, :3000]
+
                 with torch.no_grad():
-                    src_latents = whisper_enc(feats).last_hidden_state
+                    full_latents = whisper_enc(feats).last_hidden_state  # [B, 1500, 768]
+                
+                # Cắt theo độ dài audio thực tế (Whisper 50Hz: 1 frame = 320 samples)
+                real_len = max(10, int(src_audio_16k.shape[-1] / 320))
+                src_latents = full_latents[:, :real_len, :]
             else:
                 src_latents = torch.randn(batch_size, 100, 768, device=device, dtype=dtype)
 
