@@ -242,7 +242,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
 
     try:
         from transformers import (
-            WhisperProcessor, WhisperForConditionalGeneration,
+            WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration,
             AutoTokenizer, AutoModelForSeq2SeqLM,
             VitsModel
         )
@@ -250,8 +250,9 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
         print(f"[Lỗi] Thiếu thư viện transformers để chạy Cascaded Baseline: {e}")
         return None
 
-    # Nạp ASR Whisper
-    asr_proc = WhisperProcessor.from_pretrained("openai/whisper-small")
+    # Nạp ASR Whisper thuần FeatureExtractor & Tokenizer (không phụ thuộc torchaudio)
+    asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
+    asr_tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="en", task="transcribe")
     asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device).eval()
 
     # Nạp MT Opus-MT (tự động đảm bảo sentencepiece và sacremoses)
@@ -292,10 +293,10 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline):
         t_start = time.perf_counter()
 
         # 1. ASR: Audio 16k -> English Text
-        in_feats = asr_proc(src_w.numpy(), sampling_rate=16000, return_tensors="pt").input_features.to(device)
+        in_feats = asr_feat_extractor(src_w.numpy(), sampling_rate=16000, return_tensors="pt").input_features.to(device)
         with torch.no_grad():
             gen_tokens = asr_model.generate(in_feats, language="en", task="transcribe")
-        pred_en_text = asr_proc.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+        pred_en_text = asr_tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
 
         # 2. MT: English Text -> Vietnamese Text
         mt_inputs = mt_tok(pred_en_text, return_tensors="pt").to(device)
