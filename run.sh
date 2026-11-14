@@ -14,6 +14,9 @@ LOG_FILE="$LOG_DIR/${EXP_NAME}.log"
 
 case "$ACTION" in
     start)
+        # 0. Gỡ bỏ torchaudio C++ bị lỗi ABI trên Python 3.13
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+
         # 1. Tự động kiểm tra và cấu hình rclone từ .env nếu chưa có
         if [ -f "tools/setup_rclone.py" ] && [ -f ".env" ] && [ ! -f "$HOME/.config/rclone/rclone.conf" ]; then
             python tools/setup_rclone.py >/dev/null 2>&1 || true

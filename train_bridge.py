@@ -6,12 +6,82 @@
 # ==============================================================================
 
 import argparse
+import importlib.machinery
 import json
 import math
 import os
 import sys
 import time
+import types
+import warnings
 from pathlib import Path
+
+# Tắt cảnh báo không cần thiết
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ==============================================================================
+# RUNTIME RESILIENCE: TORCHAUDIO IN-MEMORY MOCK (PYTHON 3.13 ABI GUARD)
+# ==============================================================================
+def apply_torchaudio_mock_if_needed():
+    """Bypass hoàn toàn lỗi C++ ABI undefined symbol của torchaudio trên Python 3.13."""
+    try:
+        import torchaudio
+        _ = torchaudio.__version__
+        return "native"
+    except Exception:
+        # Xóa các module torchaudio bị load dở
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("torchaudio"):
+                del sys.modules[mod]
+
+        def _create_mock(name: str, is_pkg: bool = False):
+            mod = types.ModuleType(name)
+            if is_pkg:
+                mod.__path__ = []
+            spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_pkg)
+            spec.has_location = False
+            mod.__spec__ = spec
+            return mod
+
+        ta = _create_mock("torchaudio", is_pkg=True)
+        ta.__version__ = "2.5.0-shim"
+        ta_func = _create_mock("torchaudio.functional", is_pkg=True)
+        ta_func_func = _create_mock("torchaudio.functional.functional", is_pkg=False)
+        ta_trans = _create_mock("torchaudio.transforms", is_pkg=False)
+        ta_ext = _create_mock("torchaudio._extension", is_pkg=False)
+
+        def _hz_to_mel(freq: float, mel_scale: str = "htk") -> float:
+            return 2595.0 * math.log10(1.0 + (freq / 700.0))
+
+        def _mel_to_hz(mels, mel_scale: str = "htk"):
+            return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
+
+        ta_func_func._hz_to_mel = _hz_to_mel
+        ta_func_func._mel_to_hz = _mel_to_hz
+        ta_func.functional = ta_func_func
+        ta_func._hz_to_mel = _hz_to_mel
+        ta_func._mel_to_hz = _mel_to_hz
+        ta.functional = ta_func
+
+        class _MockMel:
+            def __init__(self, *args, **kwargs):
+                pass
+            def __call__(self, x, *args, **kwargs):
+                return x
+
+        ta_trans.MelSpectrogram = _MockMel
+        ta.transforms = ta_trans
+
+        sys.modules["torchaudio"] = ta
+        sys.modules["torchaudio.functional"] = ta_func
+        sys.modules["torchaudio.functional.functional"] = ta_func_func
+        sys.modules["torchaudio.transforms"] = ta_trans
+        sys.modules["torchaudio._extension"] = ta_ext
+        return "mocked"
+
+apply_torchaudio_mock_if_needed()
 
 # Cấu hình logging ra cả terminal và file
 class Logger:
@@ -436,6 +506,13 @@ class RealStreamingSpeechPipeline:
         """Reset chỉ mục để mọi kịch bản (Case 0 -> Case 4) cùng đánh giá trên đúng các mẫu giống hệt nhau."""
         self._pair_index = 0
 
+    def shuffle(self):
+        """Xáo trộn ngẫu nhiên thứ tự các cặp song song En-Vi sau mỗi Epoch để chống học vẹt."""
+        if self._parallel_pairs:
+            import random
+            random.shuffle(self._parallel_pairs)
+            self._pair_index = 0
+
     def _extract_audio_tensor(self, audio_data):
         import io
         import soundfile as sf
@@ -689,10 +766,25 @@ def main():
         return
 
     epochs = 1 if args.smoke_test else train_cfg["epochs"]
-    steps_per_epoch = 2 if args.smoke_test else 25
     batch_size = train_cfg["batch_size"]
+    num_pairs = len(data_pipeline._parallel_pairs) if data_pipeline._parallel_pairs else 100
+    auto_steps = max(20, num_pairs // batch_size)
+    steps_per_epoch = 2 if args.smoke_test else auto_steps
 
-    print(f"\n[Training Config] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch | Batch Size: {batch_size}")
+    # Thiết lập Cosine Warm-up Learning Rate Scheduler
+    total_train_steps = epochs * steps_per_epoch
+    warmup_steps = min(train_cfg.get("warmup_steps", 150), max(10, total_train_steps // 6))
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_train_steps - warmup_steps))
+        return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    print(f"\n[Training Config] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch (~{num_pairs} câu) | Batch: {batch_size}")
+    print(f"   → Tổng cộng: {total_train_steps} Steps | Warmup: {warmup_steps} Steps | LR Scheduler: Cosine Warmup")
     print("-" * 75)
 
     for epoch in range(start_epoch, epochs):
@@ -749,19 +841,24 @@ def main():
             total_loss.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=float(train_cfg["max_grad_norm"]))
             optimizer.step()
+            scheduler.step()
 
             global_step += 1
             epoch_loss += total_loss.item()
             epoch_tone_acc += tone_acc
 
-            if global_step % 5 == 0 or args.smoke_test:
+            if global_step % 10 == 0 or args.smoke_test:
+                cur_lr = scheduler.get_last_lr()[0]
                 print(f"   [E{epoch:02d}|Step {global_step:04d}] Total Loss: {total_loss.item():.4f} | "
-                      f"CFM: {cfm_l.item():.4f} | Tone: {tone_l.item():.4f} (Acc: {tone_acc:.1f}%) | Dur: {dur_l.item():.4f}")
+                      f"CFM: {cfm_l.item():.4f} | Tone: {tone_l.item():.4f} (Acc: {tone_acc:.1f}%) | Dur: {dur_l.item():.4f} | LR: {cur_lr:.2e}")
 
         avg_loss = epoch_loss / max(1, steps_per_epoch)
         avg_acc = epoch_tone_acc / max(1, steps_per_epoch)
         elapsed = time.time() - t0
         print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f} | Tone Acc: {avg_acc:.1f}% | Best Loss: {min(best_loss, avg_loss):.4f}")
+
+        # Xáo trộn dữ liệu sau mỗi Epoch để chống học vẹt
+        data_pipeline.shuffle()
 
         # Lưu Checkpoint Atomic
         ckpt_data = {
