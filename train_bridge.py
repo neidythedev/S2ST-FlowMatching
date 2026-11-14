@@ -618,8 +618,12 @@ def main():
     if args.resume and os.path.exists(ckpt_path):
         print(f"[Resume] Đang khôi phục checkpoint từ: {ckpt_path}...")
         ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as e:
+                print(f"[Optimizer Info] Không khớp danh sách tham số cũ ({e}) do CFM đã được đóng băng. Sử dụng Optimizer mới cho Bridge!")
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))

@@ -28,7 +28,11 @@ case "$ACTION" in
 
         # 3. Kiểm tra checkpoint cũ để tự động nối tiếp (--resume)
         EXTRA_ARGS=""
-        if [ -f "checkpoints/${EXP_NAME}-last.pth" ] || [ -f "checkpoints/model-last.pth" ]; then
+        if [[ "${*:-}" == *"--fresh"* ]]; then
+            echo "🆕 Bắt đầu huấn luyện MỚI HOÀN TOÀN từ đầu (--fresh), bỏ qua checkpoint cũ!"
+            rm -f "checkpoints/${EXP_NAME}-last.pth"
+            EXTRA_ARGS=""
+        elif [ -f "checkpoints/${EXP_NAME}-last.pth" ] || [ -f "checkpoints/model-last.pth" ]; then
             echo "⚡ Phát hiện Checkpoint lưu trước đó -> Tự động nối tiếp huấn luyện (--resume)!"
             EXTRA_ARGS="--resume"
         fi
