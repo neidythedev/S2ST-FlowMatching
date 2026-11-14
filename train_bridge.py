@@ -386,7 +386,7 @@ class RealStreamingSpeechPipeline:
             self.is_online = False
 
     def _build_parallel_pairs(self):
-        """Buffer toàn bộ Vi items theo 'id', rồi match từng En item → cặp song song chính xác."""
+        """Buffer Vi items theo 'id', rồi match từng En item → đảm bảo 100% cặp song song chuẩn FLoRes."""
         print("🔗 Đang căn chỉnh song song En-Vi bằng trường 'id' (FLoRes sentence ID)...")
         vi_by_id = {}
         count_vi = 0
@@ -395,21 +395,40 @@ class RealStreamingSpeechPipeline:
             if fid is not None and fid not in vi_by_id:
                 vi_by_id[fid] = item
                 count_vi += 1
-        print(f"   → Đã nạp {count_vi} câu Vi (unique ID).")
+            # Với tập test (~864 câu), nạp tối đa 200 câu là dư dả cho benchmark
+            if self.split == 'test' and count_vi >= 200:
+                break
+        print(f"   → Đã nạp {count_vi} câu tiếng Việt độc lập vào bộ đệm.")
 
         pairs = []
-        count_en = 0
         for item in self.ds_en:
             fid = item.get('id')
             if fid is not None and fid in vi_by_id:
                 pairs.append((item, vi_by_id[fid]))
-                count_en += 1
+                if self.split == 'test' and len(pairs) >= 50:
+                    break
         self._parallel_pairs = pairs
         self._pair_index = 0
-        print(f"   → Căn chỉnh thành công {len(pairs)} cặp song song En↔Vi!")
-        if len(pairs) == 0:
+        print(f"   ✓ Căn chỉnh thành công {len(pairs)} cặp song song En ↔ Vi chuẩn xác!")
+        
+        # In ngay 3 cặp mẫu đầu tiên để kiểm chứng ngữ nghĩa
+        if pairs:
+            print("\n📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG GIAI ĐOẠN 1]:")
+            for i in range(min(3, len(pairs))):
+                en_txt = pairs[i][0].get('transcription', '').strip()
+                vi_txt = pairs[i][1].get('transcription', '').strip()
+                cid = pairs[i][0].get('id', 'N/A')
+                print(f"   🔹 Cặp #{i+1:02d} [FLoRes ID {cid}]:")
+                print(f"      🇬🇧 En: \"{en_txt}\"")
+                print(f"      🇻🇳 Vi: \"{vi_txt}\"")
+            print("-" * 65 + "\n")
+        else:
             print("[Cảnh báo] Không tìm được cặp song song nào! Kiểm tra trường 'id' trong dataset.")
             self.is_online = False
+
+    def reset(self):
+        """Reset chỉ mục để mọi kịch bản (Case 0 -> Case 4) cùng đánh giá trên đúng các mẫu giống hệt nhau."""
+        self._pair_index = 0
 
     def _extract_audio_tensor(self, audio_data):
         import io

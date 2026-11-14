@@ -258,6 +258,8 @@ def load_vietnamese_asr(device):
         asr_feat = WhisperFeatureExtractor.from_pretrained(model_id)
         asr_tok = WhisperTokenizer.from_pretrained(model_id, language="vi", task="transcribe")
         asr_mod = WhisperForConditionalGeneration.from_pretrained(model_id).to(device).eval()
+        if hasattr(asr_mod, "generation_config"):
+            asr_mod.generation_config.max_length = None
         print("✓ Đã nạp thành công Whisper Vietnamese ASR (đo ASR-BLEU).")
         return asr_feat, asr_tok, asr_mod
     except Exception as e:
@@ -495,6 +497,8 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools=Non
     asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
     asr_tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="en", task="transcribe")
     asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device).eval()
+    if hasattr(asr_model, "generation_config"):
+        asr_model.generation_config.max_length = None
 
     # Nạp MT Opus-MT
     try:
@@ -503,6 +507,8 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools=Non
     except Exception:
         mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-vi")
         mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-vi").to(device).eval()
+    if hasattr(mt_model, "generation_config"):
+        mt_model.generation_config.max_length = None
 
     # Nạp TTS MMS-TTS-Vie
     tts_tok = AutoTokenizer.from_pretrained("facebook/mms-tts-vie")
@@ -910,6 +916,8 @@ def main():
     all_summaries = []
 
     for c in cases_to_run:
+        if hasattr(data_pipeline, "reset"):
+            data_pipeline.reset()
         if c == 0:
             summary = evaluate_cascaded_case(args, device, mel_fb, data_pipeline, vi_asr_tools)
         else:
