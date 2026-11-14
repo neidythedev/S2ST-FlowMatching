@@ -8,9 +8,10 @@ Tài liệu tổng hợp toàn bộ các nhánh Git (Branches), quy trình thi�
 
 | Tên nhánh (Branch) | Mục đích & Vai trò |
 | :--- | :--- |
-| **`main`** | **Nhánh chính thức (Production)**: Chứa toàn bộ mã nguồn ổn định nhất, đồng bộ đầy đủ các tính năng. |
+| **`train-bridge`** | **Huấn luyện Stage 2**: Nhánh chuyên dụng huấn luyện `ToneAwareBridge` với cơ chế đóng băng Pretrained CFM làm Acoustic Teacher trên tập En-Vi song song FLoRes. |
+| **`train-cfm`** | **Huấn luyện Stage 1**: Nhánh chuyên dụng tối ưu bộ giải mã âm học Optimal Transport Conditional Flow Matching (OT-CFM) trên âm thanh tiếng Việt `vi_vn`. |
 | **`ablation-study`** | **Nghiên cứu Thực nghiệm**: Nhánh chuyên dụng chạy Benchmark 5 Cases (Case 0 Cascaded Baseline, Case 1-4 Ablation), đo RTF, Mel L1, SECS, ASR-BLEU và sinh Web Audio Gallery. |
-| **`train-cfm`** | **Huấn luyện Stage 1**: Nhánh tập trung tối ưu bộ giải mã âm học Optimal Transport Conditional Flow Matching (OT-CFM) trên âm thanh tiếng Việt. |
+| **`main`** | **Nhánh chính thức (Production)**: Chứa toàn bộ mã nguồn ổn định nhất, đồng bộ đầy đủ các tính năng. |
 
 > 💡 **Ghi chú**: Hiện tại cả 3 nhánh đã được đồng bộ chuẩn hóa (`git pull` trên bất kỳ nhánh nào cũng có đầy đủ tính năng mới nhất).
 
