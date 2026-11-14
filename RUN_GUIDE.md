@@ -103,7 +103,8 @@ Hệ thống hỗ trợ chạy ngầm hoàn toàn độc lập (không sợ mấ
 
 | Tác vụ | Lệnh thực thi | Mô tả |
 | :--- | :--- | :--- |
-| **Khởi chạy ngầm Stage 2 (Bridge)** | `bash run.sh start bridge` | Tự động nạp cấu hình `configs/stage2_bridge.yaml`, tự nhận checkpoint cũ để nối tiếp (`--resume`). |
+| **Kiểm tra tiền huấn luyện (Sanity Check)** | `bash run.sh sanity` | Chạy overfit 50 steps trên 4 mẫu cố định để kiểm chứng luồng gradient thông suốt. |
+| **Khởi chạy ngầm Stage 2 (Bridge)** | `bash run.sh start bridge` | Tự động nạp Pretrained CFM, đóng băng CFM, và huấn luyện sạch ToneAwareBridge từ đầu. |
 | **Khởi chạy ngầm Stage 1 (CFM)** | `bash run.sh start cfm` | Tự động chạy `train_cfm.py` với cấu hình `configs/stage1_cfm.yaml`. |
 | **Xem log trực tiếp** | `bash run.sh logs bridge` | Theo dõi Loss, Epoch, Step thời gian thực (Ấn `Ctrl+C` để thoát xem). |
 | **Kiểm tra trạng thái** | `bash run.sh status bridge` | Báo tiến trình còn chạy (PID) hay đã dừng. |
@@ -116,3 +117,4 @@ Hệ thống hỗ trợ chạy ngầm hoàn toàn độc lập (không sợ mấ
 Sau khi chạy xong lệnh `eval`, kết quả sẽ nằm tại thư mục `outputs/benchmark/`:
 1. **File Báo cáo Markdown**: `outputs/benchmark/ablation_summary.md` (chứa bảng tổng hợp số liệu RTF, Mel L1, SECS, ASR-BLEU sẵn sàng copy vào Luận văn).
 2. **File Web Audio Gallery**: `outputs/benchmark/index.html` (chứa trình nghe trực tiếp so sánh 4 cột âm thanh: Audio En $\leftrightarrow$ Audio Cascaded $\leftrightarrow$ Audio FlowMatching $\leftrightarrow$ Audio Vi chuẩn).
+

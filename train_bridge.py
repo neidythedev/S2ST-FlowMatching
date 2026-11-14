@@ -301,7 +301,7 @@ class EnViS2STSystem(nn.Module):
         v_pred = self.decoder(x_t, t, cond, speaker_emb)
         cfm_loss = F.mse_loss(v_pred, u_t)
 
-        # 2. Auxiliary Tone Classification Loss
+        # 2. Auxiliary Tone Classification Loss & Accuracy
         if target_tones is not None:
             if tone_logits.shape[1] != target_tones.shape[1]:
                 t_logits_interp = F.interpolate(
@@ -311,8 +311,12 @@ class EnViS2STSystem(nn.Module):
             else:
                 t_logits_interp = tone_logits
             tone_loss = F.cross_entropy(t_logits_interp.reshape(-1, 6), target_tones.reshape(-1))
+            preds = t_logits_interp.reshape(-1, 6).argmax(dim=-1)
+            targets = target_tones.reshape(-1)
+            tone_acc = (preds == targets).float().mean().item() * 100.0
         else:
             tone_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
+            tone_acc = 0.0
 
         # 3. Duration Predictor Loss
         if target_dur_ratio is not None:
@@ -323,7 +327,7 @@ class EnViS2STSystem(nn.Module):
         total_loss = (weights["cfm_weight"] * cfm_loss + 
                       weights["tone_weight"] * tone_loss + 
                       weights["dur_weight"] * dur_loss)
-        return total_loss, cfm_loss, tone_loss, dur_loss
+        return total_loss, cfm_loss, tone_loss, dur_loss, tone_acc
 
     @torch.no_grad()
     def inference(self, src_whisper, speaker_emb=None, num_steps=25):
@@ -387,16 +391,18 @@ class RealStreamingSpeechPipeline:
 
     def _build_parallel_pairs(self):
         """Buffer Vi items theo 'id', rồi match từng En item → đảm bảo 100% cặp song song chuẩn FLoRes."""
-        print("🔗 Đang căn chỉnh song song En-Vi bằng trường 'id' (FLoRes sentence ID)...")
+        print(f"🔗 Đang căn chỉnh song song En-Vi bằng trường 'id' (FLoRes sentence ID, split='{self.split}')...")
         vi_by_id = {}
         count_vi = 0
+        limit_vi = 800 if self.split == 'train' else 200
+        limit_pairs = 600 if self.split == 'train' else 50
+
         for item in self.ds_vi:
             fid = item.get('id')
             if fid is not None and fid not in vi_by_id:
                 vi_by_id[fid] = item
                 count_vi += 1
-            # Với tập test (~864 câu), nạp tối đa 200 câu là dư dả cho benchmark
-            if self.split == 'test' and count_vi >= 200:
+            if count_vi >= limit_vi:
                 break
         print(f"   → Đã nạp {count_vi} câu tiếng Việt độc lập vào bộ đệm.")
 
@@ -405,7 +411,7 @@ class RealStreamingSpeechPipeline:
             fid = item.get('id')
             if fid is not None and fid in vi_by_id:
                 pairs.append((item, vi_by_id[fid]))
-                if self.split == 'test' and len(pairs) >= 50:
+                if len(pairs) >= limit_pairs:
                     break
         self._parallel_pairs = pairs
         self._pair_index = 0
@@ -413,7 +419,7 @@ class RealStreamingSpeechPipeline:
         
         # In ngay 3 cặp mẫu đầu tiên để kiểm chứng ngữ nghĩa
         if pairs:
-            print("\n📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG GIAI ĐOẠN 1]:")
+            print("\n📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG]:")
             for i in range(min(3, len(pairs))):
                 en_txt = pairs[i][0].get('transcription', '').strip()
                 vi_txt = pairs[i][1].get('transcription', '').strip()
@@ -506,11 +512,14 @@ class RealStreamingSpeechPipeline:
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Huấn luyện ToneAwareBridge S2ST")
+    parser = argparse.ArgumentParser(description="Huấn luyện ToneAwareBridge S2ST (Frozen CFM Teacher)")
     parser.add_argument("--config", type=str, default="configs/stage2_bridge.yaml", help="Đường dẫn file cấu hình YAML")
     parser.add_argument("--exp-name", type=str, default="bridge", help="Tên thử nghiệm")
     parser.add_argument("--resume", action="store_true", help="Khôi phục huấn luyện từ checkpoint gần nhất")
     parser.add_argument("--smoke-test", action="store_true", help="Chạy kiểm thử 2 bước rồi dừng (kiểm tra CUDA/Forward/Backward)")
+    parser.add_argument("--sanity-check", action="store_true", help="Chạy bài test overfit 50 bước trên 4 mẫu cố định để kiểm chứng luồng gradient")
+    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth", help="Đường dẫn checkpoint CFM pretrained để làm Acoustic Teacher")
+    parser.add_argument("--no-freeze-cfm", action="store_true", help="Không đóng băng CFM (mặc định luôn đóng băng để bảo toàn âm học chuẩn)")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
@@ -528,12 +537,12 @@ def main():
     use_bf16 = train_cfg.get("bf16", True) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    print("=" * 70)
+    print("=" * 75)
     print(f"🚀 KHỞI ĐỘNG HUẤN LUYỆN TONE-AWARE BRIDGE: [{args.exp_name.upper()}]")
     print(f"Thiết bị: {device} | Dtype: {dtype} | BF16 Hỗ trợ: {use_bf16}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print("=" * 70)
+    print("=" * 75)
 
     # 1. Nạp Whisper-Small Encoder (Đóng băng - Frozen)
     whisper_id = cfg["model"].get("whisper_model", "openai/whisper-small")
@@ -562,8 +571,36 @@ def main():
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
+    # Nạp Pretrained CFM Decoder làm Acoustic Teacher
+    if os.path.exists(args.cfm_ckpt):
+        print(f"⏳ Đang nạp weights Pretrained CFM từ: {args.cfm_ckpt}...")
+        ckpt_cfm = torch.load(args.cfm_ckpt, map_location=device)
+        st = ckpt_cfm["model_state_dict"] if "model_state_dict" in ckpt_cfm else ckpt_cfm
+        dec_st = {}
+        for k, v in st.items():
+            if k.startswith("decoder."):
+                dec_st[k[len("decoder."):]] = v
+            elif not any(k.startswith(p) for p in ["bridge.", "spk_encoder.", "cond_proj."]):
+                dec_st[k] = v
+        model.decoder.load_state_dict(dec_st if dec_st else st, strict=False)
+        print("✓ Nạp weights Pretrained CFM thành công!")
+    else:
+        print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt}! CFM sẽ dùng weights ngẫu nhiên.")
+
+    # Đóng băng CFM nếu không có cờ --no-freeze-cfm
+    if not args.no_freeze_cfm:
+        for p in model.decoder.parameters():
+            p.requires_grad = False
+        print("🔒 Đã ĐÓNG BĂNG (FREEZE) CFM Decoder. Toàn bộ áp lực học tập trung 100% vào ToneAwareBridge!")
+
+    # Liệt kê tham số có thể huấn luyện (Trainable Parameters)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    num_trainable = sum(p.numel() for p in trainable_params)
+    num_total = sum(p.numel() for p in model.parameters())
+    print(f"ℹ️ Số tham số huấn luyện (Trainable): {num_trainable:,} / {num_total:,} ({num_trainable/num_total*100:.1f}%)")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=float(train_cfg["learning_rate"]),
         weight_decay=float(train_cfg["weight_decay"]),
         betas=(0.9, 0.98)
@@ -589,18 +626,75 @@ def main():
         print(f"✓ [Resume] Đã nạp thành công từ Epoch {start_epoch - 1}, Step {global_step}!")
 
     # 3. Pipeline Dữ liệu
-    max_sec = cfg["data"].get("max_audio_sec", 6.0)
+    max_sec = cfg["data"].get("max_audio_sec", 12.0)
     data_pipeline = RealStreamingSpeechPipeline(max_sec=max_sec)
+
+    # --------------------------------------------------------------------------
+    # BÀI KIỂM TRA TIỀN HUẤN LUYỆN (SANITY OVERFIT CHECK TRÊN 4 MẪU)
+    # --------------------------------------------------------------------------
+    if args.sanity_check:
+        print("\n" + "=" * 75)
+        print("🧪 BẮT ĐẦU BÀI KIỂM TRA TIỀN HUẤN LUYỆN (SANITY CHECK: OVERFIT 4 MẪU)")
+        print("Mục tiêu: Đảm bảo Gradient chảy thông suốt từ CFM về Bridge và Loss giảm dốc đứng.")
+        print("=" * 75)
+        model.train()
+        fix_src, fix_tgt, fix_vi_texts = data_pipeline.fetch_batch(batch_size=4)
+        
+        # Trích xuất Whisper Latents cố định
+        if feat_extractor is not None and whisper_enc is not None:
+            in_proc = feat_extractor(fix_src.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
+            f = in_proc.input_features.to(device=device, dtype=dtype)
+            if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
+            elif f.shape[-1] > 3000: f = f[:, :, :3000]
+            with torch.no_grad():
+                fl = whisper_enc(f).last_hidden_state
+            real_l = max(10, int(fix_src.shape[-1] / 320))
+            s_lat = fl[:, :real_l, :]
+        else:
+            s_lat = torch.randn(4, 100, 768, device=device, dtype=dtype)
+
+        tgt_24 = resample_16k_to_24k(fix_tgt.to(device=device, dtype=torch.float32))
+        tgt_m = extract_100_mel(tgt_24, mel_fb).to(dtype=dtype)
+        t_list = [parse_tones(txt, target_len=tgt_m.shape[-1] // 2) for txt in fix_vi_texts]
+        t_tens = torch.stack(t_list, dim=0).to(device=device)
+        d_ratio = torch.tensor([float(tgt_m.shape[-1]) / float(s_lat.shape[1] * 2)] * 4, device=device, dtype=dtype)
+
+        initial_loss = None
+        final_loss = None
+        for s in range(50):
+            optimizer.zero_grad()
+            l_tot, cfm_l, t_l, d_l, t_acc = model.compute_loss(
+                s_lat, tgt_m, target_tones=t_tens, target_dur_ratio=d_ratio, loss_weights=loss_weights
+            )
+            l_tot.backward()
+            nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+
+            if s == 0: initial_loss = l_tot.item()
+            if (s + 1) % 10 == 0 or s == 0:
+                print(f"   [Sanity Step {s+1:02d}/50] Total Loss: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} | Tone: {t_l.item():.4f} (Acc: {t_acc:.1f}%) | Dur: {d_l.item():.4f}")
+            final_loss = l_tot.item()
+
+        print("-" * 75)
+        if final_loss < initial_loss:
+            print(f"✅ SANITY CHECK PASS! Loss giảm từ {initial_loss:.4f} xuống {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%).")
+            print("   Hệ thống sẵn sàng 100% để huấn luyện chính thức!")
+        else:
+            print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}). Kiểm tra lại Learning Rate!")
+        print("=" * 75 + "\n")
+        return
 
     epochs = 1 if args.smoke_test else train_cfg["epochs"]
     steps_per_epoch = 2 if args.smoke_test else 25
     batch_size = train_cfg["batch_size"]
 
-    print(f"[Training] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch | Batch Size: {batch_size}")
+    print(f"\n[Training Config] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch | Batch Size: {batch_size}")
+    print("-" * 75)
 
     for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_tone_acc = 0.0
         t0 = time.time()
 
         for step in range(steps_per_epoch):
@@ -618,16 +712,14 @@ def main():
                     padding="max_length"
                 )
                 feats = in_proc.input_features.to(device=device, dtype=dtype)
-                # Đảm bảo mel features đúng chuẩn 3000 frames cho Whisper
                 if feats.shape[-1] < 3000:
                     feats = F.pad(feats, (0, 3000 - feats.shape[-1]))
                 elif feats.shape[-1] > 3000:
                     feats = feats[:, :, :3000]
 
                 with torch.no_grad():
-                    full_latents = whisper_enc(feats).last_hidden_state  # [B, 1500, 768]
-                
-                # Cắt theo độ dài audio thực tế (Whisper 50Hz: 1 frame = 320 samples)
+                    full_latents = whisper_enc(feats).last_hidden_state
+
                 real_len = max(10, int(src_audio_16k.shape[-1] / 320))
                 src_latents = full_latents[:, :real_len, :]
             else:
@@ -645,25 +737,27 @@ def main():
                                      device=device, dtype=dtype)
 
             # Tính Loss Multi-Task
-            total_loss, cfm_l, tone_l, dur_l = model.compute_loss(
+            total_loss, cfm_l, tone_l, dur_l, tone_acc = model.compute_loss(
                 src_latents, tgt_mel, target_tones=tones, target_dur_ratio=dur_ratio,
                 loss_weights=loss_weights
             )
 
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(train_cfg["max_grad_norm"]))
+            nn.utils.clip_grad_norm_(trainable_params, max_norm=float(train_cfg["max_grad_norm"]))
             optimizer.step()
 
             global_step += 1
             epoch_loss += total_loss.item()
+            epoch_tone_acc += tone_acc
 
             if global_step % 5 == 0 or args.smoke_test:
-                print(f"[E{epoch:02d}|Step {global_step:04d}] Total Loss: {total_loss.item():.4f} | "
-                      f"CFM: {cfm_l.item():.4f} | Tone: {tone_l.item():.4f} | Dur: {dur_l.item():.4f}")
+                print(f"   [E{epoch:02d}|Step {global_step:04d}] Total Loss: {total_loss.item():.4f} | "
+                      f"CFM: {cfm_l.item():.4f} | Tone: {tone_l.item():.4f} (Acc: {tone_acc:.1f}%) | Dur: {dur_l.item():.4f}")
 
         avg_loss = epoch_loss / max(1, steps_per_epoch)
+        avg_acc = epoch_tone_acc / max(1, steps_per_epoch)
         elapsed = time.time() - t0
-        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f}")
+        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f} | Tone Acc: {avg_acc:.1f}% | Best Loss: {min(best_loss, avg_loss):.4f}")
 
         # Lưu Checkpoint Atomic
         ckpt_data = {
@@ -683,12 +777,12 @@ def main():
             best_loss = avg_loss
             best_ckpt = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
             torch.save(ckpt_data, best_ckpt)
-            print(f"⭐ Đã cập nhật Model Best Loss: {best_loss:.4f}")
+            print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best Loss: {best_loss:.4f}")
 
-    print("=" * 70)
+    print("=" * 75)
     print("✅ HUẤN LUYỆN TONE-AWARE BRIDGE KẾT THÚC THÀNH CÔNG!")
     print(f"Checkpoint lưu tại: {ckpt_path}")
-    print("=" * 70)
+    print("=" * 75)
 
 if __name__ == "__main__":
     main()

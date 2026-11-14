@@ -101,6 +101,13 @@ case "$ACTION" in
         echo "✓ Khôi phục Checkpoints thành công từ Google Drive!"
         ;;
 
+    sanity)
+        echo "🧪 Đang chạy bài kiểm tra Tiền Huấn luyện (Sanity Overfit Check 50 steps trên 4 mẫu)..."
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
+        python train_bridge.py --sanity-check
+        ;;
+
     eval)
         CASE_CHOICE="${2:-all}"
         echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
