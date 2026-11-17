@@ -4,7 +4,7 @@
 # ==============================================================================
 
 model:
-  whisper_model: "openai/whisper-small"
+  whisper_model: "vinai/PhoWhisper-small" # Đồng bộ thống nhất PhoWhisper-small cho toàn dự án
   encoder_dim: 768
   cond_dim: 512
   n_mels: 100

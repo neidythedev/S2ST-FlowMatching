@@ -102,13 +102,13 @@ try:
     class MockSpectrogram(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            self.register_buffer("window", torch.empty(0))
+            self.register_buffer("window", torch.empty(1024))
         def forward(self, x): return x
 
     class MockMelScale(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            self.register_buffer("fb", torch.empty(0))
+            self.register_buffer("fb", torch.empty(513, 100))
         def forward(self, x): return x
 
     class MockMelSpectrogram(nn.Module):
@@ -189,9 +189,14 @@ def load_vocos(device):
         from vocos import Vocos
         print("⏳ Đang nạp Pretrained Vocos Vocoder 24kHz...")
         orig_load = Vocos.load_state_dict
-        Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
-        vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
-        Vocos.load_state_dict = orig_load
+        def safe_load(self, state_dict, strict=False):
+            clean_sd = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor")}
+            return orig_load(self, clean_sd, strict=False)
+        Vocos.load_state_dict = safe_load
+        try:
+            vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+        finally:
+            Vocos.load_state_dict = orig_load
         vocos.eval()
         print("✓ Nạp Vocos Vocoder thành công!")
         return vocos
@@ -478,7 +483,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
     os.makedirs(wavs_dir, exist_ok=True)
 
     print("⏳ Đang nạp các mô hình thành phần Cascaded Vi -> En (Pretrained chuẩn):")
-    print("  1. ASR: openai/whisper-small (Nhận diện giọng nói tiếng Việt)")
+    print("  1. ASR: vinai/PhoWhisper-small (Nhận diện giọng nói tiếng Việt tối ưu WER 9.0%)")
     print("  2. MT:  Helsinki-NLP/opus-mt-vi-en (Dịch thuật Việt - Anh)")
     print("  3. TTS: facebook/mms-tts-eng (Tổng hợp giọng nói tiếng Anh VITS)")
 
@@ -492,10 +497,10 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         print(f"[Lỗi] Thiếu thư viện transformers để chạy Cascaded Baseline: {e}")
         return None
 
-    # Nạp ASR Whisper tiếng Việt
-    asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-    asr_tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="vi", task="transcribe")
-    asr_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device).eval()
+    # Nạp ASR PhoWhisper tiếng Việt (SOTA Tiếng Việt)
+    asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("vinai/PhoWhisper-small")
+    asr_tokenizer = WhisperTokenizer.from_pretrained("vinai/PhoWhisper-small", language="vi", task="transcribe")
+    asr_model = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device).eval()
     if hasattr(asr_model, "generation_config"):
         asr_model.generation_config.max_length = None
 

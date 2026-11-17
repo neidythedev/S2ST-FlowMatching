@@ -85,13 +85,13 @@ import torch.nn.functional as F
 class MockSpectrogram(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.register_buffer("window", torch.empty(0))
+        self.register_buffer("window", torch.empty(1024))
     def forward(self, x): return x
 
 class MockMelScale(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.register_buffer("fb", torch.empty(0))
+        self.register_buffer("fb", torch.empty(513, 100))
     def forward(self, x): return x
 
 class MockMelSpectrogram(nn.Module):
@@ -108,12 +108,17 @@ if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transform
     sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
 
 def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
-    """Nạp Vocos vocoder an toàn với strict=False để chống lỗi buffer torchaudio."""
+    """Nạp Vocos vocoder an toàn với strict=False và loại bỏ feature_extractor để chống lỗi shape mismatch."""
     from vocos import Vocos
     orig_load = Vocos.load_state_dict
-    Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
-    vocos = Vocos.from_pretrained(repo_id)
-    Vocos.load_state_dict = orig_load
+    def safe_load(self, state_dict, strict=False):
+        clean_sd = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor")}
+        return orig_load(self, clean_sd, strict=False)
+    Vocos.load_state_dict = safe_load
+    try:
+        vocos = Vocos.from_pretrained(repo_id)
+    finally:
+        Vocos.load_state_dict = orig_load
     return vocos.to(device)
 
 from train_bridge import (
@@ -270,7 +275,7 @@ def run_vocos_roundtrip_test(device):
 # BƯỚC 3: SANITY CHECK #2 - ĐỘ KHỎE CỦA WHISPER TRÊN TIẾNG VIỆT
 # ==============================================================================
 
-def run_whisper_vietnamese_health_check(device, model_id="openai/whisper-small", num_samples=10):
+def run_whisper_vietnamese_health_check(device, model_id="vinai/PhoWhisper-small", num_samples=10):
     print("\n" + "=" * 75)
     print(f"🧪 BƯỚC 3: SANITY CHECK #2 - KIỂM TRA ĐỘ KHỎE CỦA WHISPER TRÊN TIẾNG VIỆT ({model_id})")
     print("Mục tiêu: Đảm bảo Whisper Encoder nghe tiếng Việt chuẩn xác trước khi đóng băng làm nguồn.")
@@ -351,7 +356,7 @@ def main():
     parser.add_argument("--eda", action="store_true", help="Chạy Bước 1: EDA Dữ liệu và độ dài")
     parser.add_argument("--vocos-roundtrip", action="store_true", help="Chạy Bước 2: Vocos Round-Trip Test")
     parser.add_argument("--whisper-check", action="store_true", help="Chạy Bước 3: Whisper Vietnamese Health Check")
-    parser.add_argument("--whisper-model", type=str, default="openai/whisper-small", help="Model Whisper cần test")
+    parser.add_argument("--whisper-model", type=str, default="vinai/PhoWhisper-small", help="Model Whisper cần test")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

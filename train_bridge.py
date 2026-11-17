@@ -100,7 +100,7 @@ def load_yaml_config(config_path):
     """Đọc file YAML an toàn với fallback nếu chưa cài pyyaml."""
     default_config = {
         "model": {
-            "whisper_model": "openai/whisper-small",
+            "whisper_model": "vinai/PhoWhisper-small",
             "encoder_dim": 768,
             "bridge_dim": 512,
             "bridge_layers": 6,
@@ -173,13 +173,13 @@ try:
     class MockSpectrogram(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            self.register_buffer("window", torch.empty(0))
+            self.register_buffer("window", torch.empty(1024))
         def forward(self, x): return x
 
     class MockMelScale(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            self.register_buffer("fb", torch.empty(0))
+            self.register_buffer("fb", torch.empty(513, 100))
         def forward(self, x): return x
 
     class MockMelSpectrogram(nn.Module):
@@ -196,11 +196,17 @@ try:
         sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
 
     def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
+        """Nạp Vocos vocoder an toàn với strict=False và loại bỏ feature_extractor để chống lỗi shape mismatch."""
         from vocos import Vocos
         orig_load = Vocos.load_state_dict
-        Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
-        vocos = Vocos.from_pretrained(repo_id)
-        Vocos.load_state_dict = orig_load
+        def safe_load(self, state_dict, strict=False):
+            clean_sd = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor")}
+            return orig_load(self, clean_sd, strict=False)
+        Vocos.load_state_dict = safe_load
+        try:
+            vocos = Vocos.from_pretrained(repo_id)
+        finally:
+            Vocos.load_state_dict = orig_load
         return vocos.to(device)
 except ImportError as e:
     print(f"[Fatal Error] PyTorch chưa được cài đặt: {e}")
