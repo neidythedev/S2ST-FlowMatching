@@ -141,6 +141,11 @@ case "$ACTION" in
         python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
         ;;
 
+    plot)
+        echo "📊 Đang vẽ đồ thị tiến trình loss cho thử nghiệm '$EXP_NAME'..."
+        python tools/plot_loss.py "$EXP_NAME"
+        ;;
+
     *)
         echo "=========================================================="
         echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH (S2ST VI -> EN):"
@@ -149,6 +154,7 @@ case "$ACTION" in
         echo "  bash run.sh start cfm_en         -> Huấn luyện Stage 1 OT-CFM Tiếng Anh"
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"
+        echo "  bash run.sh plot [tên_exp]       -> Vẽ biểu đồ ASCII và xuất file ảnh SVG/PNG đồ thị loss"
         echo "  bash run.sh eval [0|1|2|3|4|5]   -> Chạy benchmark đo metric (0: Cascaded, 5: SeamlessM4T)"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
