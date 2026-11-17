@@ -142,10 +142,11 @@ case "$ACTION" in
         ;;
 
     encoders)
-        echo "🔬 Đang chạy Benchmark so sánh 3 Speech Encoders (Whisper Small vs PhoWhisper vs Large-v3) trên FLEURS, VIVOS & Common Voice..."
+        SAMPLES="${2:-30}"
+        echo "🔬 Đang chạy Benchmark so sánh 3 Speech Encoders trên FLEURS, VietMed, VIVOS & Common Voice (Tổng cộng: $SAMPLES mẫu trên nhiều batch)..."
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
         pip install "datasets<4.0.0" soundfile librosa transformers -q 2>/dev/null || true
-        python tools/benchmark_encoders.py
+        python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
     plot)
