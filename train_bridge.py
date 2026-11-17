@@ -569,8 +569,8 @@ class RealStreamingSpeechPipeline:
         print(f"🔗 Đang căn chỉnh song song {self.src_lang} ↔ {self.tgt_lang} bằng trường 'id' (FLoRes sentence ID)...")
         tgt_by_id = {}
         count_tgt = 0
-        limit_tgt = 800 if self.split == 'train' else 200
-        limit_pairs = 600 if self.split == 'train' else 50
+        limit_tgt = 800 if self.split == 'train' else 600
+        limit_pairs = 600 if self.split == 'train' else 400
 
         for item in self.ds_tgt:
             fid = item.get('id')
