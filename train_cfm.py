@@ -213,21 +213,28 @@ def load_yaml_config(config_path):
 # ==============================================================================
 
 def build_mel_filterbank(sr=24000, n_fft=1024, n_mels=100, fmin=0.0, fmax=12000.0, device='cpu'):
+    """
+    Ma trận Mel Filterbank tam giác liên tục chuẩn Torchaudio HTK (Khớp 100% với Vocos pre-trained).
+    Loại bỏ hiện tượng rời rạc hóa tần số của hàm floor() để âm thanh trong trẻo, không bị buzz.
+    """
     def hz_to_mel(hz): return 2595.0 * math.log10(1.0 + hz / 700.0)
     def mel_to_hz(mel): return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
     mel_min = hz_to_mel(fmin)
     mel_max = hz_to_mel(fmax if fmax is not None else sr / 2.0)
-    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2, device=device)
-    hz_points = mel_to_hz(mel_points)
-    bin_points = torch.floor((n_fft + 1) * hz_points / sr).long()
-    filterbank = torch.zeros(n_mels, n_fft // 2 + 1, device=device)
-    for i in range(n_mels):
-        left, center, right = bin_points[i], bin_points[i + 1], bin_points[i + 2]
-        if center > left:
-            filterbank[i, left:center] = (torch.arange(left, center, device=device) - left) / (center - left)
-        if right > center:
-            filterbank[i, center:right] = (right - torch.arange(center, right, device=device)) / (right - center)
-    return filterbank
+    mel_pts = torch.linspace(mel_min, mel_max, n_mels + 2, device=device)
+    f_pts = torch.tensor([mel_to_hz(m.item()) for m in mel_pts], device=device)
+
+    n_freqs = n_fft // 2 + 1
+    all_freqs = torch.linspace(0, sr / 2.0, n_freqs, device=device)
+
+    f_diff = f_pts[1:] - f_pts[:-1]
+    slopes = f_pts.unsqueeze(0) - all_freqs.unsqueeze(1)
+
+    zero = torch.zeros(1, device=device, dtype=torch.float32)
+    down_slopes = (-1.0 * slopes[:, :-2]) / f_diff[:-1]
+    up_slopes = slopes[:, 2:] / f_diff[1:]
+    fb = torch.max(zero, torch.min(down_slopes, up_slopes))
+    return fb.T
 
 def extract_100_mel(waveform_24k, mel_filterbank, n_fft=1024, hop_length=256):
     if waveform_24k.dim() == 1:
