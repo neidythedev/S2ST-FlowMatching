@@ -125,17 +125,42 @@ def compute_cer(ref: str, hyp: str) -> float:
                 d[i][j] = min(d[i - 1][j], d[i][j - 1], d[i - 1][j - 1]) + 1
     return d[len(ref_chars)][len(hyp_chars)] / max(1, len(ref_chars))
 
+# Bộ giải mã audio vạn năng (không phụ thuộc vào HuggingFace Audio Decoder)
+def decode_raw_audio(audio_data):
+    import io
+    import soundfile as sf
+    if isinstance(audio_data, dict):
+        if "bytes" in audio_data and audio_data["bytes"]:
+            arr, sr = sf.read(io.BytesIO(audio_data["bytes"]))
+            if arr.ndim > 1: arr = arr.mean(axis=-1)
+            return np.array(arr, dtype=np.float32), sr
+        if "array" in audio_data and audio_data["array"] is not None:
+            arr = audio_data["array"]
+            sr = audio_data.get("sampling_rate", 16000)
+            if hasattr(arr, "ndim") and arr.ndim > 1: arr = arr.mean(axis=-1)
+            return np.array(arr, dtype=np.float32), sr
+        if "path" in audio_data and os.path.exists(audio_data["path"]):
+            arr, sr = sf.read(audio_data["path"])
+            if arr.ndim > 1: arr = arr.mean(axis=-1)
+            return np.array(arr, dtype=np.float32), sr
+    return None, None
+
 # Bộ nạp dữ liệu tiếng Việt từ 3 nguồn: FLEURS, VIVOS, Common Voice
 def fetch_vietnamese_samples(dataset_name: str, num_samples: int = 10):
     samples = []
     print(f"\n📡 Đang nạp dữ liệu mẫu từ tập: {dataset_name.upper()}...")
+    from datasets import Audio
     
     if dataset_name == "fleurs":
         try:
             ds = load_dataset("google/fleurs", "vi_vn", split="train", streaming=True)
+            try:
+                ds = ds.cast_column("audio", Audio(decode=False))
+            except Exception:
+                pass
             for item in ds:
-                audio_arr = item["audio"]["array"]
-                sr = item["audio"]["sampling_rate"]
+                audio_arr, sr = decode_raw_audio(item["audio"])
+                if audio_arr is None: continue
                 txt = item.get("transcription") or item.get("raw_transcription", "")
                 dur = len(audio_arr) / sr
                 if 2.0 <= dur <= 14.0 and txt.strip():
@@ -146,14 +171,17 @@ def fetch_vietnamese_samples(dataset_name: str, num_samples: int = 10):
             print(f"⚠️ Lỗi nạp fleurs: {e}")
 
     elif dataset_name == "vivos":
-        # Thử lần lượt các mirror của VIVOS
         vivos_repos = ["Martha-987/vivos", "HaniAI/vivos-vi-asr", "AILAB-VNUHCM/vivos"]
         for repo in vivos_repos:
             try:
-                ds = load_dataset(repo, split="test", streaming=True)
+                ds = load_dataset(repo, split="test", streaming=True, trust_remote_code=True)
+                try:
+                    ds = ds.cast_column("audio", Audio(decode=False))
+                except Exception:
+                    pass
                 for item in ds:
-                    audio_arr = item["audio"]["array"]
-                    sr = item["audio"]["sampling_rate"]
+                    audio_arr, sr = decode_raw_audio(item["audio"])
+                    if audio_arr is None: continue
                     txt = item.get("sentence", "")
                     dur = len(audio_arr) / sr
                     if 1.5 <= dur <= 14.0 and txt.strip():
@@ -162,7 +190,7 @@ def fetch_vietnamese_samples(dataset_name: str, num_samples: int = 10):
                         break
                 if samples:
                     break
-            except Exception:
+            except Exception as e:
                 continue
 
     elif dataset_name == "common_voice":
@@ -174,12 +202,16 @@ def fetch_vietnamese_samples(dataset_name: str, num_samples: int = 10):
         for repo, cfg in cv_repos:
             try:
                 if cfg:
-                    ds = load_dataset(repo, cfg, split="train", streaming=True)
+                    ds = load_dataset(repo, cfg, split="train", streaming=True, trust_remote_code=True)
                 else:
-                    ds = load_dataset(repo, split="train", streaming=True)
+                    ds = load_dataset(repo, split="train", streaming=True, trust_remote_code=True)
+                try:
+                    ds = ds.cast_column("audio", Audio(decode=False))
+                except Exception:
+                    pass
                 for item in ds:
-                    audio_arr = item["audio"]["array"]
-                    sr = item["audio"]["sampling_rate"]
+                    audio_arr, sr = decode_raw_audio(item["audio"])
+                    if audio_arr is None: continue
                     txt = item.get("sentence") or item.get("transcription", "")
                     dur = len(audio_arr) / sr
                     if 1.5 <= dur <= 14.0 and txt.strip():
@@ -224,6 +256,12 @@ def evaluate_model_on_samples(model_id: str, samples: list, device: torch.device
 
     for i, s in enumerate(samples):
         audio_16k = s["audio"]
+        sr = s.get("sr", 16000)
+        if sr != 16000:
+            t_audio = torch.from_numpy(audio_16k).float().unsqueeze(0).unsqueeze(0)
+            t_resampled = torch.nn.functional.interpolate(t_audio, size=int(len(audio_16k) * 16000.0 / sr), mode="linear", align_corners=False)
+            audio_16k = t_resampled.squeeze().numpy()
+
         ref_text = s["text"]
 
         t0 = time.time()

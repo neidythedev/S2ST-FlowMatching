@@ -144,7 +144,7 @@ case "$ACTION" in
     encoders)
         echo "🔬 Đang chạy Benchmark so sánh 3 Speech Encoders (Whisper Small vs PhoWhisper vs Large-v3) trên FLEURS, VIVOS & Common Voice..."
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
-        pip install "datasets<4.0.0" soundfile transformers -q 2>/dev/null || true
+        pip install "datasets<4.0.0" soundfile librosa transformers -q 2>/dev/null || true
         python tools/benchmark_encoders.py
         ;;
 
