@@ -79,7 +79,19 @@ def apply_torchaudio_mock_if_needed():
 _ = apply_torchaudio_mock_if_needed()
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+class MockMelSpectrogram(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+    def forward(self, x):
+        return x
+
+if "torchaudio.transforms" in sys.modules:
+    sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
+if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
+    sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
 
 from train_bridge import (
     build_mel_filterbank, extract_100_mel, resample_16k_to_24k, resample_24k_to_16k,

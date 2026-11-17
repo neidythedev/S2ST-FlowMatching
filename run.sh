@@ -8,9 +8,14 @@ set -euo pipefail
 ACTION="${1:-help}"
 EXP_NAME="${2:-bridge_envi}"
 LOG_DIR="logs"
-mkdir -p "$LOG_DIR" "checkpoints"
+mkdir -p "$LOG_DIR" "checkpoints" "outputs/sanity" "outputs/benchmark"
 PID_FILE="$LOG_DIR/${EXP_NAME}.pid"
 LOG_FILE="$LOG_DIR/${EXP_NAME}.log"
+
+# Tự động liên kết thư mục dự án với giao diện File Explorer của Marimo trên Molab
+if [ -d "/marimo" ] && [ "$PWD" != "/marimo" ]; then
+    ln -sfn "$PWD" "/marimo/S2ST-FlowMatching" 2>/dev/null || true
+fi
 
 case "$ACTION" in
     start)
