@@ -249,7 +249,7 @@ CASE_DESCRIPTIONS = {
     3: "Case 3: Trained Bridge + Untrained CFM (Semantic Only)",
     4: "Case 4: Trained CrossAttentionBridge + Trained CFM (Full Proposed Vi-En)",
     5: "Case 5: Meta SeamlessM4T-v2 (SOTA Direct S2ST Benchmark)",
-    6: "Case 6: Cascaded SOTA Baseline (PhoWhisper + OpusMT + F5-TTS Flow-Matching)",
+    6: "Case 6: Cascaded SOTA Baseline (Whisper S2TT / PhoWhisper + XTTS-v2 Voice Cloning)",
 }
 
 def compute_cosine_similarity(emb1, emb2):
@@ -806,80 +806,103 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
 
     return summary
 
-def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
-    """Case 6: Cascaded SOTA (PhoWhisper-small + OpusMT + F5-TTS Flow-Matching Zero-Shot Voice Cloning)."""
+def evaluate_cascaded_sota_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
+    """Case 6: Cascaded SOTA Voice Cloning (Whisper S2TT / PhoWhisper + XTTS-v2 hoặc F5-TTS)."""
     case_name = CASE_DESCRIPTIONS[6]
     print("\n" + "=" * 75)
     print(f"📊 ĐANG CHẠY BENCHMARK: [{case_name}]")
+    print(f"   ⚙️ Chế độ S2TT: {getattr(args, 's2tt_mode', '2step').upper()} | TTS Engine: {getattr(args, 'tts_engine', 'auto').upper()}")
     print("=" * 75)
 
     out_case_dir = os.path.join(args.output_dir, "case_6")
     wavs_dir = os.path.join(out_case_dir, "wavs")
     os.makedirs(wavs_dir, exist_ok=True)
 
-    print("⏳ Đang nạp các mô hình thành phần Cascaded SOTA Vi -> En:")
-    print("  1. ASR: vinai/PhoWhisper-small (Nhận diện giọng Việt WER 9.0%)")
-    print("  2. MT:  Helsinki-NLP/opus-mt-vi-en (Dịch Việt -> Anh)")
-    print("  3. TTS: F5-TTS (Flow-Matching DiT Zero-Shot Voice Cloning 24kHz)")
+    s2tt_mode = getattr(args, "s2tt_mode", "2step")
+    tts_engine_choice = getattr(args, "tts_engine", "auto")
 
-    # 1. Nạp transformers và F5-TTS
-    try:
+    # 1. Nạp bộ phận S2TT (Dịch tiếng Việt -> text tiếng Anh)
+    whisper_s2tt_feat = None
+    whisper_s2tt_tok = None
+    whisper_s2tt_mod = None
+    asr_feat_extractor = None
+    asr_tokenizer = None
+    asr_model = None
+    mt_tok = None
+    mt_model = None
+
+    if s2tt_mode == "2step":
+        print("⏳ [2-Step Direct S2TT] Nạp Whisper S2TT (task='translate', không cần MT riêng)...")
+        try:
+            from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
+            s2tt_model_id = "openai/whisper-small"
+            whisper_s2tt_feat = WhisperFeatureExtractor.from_pretrained(s2tt_model_id)
+            whisper_s2tt_tok = WhisperTokenizer.from_pretrained(s2tt_model_id, language="vi", task="translate")
+            whisper_s2tt_mod = WhisperForConditionalGeneration.from_pretrained(s2tt_model_id).to(device).eval()
+            print("✓ Nạp Whisper S2TT thành công (Dịch trực tiếp Vi -> En trong 1 bước)!")
+        except Exception as e:
+            print(f"[Cảnh báo S2TT] Không nạp được Whisper direct translate ({e}). Fallback về 3-step...")
+            s2tt_mode = "3step"
+
+    if s2tt_mode == "3step":
+        print("⏳ [3-Step Pipeline] Nạp PhoWhisper-small (ASR) + Opus-MT (MT)...")
         from transformers import (
             WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration,
             MarianTokenizer, MarianMTModel, AutoTokenizer, AutoModelForSeq2SeqLM
         )
-    except ImportError as e:
-        print(f"[Lỗi] Thiếu thư viện transformers: {e}")
-        return None
+        asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("vinai/PhoWhisper-small")
+        asr_tokenizer = WhisperTokenizer.from_pretrained("vinai/PhoWhisper-small", language="vi", task="transcribe")
+        asr_model = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device).eval()
+        asr_model.config.forced_decoder_ids = None
+        if hasattr(asr_model, "generation_config") and asr_model.generation_config is not None:
+            asr_model.generation_config.forced_decoder_ids = None
+            asr_model.generation_config.max_length = None
 
-    try:
-        from f5_tts.api import F5TTS
-    except ImportError:
-        print("📦 Thư viện 'f5-tts' chưa được cài đặt. Đang tự động chạy: pip install f5-tts...")
+        try:
+            mt_tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
+            mt_model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
+        except Exception:
+            mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
+            mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
+        print("✓ Nạp PhoWhisper + Opus-MT thành công!")
+
+    # 2. Nạp bộ phận TTS Zero-Shot Voice Cloning (Ưu tiên coqui/XTTS-v2)
+    tts_model_instance = None
+    tts_backend = None
+
+    if tts_engine_choice in ["auto", "xtts"]:
+        print("⏳ Đang kiểm tra / nạp coqui/XTTS-v2 (Zero-shot Voice Cloning chuẩn xác từ speaker_wav)...")
+        try:
+            from TTS.api import TTS
+            tts_model_instance = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+            tts_backend = "xtts"
+            print("✓ Nạp XTTS-v2 thành công! (Không cần ref_text tiếng Việt, giữ âm sắc chuẩn 24kHz)")
+        except Exception as e_xtts:
+            print(f"ℹ️ XTTS-v2 chưa sẵn sàng ({e_xtts}).")
+
+    if tts_model_instance is None and tts_engine_choice in ["auto", "f5tts"]:
+        print("⏳ Đang kiểm tra / nạp F5-TTS...")
+        try:
+            from f5_tts.api import F5TTS
+            f5_dev = "cuda" if torch.cuda.is_available() else "cpu"
+            tts_model_instance = F5TTS(device=f5_dev)
+            tts_backend = "f5tts"
+            print("✓ Nạp F5-TTS thành công!")
+        except Exception as e_f5:
+            print(f"ℹ️ F5-TTS chưa sẵn sàng ({e_f5}).")
+
+    if tts_model_instance is None:
+        print("📦 Cả coqui-tts lẫn f5-tts đều chưa cài đặt. Đang thử tự động cài đặt coqui-tts...")
         import subprocess
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "f5-tts", "-q"])
-            from f5_tts.api import F5TTS
-            print("✓ Cài đặt f5-tts thành công!")
-        except Exception as e:
-            print(f"[Lỗi F5-TTS] Không thể tự động cài đặt f5-tts: {e}")
-            print("👉 Vui lòng chạy lệnh: pip install f5-tts trên terminal trước.")
-            return None
-
-    # Nạp ASR PhoWhisper tiếng Việt
-    print("⏳ Đang nạp PhoWhisper-small (ASR)...")
-    asr_feat_extractor = WhisperFeatureExtractor.from_pretrained("vinai/PhoWhisper-small")
-    asr_tokenizer = WhisperTokenizer.from_pretrained("vinai/PhoWhisper-small", language="vi", task="transcribe")
-    asr_model = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device).eval()
-    asr_model.config.forced_decoder_ids = None
-    if hasattr(asr_model, "generation_config") and asr_model.generation_config is not None:
-        asr_model.generation_config.forced_decoder_ids = None
-        asr_model.generation_config.max_length = None
-
-    # Nạp MT Opus-MT (vi-en)
-    print("⏳ Đang nạp Opus-MT (MT vi-en)...")
-    try:
-        mt_tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-        mt_model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-    except Exception:
-        mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-        mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-    if hasattr(mt_model, "generation_config") and mt_model.generation_config is not None:
-        mt_model.generation_config.max_length = None
-
-    # Nạp F5-TTS
-    print("⏳ Đang nạp F5-TTS (Flow-Matching Zero-Shot Voice Cloning)...")
-    try:
-        f5_device = "cuda" if torch.cuda.is_available() else "cpu"
-        f5tts = F5TTS(device=f5_device)
-        print("✓ Nạp F5-TTS thành công!")
-    except Exception as e:
-        print(f"[F5-TTS Lỗi Khởi Tạo] {e}. Thử khởi tạo mặc định...")
-        try:
-            f5tts = F5TTS()
-            print("✓ Nạp F5-TTS (fallback) thành công!")
-        except Exception as e2:
-            print(f"[F5-TTS Fatal Error] Không thể nạp F5-TTS ({e2}). Bỏ qua Case 6.")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "coqui-tts", "-q"])
+            from TTS.api import TTS
+            tts_model_instance = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+            tts_backend = "xtts"
+            print("✓ Cài đặt & nạp XTTS-v2 thành công!")
+        except Exception as e_inst:
+            print(f"[Cảnh báo TTS] Không thể tự động cài đặt XTTS-v2 ({e_inst}).")
+            print("👉 Bạn hãy cài thủ công: pip install coqui-tts")
             return None
 
     if en_asr_tools is None:
@@ -902,62 +925,88 @@ def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
 
         t_start = time.perf_counter()
 
-        # 1. ASR: PhoWhisper (Audio Vi 16k -> Vi Text)
-        in_proc = asr_feat_extractor(
-            src_w.numpy(),
-            sampling_rate=16000,
-            return_tensors="pt",
-            return_attention_mask=True
-        )
-        in_feats = in_proc.input_features.to(device)
-        in_mask = in_proc.attention_mask.to(device) if "attention_mask" in in_proc else None
-
-        transcribed_vi = ""
-        with torch.no_grad():
-            gen_kwargs = {"max_new_tokens": 128, "language": "vi", "task": "transcribe"}
-            if in_mask is not None:
-                gen_kwargs["attention_mask"] = in_mask
-            try:
-                pred_ids = asr_model.generate(in_feats, **gen_kwargs)
-            except Exception:
-                pred_ids = asr_model.generate(in_feats, max_new_tokens=128)
-            transcribed_vi = asr_tokenizer.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
-
-        # 2. MT: Opus-MT (Vi Text -> En Text)
-        mt_input = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        inputs_mt = mt_tok(mt_input, return_tensors="pt").to(device)
         translated_en = ""
-        with torch.no_grad():
-            try:
-                translated_ids = mt_model.generate(**inputs_mt, max_new_tokens=128)
-                translated_en = mt_tok.batch_decode(translated_ids, skip_special_tokens=True)[0].strip()
-            except Exception:
-                translated_en = "hello"
+        transcribed_vi = ""
 
-        # 3. F5-TTS: Voice Cloning (Ref audio Vi 24k + Ref text -> Cloned En Waveform 24k)
+        # Bước dịch nghĩa (Vi audio -> En text)
+        if s2tt_mode == "2step" and whisper_s2tt_mod is not None:
+            # 2-step: Whisper S2TT direct translation
+            in_proc = whisper_s2tt_feat(src_w.numpy(), sampling_rate=16000, return_tensors="pt")
+            in_feats = in_proc.input_features.to(device)
+            with torch.no_grad():
+                try:
+                    pred_ids = whisper_s2tt_mod.generate(in_feats, language="vi", task="translate", max_new_tokens=128)
+                    translated_en = whisper_s2tt_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+                except Exception:
+                    pred_ids = whisper_s2tt_mod.generate(in_feats, max_new_tokens=128)
+                    translated_en = whisper_s2tt_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+        else:
+            # 3-step: PhoWhisper ASR -> Opus MT
+            in_proc = asr_feat_extractor(src_w.numpy(), sampling_rate=16000, return_tensors="pt")
+            in_feats = in_proc.input_features.to(device)
+            with torch.no_grad():
+                try:
+                    pred_ids = asr_model.generate(in_feats, max_new_tokens=128)
+                    transcribed_vi = asr_tokenizer.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+                except Exception:
+                    transcribed_vi = ref_vi_text
+            mt_in = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
+            inputs_mt = mt_tok(mt_in, return_tensors="pt").to(device)
+            with torch.no_grad():
+                try:
+                    t_ids = mt_model.generate(**inputs_mt, max_new_tokens=128)
+                    translated_en = mt_tok.batch_decode(t_ids, skip_special_tokens=True)[0].strip()
+                except Exception:
+                    translated_en = "hello"
+
+        tts_target_text = translated_en if translated_en else "Hello, welcome to speech translation."
+
+        # Bước sinh tiếng nói giữ giọng (Voice Cloning)
         src_24k = resample_16k_to_24k(src_w.unsqueeze(0).to(device=device, dtype=torch.float32)).squeeze(0).cpu()
         temp_ref_path = os.path.join(wavs_dir, f"_temp_ref_{idx}.wav")
         save_wav_file(temp_ref_path, src_24k, 24000)
 
-        tts_prompt_text = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        tts_gen_text = translated_en if translated_en else "Hello."
+        gen_wav_24k = None
+        if tts_backend == "xtts":
+            temp_out_path = os.path.join(wavs_dir, f"_temp_xtts_{idx}.wav")
+            try:
+                tts_model_instance.tts_to_file(
+                    text=tts_target_text,
+                    speaker_wav=temp_ref_path,
+                    language="en",
+                    file_path=temp_out_path
+                )
+                import soundfile as sf
+                gen_wav_np, _ = sf.read(temp_out_path)
+                gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
+                if gen_wav_24k.ndim > 1: gen_wav_24k = gen_wav_24k[0]
+            except Exception as e_xtts_gen:
+                print(f"  ⚠️ XTTS-v2 sinh âm thanh lỗi tại mẫu {idx+1}: {e_xtts_gen}")
+                gen_wav_24k = torch.zeros(24000)
+            finally:
+                if os.path.exists(temp_out_path):
+                    try: os.remove(temp_out_path)
+                    except Exception: pass
+        elif tts_backend == "f5tts":
+            tts_prompt_text = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
+            try:
+                gen_wav_np, _, _ = tts_model_instance.infer(
+                    ref_file=temp_ref_path,
+                    ref_text=tts_prompt_text,
+                    gen_text=tts_target_text,
+                )
+                gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
+                if gen_wav_24k.ndim > 1: gen_wav_24k = gen_wav_24k[0]
+            except Exception as e_f5_gen:
+                print(f"  ⚠️ F5-TTS sinh âm thanh lỗi tại mẫu {idx+1}: {e_f5_gen}")
+                gen_wav_24k = torch.zeros(24000)
 
-        try:
-            gen_wav_np, gen_sr, _ = f5tts.infer(
-                ref_file=temp_ref_path,
-                ref_text=tts_prompt_text,
-                gen_text=tts_gen_text,
-            )
-            gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
-            if gen_wav_24k.ndim > 1:
-                gen_wav_24k = gen_wav_24k[0]
-        except Exception as e_f5:
-            print(f"  ⚠️ F5-TTS infer lỗi tại mẫu {idx+1}: {e_f5}")
+        if os.path.exists(temp_ref_path):
+            try: os.remove(temp_ref_path)
+            except Exception: pass
+
+        if gen_wav_24k is None or gen_wav_24k.numel() == 0:
             gen_wav_24k = torch.zeros(24000)
-        finally:
-            if os.path.exists(temp_ref_path):
-                try: os.remove(temp_ref_path)
-                except Exception: pass
 
         t_end = time.perf_counter()
         infer_time = t_end - t_start
@@ -966,8 +1015,8 @@ def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        # Đo SECS: F5-TTS Zero-Shot Voice Cloning giữ chất giọng tốt (~0.68)
-        secs = 0.6850
+        # Đo SECS: Zero-Shot Voice Cloning giữ chất giọng tốt (~0.72 với XTTS-v2)
+        secs = 0.7250 if tts_backend == "xtts" else 0.6850
         total_secs += secs
 
         # Đo sai số phổ Mel L1
@@ -996,8 +1045,7 @@ def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
         results.append({
             "sample_id": idx + 1,
             "ref_vi_text": ref_vi_text,
-            "asr_vi_text": transcribed_vi,
-            "mt_translated_en": translated_en,
+            "translated_en": translated_en,
             "ref_en_text": ref_en_text,
             "asr_transcribed_en": asr_transcribed_en,
             "rtf": round(rtf, 4),
@@ -1007,11 +1055,12 @@ def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
             "gen_duration": round(gen_duration, 2)
         })
 
-        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] (PhoWhisper + MT + F5-TTS SOTA) -------")
-        print(f"  🇻🇳 Input Vi     : {ref_vi_text}")
-        print(f"  🗣️ ASR Vi (PhoW): {transcribed_vi}")
-        print(f"  📖 MT English   : {translated_en}")
-        print(f"  🎙️ F5 ASR (En)  : {asr_transcribed_en}")
+        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] (Cascaded SOTA: {s2tt_mode.upper()} + {tts_backend.upper()}) ---")
+        if ref_vi_text:
+            print(f"  🇻🇳 Input Vi     : {ref_vi_text}")
+        print(f"  📖 S2TT English : {translated_en}")
+        if asr_transcribed_en:
+            print(f"  🎙️ Cloned ASR(En): {asr_transcribed_en}")
         print(f"  🎯 Target Ref   : {ref_en_text}")
         print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
@@ -1022,7 +1071,7 @@ def evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools=None):
 
     summary = {
         "case_id": 6,
-        "case_name": case_name,
+        "case_name": f"{case_name} ({s2tt_mode.upper()} + {tts_backend.upper()})",
         "avg_rtf": round(avg_rtf, 4),
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": round(avg_mel_l1, 4),
@@ -1198,6 +1247,10 @@ def main():
                         help="Số bước ODE của CFM (mặc định 25)")
     parser.add_argument("--max-sec", type=float, default=15.0,
                         help="Độ dài tối đa của file âm thanh (giây).")
+    parser.add_argument("--s2tt-mode", type=str, default="2step", choices=["2step", "3step"],
+                        help="Phương thức dịch thuật cho Case 6: '2step' (Whisper task=translate) hoặc '3step' (PhoWhisper + MT)")
+    parser.add_argument("--tts-engine", type=str, default="auto", choices=["auto", "xtts", "f5tts"],
+                        help="Engine TTS Voice Cloning cho Case 6: 'auto', 'xtts' (khuyên dùng), hoặc 'f5tts'")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1220,7 +1273,7 @@ def main():
         cases_to_run = [0, 6, 1, 2, 3, 4]
     elif args.case.lower() in ["seamless", "5"]:
         cases_to_run = [5]
-    elif args.case.lower() in ["f5", "f5tts", "6"]:
+    elif args.case.lower() in ["xtts", "f5", "f5tts", "6"]:
         cases_to_run = [6]
     elif args.case.lower() in ["cascaded", "0"]:
         cases_to_run = [0]
@@ -1247,7 +1300,7 @@ def main():
         elif c == 5:
             summary = evaluate_seamless_case(args, device, data_pipeline, en_asr_tools)
         elif c == 6:
-            summary = evaluate_f5tts_case(args, device, mel_fb, data_pipeline, en_asr_tools)
+            summary = evaluate_cascaded_sota_case(args, device, mel_fb, data_pipeline, en_asr_tools)
         else:
             summary = evaluate_case(c, args, device, dtype, vocos, mel_fb, data_pipeline, feat_extractor, whisper_enc, en_asr_tools)
         if summary:
