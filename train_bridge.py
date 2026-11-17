@@ -720,9 +720,24 @@ def main():
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
     # Nạp Pretrained CFM nếu có
-    if os.path.exists(args.cfm_ckpt):
-        print(f"⏳ Đang nạp weights Pretrained CFM từ: {args.cfm_ckpt}...")
-        ckpt_cfm = torch.load(args.cfm_ckpt, map_location=device)
+    found_cfm = None
+    cfm_candidates = [
+        args.cfm_ckpt,
+        "checkpoints/cfm_en-best.pth",
+        "checkpoints/cfm_en-last.pth",
+        "checkpoints/cfm-best.pth",
+        "checkpoints/cfm-last.pth",
+        "checkpoints/stage1_cfm_en-best.pth",
+        "checkpoints/stage1_cfm_en-last.pth",
+    ]
+    for cp in cfm_candidates:
+        if cp and os.path.exists(cp):
+            found_cfm = cp
+            break
+
+    if found_cfm:
+        print(f"⏳ Đang nạp weights Pretrained CFM từ: {found_cfm}...")
+        ckpt_cfm = torch.load(found_cfm, map_location=device)
         st = ckpt_cfm["model_state_dict"] if "model_state_dict" in ckpt_cfm else ckpt_cfm
         dec_st = {}
         for k, v in st.items():
@@ -733,9 +748,14 @@ def main():
         model.decoder.load_state_dict(dec_st if dec_st else st, strict=False)
         print("✓ Nạp weights Pretrained CFM thành công!")
     else:
-        print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt}! CFM sẽ dùng weights ngẫu nhiên (hoặc huấn luyện từ đầu).")
+        print(f"[Cảnh báo] Không tìm thấy CFM checkpoint! CFM sẽ dùng weights ngẫu nhiên.")
 
-    if not args.no_freeze_cfm:
+    should_freeze_cfm = not args.no_freeze_cfm
+    if args.overfit_16 and not found_cfm:
+        should_freeze_cfm = False
+        print("💡 [Overfit Mode] Chưa có CFM pre-trained -> Mở toàn bộ trọng số (không freeze CFM) để End-to-End Bridge+CFM cùng overfit 16 câu!")
+
+    if should_freeze_cfm:
         for p in model.decoder.parameters():
             p.requires_grad = False
         print("🔒 Đã ĐÓNG BĂNG (FREEZE) CFM Decoder. Toàn bộ áp lực học tập trung 100% vào CrossAttentionBridge!")
@@ -784,7 +804,7 @@ def main():
     if args.sanity_check or args.overfit_16:
         is_deep = args.overfit_16
         num_samples = 16 if is_deep else 4
-        num_steps = 500 if is_deep else 50
+        num_steps = 800 if is_deep else 50
         print("\n" + "=" * 75)
         print(f"🧪 BẮT ĐẦU KIỂM TRA OVERFIT ({num_steps} BƯỚC TRÊN {num_samples} CẶP CÂU VI -> EN)")
         print("Mục tiêu: Đảm bảo Gradient chảy thông suốt qua Cross-Attention Bridge và kiểm tra khả năng học.")
@@ -810,6 +830,7 @@ def main():
         tgt_m = extract_100_mel(tgt_24, mel_fb).to(dtype=dtype)
         d_ratio = torch.tensor([float(tgt_m.shape[-1]) / float(s_lat.shape[1])] * num_samples, device=device, dtype=dtype)
 
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps, eta_min=1e-5)
         initial_loss = None
         final_loss = None
         t_start = time.time()
@@ -821,6 +842,7 @@ def main():
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             if s == 0: initial_loss = l_tot.item()
             log_interval = 50 if is_deep else 10
@@ -834,7 +856,7 @@ def main():
         else:
             print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
 
-        # Nếu là Overfit sâu 500 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
+        # Nếu là Overfit sâu 800 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
         if is_deep:
             out_dir = "outputs/sanity/bridge_overfit16"
             legacy_dir = "outputs/sanity"
@@ -842,16 +864,23 @@ def main():
             os.makedirs(legacy_dir, exist_ok=True)
             try:
                 vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
-                gen_mels = model.inference(s_lat, num_steps=25)
+                gen_mels = model.inference(s_lat, num_steps=32)
                 with torch.no_grad():
                     print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_src)} FILE AUDIO VI -> EN QUA VOCOS...")
                     for idx in range(len(fix_src)):
                         pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
+                        vocos_upper_wav = vocos.decode(tgt_m[idx:idx+1].float()).squeeze().cpu()
                         gt_wav = tgt_24[idx].cpu()
+                        src_wav_16k = fix_src[idx].cpu()
 
+                        out_src = os.path.join(out_dir, f"sample_{idx:02d}_vi_input.wav")
                         out_pred = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred.wav")
+                        out_mel = os.path.join(out_dir, f"sample_{idx:02d}_en_mel_vocos.wav")
                         out_gt = os.path.join(out_dir, f"sample_{idx:02d}_en_groundtruth.wav")
+
+                        save_wav_file(out_src, src_wav_16k, 16000)
                         save_wav_file(out_pred, pred_wav, 24000)
+                        save_wav_file(out_mel, vocos_upper_wav, 24000)
                         save_wav_file(out_gt, gt_wav, 24000)
 
                         if idx == 0:
@@ -861,7 +890,7 @@ def main():
                         en_p = fix_en_texts[idx][:35] + "..." if len(fix_en_texts[idx]) > 35 else fix_en_texts[idx]
                         print(f"   [Cặp #{idx:02d}/16] Vi: \"{vi_p}\" -> En: \"{en_p}\"")
                 print("-" * 75)
-                print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH DỊCH VI -> EN (CẢ PRED & GROUND TRUTH) TẠI:")
+                print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH DỊCH VI -> EN (INPUT, PRED, MEL_VOCOS & GT) TẠI:")
                 print(f"  👉 Thư mục: {out_dir}/")
             except Exception as e:
                 print(f"[Vocos Info] Chưa xuất được audio: {e}")
