@@ -144,12 +144,15 @@ case "$ACTION" in
         ;;
 
     eval)
-        CASE_CHOICE="${2:-all}"
-        echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm cho Case: $CASE_CHOICE..."
+        CASE_CHOICE="${2:-sota}"
+        S2TT_MODE="${3:-both}"
+        NUM_SAMPLES="${4:-10}"
+        echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm..."
+        echo "   • Kịch bản: $CASE_CHOICE | Chế độ S2TT: $S2TT_MODE | Số mẫu: $NUM_SAMPLES"
         # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
         pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses sacrebleu -q 2>/dev/null || true
-        python -u eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10 2>&1 | tee -a "$LOG_DIR/eval.log"
+        python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 
     encoders)
@@ -174,7 +177,10 @@ case "$ACTION" in
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"
         echo "  bash run.sh plot [tên_exp]       -> Vẽ biểu đồ ASCII và xuất file ảnh SVG/PNG đồ thị loss"
-        echo "  bash run.sh eval [0|6|5|4|all]   -> Chạy benchmark (0: MMS-TTS, 6: XTTS-v2/F5-TTS, 5: SeamlessM4T, 4: Đề xuất)"
+        echo "  bash run.sh eval sota both 10    -> Benchmark cả F5-TTS & XTTS-v2 ở 2 chế độ (2-step & 3-step)"
+        echo "  bash run.sh eval xtts [both|2step|3step] -> Benchmark riêng XTTS-v2 Voice Cloning"
+        echo "  bash run.sh eval f5 [both|2step|3step]   -> Benchmark riêng F5-TTS Flow-Matching"
+        echo "  bash run.sh eval all             -> Benchmark toàn bộ hệ sinh thái (Case 0, 6, 7, 1, 2, 3, 4)"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"
