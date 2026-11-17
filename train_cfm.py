@@ -129,6 +129,15 @@ class Logger:
         self.terminal.flush()
         self.log_file.flush()
 
+    def isatty(self):
+        return getattr(self.terminal, "isatty", lambda: False)()
+
+    def fileno(self):
+        return getattr(self.terminal, "fileno", lambda: 1)()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
 def save_wav_file(filepath, waveform, sample_rate):
     """Ghi audio thành file .wav chuẩn PCM 16-bit mà không cần phụ thuộc torchaudio C++."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -341,17 +350,18 @@ class CFMStage1System(nn.Module):
         return loss
 
     @torch.no_grad()
-    def inference(self, whisper_features, num_steps=25):
+    def inference(self, whisper_features, num_steps=25, target_len=None):
         self.eval()
         B, T_src, _ = whisper_features.shape
-        T_tgt = int(T_src * (24000.0 / 16000.0) * (320.0 / 256.0))
+        if target_len is None:
+            target_len = int(T_src * (24000.0 / 16000.0) * (320.0 / 256.0))
         cond_512 = self.cond_proj(whisper_features)
-        cond_512 = F.interpolate(cond_512.transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
+        cond_512 = F.interpolate(cond_512.transpose(1, 2), size=target_len, mode='linear', align_corners=False)
         spk_emb = self.spk_encoder(whisper_features)
 
         device = whisper_features.device
         dtype = whisper_features.dtype
-        x = torch.randn(B, self.n_mels, T_tgt, device=device, dtype=dtype)
+        x = torch.randn(B, self.n_mels, target_len, device=device, dtype=dtype)
         dt = 1.0 / num_steps
         for step in range(num_steps):
             t_val = step * dt
@@ -497,15 +507,17 @@ def main():
         fix_audio, fix_txt = pipeline.fetch_batch(batch_size=16)
 
         if feat_extractor and whisper_enc:
-            in_p = feat_extractor(fix_audio.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
+            in_p = feat_extractor(list(fix_audio.numpy()), sampling_rate=16000, return_tensors='pt', padding="max_length")
             f = in_p.input_features.to(device=device, dtype=dtype)
             if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
             elif f.shape[-1] > 3000: f = f[:, :, :3000]
             with torch.no_grad():
                 fl = whisper_enc(f).last_hidden_state
-            real_l = max(10, int(fix_audio.shape[-1] / 320))
+            real_l = max(10, min(1500, int(fix_audio.shape[-1] / 320)))
             fix_latents = fl[:, :real_l, :]
+            print(f"✓ Đã trích xuất đặc trưng âm học thật từ Whisper ({whisper_id}) [Shape: {list(fix_latents.shape)}]")
         else:
+            print("⚠️ CẢNH BÁO: Whisper Encoder không tải được, đang dùng latents ngẫu nhiên!")
             fix_latents = torch.randn(16, 100, 768, device=device, dtype=dtype)
 
         fix_24k = resample_16k_to_24k(fix_audio.to(device=device, dtype=torch.float32))
@@ -531,18 +543,34 @@ def main():
         print("-" * 75)
         print(f"✅ Loss giảm từ {initial_l:.4f} xuống {final_l:.4f} (Giảm {(1.0 - final_l/initial_l)*100:.1f}%) trong {time.time()-t_start:.1f}s!")
 
-        # Xuất file .wav nghe thử qua Vocos
-        out_dir = "outputs/sanity"
+        # Xuất toàn bộ 16 file .wav nghe thử qua Vocos
+        out_dir = "outputs/sanity/cfm_overfit16"
+        legacy_dir = "outputs/sanity"
         os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(legacy_dir, exist_ok=True)
         try:
             vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
-            gen_mel = model.inference(fix_latents[:1], num_steps=25)
+            gen_mels = model.inference(fix_latents, num_steps=25, target_len=fix_mel.shape[-1])
             with torch.no_grad():
-                gen_wav = vocos.decode(gen_mel.float()).squeeze().cpu()
-            out_wav = os.path.join(out_dir, "cfm_en_overfit16_sample0.wav")
-            save_wav_file(out_wav, gen_wav, 24000)
-            print(f"🎧 Đã xuất file audio kiểm tra khả năng học tại: {out_wav}")
-            print(f"   Văn bản câu 0: \"{fix_txt[0]}\"")
+                print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_audio)} CÂU AUDIO QUA VOCOS...")
+                for idx in range(len(fix_audio)):
+                    pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
+                    gt_wav = fix_24k[idx].cpu()
+
+                    out_pred = os.path.join(out_dir, f"sample_{idx:02d}_pred.wav")
+                    out_gt = os.path.join(out_dir, f"sample_{idx:02d}_groundtruth.wav")
+                    save_wav_file(out_pred, pred_wav, 24000)
+                    save_wav_file(out_gt, gt_wav, 24000)
+
+                    if idx == 0:
+                        save_wav_file(os.path.join(legacy_dir, "cfm_en_overfit16_sample0.wav"), pred_wav, 24000)
+
+                    txt_preview = fix_txt[idx][:45] + "..." if len(fix_txt[idx]) > 45 else fix_txt[idx]
+                    print(f"   [Mẫu #{idx:02d}/16] {out_pred} | \"{txt_preview}\"")
+            print("-" * 75)
+            print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH (CẢ FILE DỰ ĐOÁN & FILE GỐC) TẠI:")
+            print(f"  👉 Thư mục: {out_dir}/")
+            print(f"  👉 Bạn có thể nghe thử và so sánh từng câu trực tiếp trên giao diện Marimo!")
         except Exception as e:
             print(f"[Vocos Info] Không thể giải mã audio: {e}")
         print("=" * 75 + "\n")

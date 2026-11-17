@@ -96,6 +96,15 @@ class TeeLogger(object):
         self.terminal.flush()
         self.log.flush()
 
+    def isatty(self):
+        return getattr(self.terminal, "isatty", lambda: False)()
+
+    def fileno(self):
+        return getattr(self.terminal, "fileno", lambda: 1)()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
 def load_yaml_config(config_path):
     """Đọc file YAML an toàn với fallback nếu chưa cài pyyaml."""
     default_config = {
@@ -736,15 +745,17 @@ def main():
         fix_src, fix_tgt, fix_en_texts, fix_vi_texts = data_pipeline.fetch_batch(batch_size=num_samples)
 
         if feat_extractor is not None and whisper_enc is not None:
-            in_proc = feat_extractor(fix_src.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
+            in_proc = feat_extractor(list(fix_src.numpy()), sampling_rate=16000, return_tensors='pt', padding="max_length")
             f = in_proc.input_features.to(device=device, dtype=dtype)
             if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
             elif f.shape[-1] > 3000: f = f[:, :, :3000]
             with torch.no_grad():
                 fl = whisper_enc(f).last_hidden_state
-            real_l = max(10, int(fix_src.shape[-1] / 320))
+            real_l = max(10, min(1500, int(fix_src.shape[-1] / 320)))
             s_lat = fl[:, :real_l, :]
+            print(f"✓ Đã trích xuất đặc trưng tiếng Việt từ PhoWhisper ({whisper_id}) [Shape: {list(s_lat.shape)}]")
         else:
+            print("⚠️ CẢNH BÁO: PhoWhisper Encoder không tải được, đang dùng latents ngẫu nhiên!")
             s_lat = torch.randn(num_samples, 100, 768, device=device, dtype=dtype)
 
         tgt_24 = resample_16k_to_24k(fix_tgt.to(device=device, dtype=torch.float32))
@@ -775,20 +786,35 @@ def main():
         else:
             print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
 
-        # Nếu là Overfit sâu 500 bước -> Xuất file audio nghe thử qua Vocos
+        # Nếu là Overfit sâu 500 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
         if is_deep:
-            out_dir = "outputs/sanity"
+            out_dir = "outputs/sanity/bridge_overfit16"
+            legacy_dir = "outputs/sanity"
             os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(legacy_dir, exist_ok=True)
             try:
                 vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
-                gen_mel = model.inference(s_lat[:1], num_steps=25)
+                gen_mels = model.inference(s_lat, num_steps=25)
                 with torch.no_grad():
-                    gen_wav = vocos.decode(gen_mel.float()).squeeze().cpu()
-                out_wav = os.path.join(out_dir, "bridge_vi_en_overfit16_sample0.wav")
-                save_wav_file(out_wav, gen_wav, 24000)
-                print(f"🎧 Đã xuất file audio kiểm tra khả năng học tại: {out_wav}")
-                print(f"   🇻🇳 Input Vi: \"{fix_vi_texts[0]}\"")
-                print(f"   🎯 Target En: \"{fix_en_texts[0]}\"")
+                    print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_src)} FILE AUDIO VI -> EN QUA VOCOS...")
+                    for idx in range(len(fix_src)):
+                        pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
+                        gt_wav = tgt_24[idx].cpu()
+
+                        out_pred = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred.wav")
+                        out_gt = os.path.join(out_dir, f"sample_{idx:02d}_en_groundtruth.wav")
+                        save_wav_file(out_pred, pred_wav, 24000)
+                        save_wav_file(out_gt, gt_wav, 24000)
+
+                        if idx == 0:
+                            save_wav_file(os.path.join(legacy_dir, "bridge_vi_en_overfit16_sample0.wav"), pred_wav, 24000)
+
+                        vi_p = fix_vi_texts[idx][:35] + "..." if len(fix_vi_texts[idx]) > 35 else fix_vi_texts[idx]
+                        en_p = fix_en_texts[idx][:35] + "..." if len(fix_en_texts[idx]) > 35 else fix_en_texts[idx]
+                        print(f"   [Cặp #{idx:02d}/16] Vi: \"{vi_p}\" -> En: \"{en_p}\"")
+                print("-" * 75)
+                print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH DỊCH VI -> EN (CẢ PRED & GROUND TRUTH) TẠI:")
+                print(f"  👉 Thư mục: {out_dir}/")
             except Exception as e:
                 print(f"[Vocos Info] Chưa xuất được audio: {e}")
 
