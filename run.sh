@@ -12,9 +12,15 @@ mkdir -p "$LOG_DIR" "checkpoints" "outputs/sanity" "outputs/benchmark"
 PID_FILE="$LOG_DIR/${EXP_NAME}.pid"
 LOG_FILE="$LOG_DIR/${EXP_NAME}.log"
 
-# Tự động liên kết thư mục dự án với giao diện File Explorer của Marimo trên Molab
-if [ -d "/marimo" ] && [ "$PWD" != "/marimo" ]; then
-    ln -sfn "$PWD" "/marimo/S2ST-FlowMatching" 2>/dev/null || true
+# Tự động liên kết thư mục dự án với mọi vị trí hiển thị của Marimo File Explorer trên Molab
+for target_dir in "/marimo" "/home/marimo" "/workspace"; do
+    if [ -d "$target_dir" ] && [ "$PWD" != "$target_dir" ]; then
+        ln -sfn "$PWD" "$target_dir/S2ST-FlowMatching" 2>/dev/null || true
+    fi
+done
+NOTEBOOK_DIR=$(dirname "$(find /marimo /home/marimo /root /workspace -maxdepth 2 -name "notebook.py" 2>/dev/null | head -n 1)" 2>/dev/null || true)
+if [ -n "$NOTEBOOK_DIR" ] && [ -d "$NOTEBOOK_DIR" ] && [ "$PWD" != "$NOTEBOOK_DIR" ]; then
+    ln -sfn "$PWD" "$NOTEBOOK_DIR/S2ST-FlowMatching" 2>/dev/null || true
 fi
 
 case "$ACTION" in

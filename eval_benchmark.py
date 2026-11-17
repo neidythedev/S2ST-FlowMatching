@@ -99,9 +99,23 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
 
+    class MockSpectrogram(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_buffer("window", torch.empty(0))
+        def forward(self, x): return x
+
+    class MockMelScale(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_buffer("fb", torch.empty(0))
+        def forward(self, x): return x
+
     class MockMelSpectrogram(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
+            self.spectrogram = MockSpectrogram()
+            self.mel_scale = MockMelScale()
         def forward(self, x):
             return x
 
@@ -174,7 +188,10 @@ def load_vocos(device):
     try:
         from vocos import Vocos
         print("⏳ Đang nạp Pretrained Vocos Vocoder 24kHz...")
+        orig_load = Vocos.load_state_dict
+        Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
         vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+        Vocos.load_state_dict = orig_load
         vocos.eval()
         print("✓ Nạp Vocos Vocoder thành công!")
         return vocos

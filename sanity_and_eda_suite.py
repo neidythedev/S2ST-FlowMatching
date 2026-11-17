@@ -82,9 +82,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class MockSpectrogram(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.register_buffer("window", torch.empty(0))
+    def forward(self, x): return x
+
+class MockMelScale(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.register_buffer("fb", torch.empty(0))
+    def forward(self, x): return x
+
 class MockMelSpectrogram(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.spectrogram = MockSpectrogram()
+        self.mel_scale = MockMelScale()
     def forward(self, x):
         return x
 
@@ -92,6 +106,15 @@ if "torchaudio.transforms" in sys.modules:
     sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
 if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
     sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
+
+def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
+    """Nạp Vocos vocoder an toàn với strict=False để chống lỗi buffer torchaudio."""
+    from vocos import Vocos
+    orig_load = Vocos.load_state_dict
+    Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
+    vocos = Vocos.from_pretrained(repo_id)
+    Vocos.load_state_dict = orig_load
+    return vocos.to(device)
 
 from train_bridge import (
     build_mel_filterbank, extract_100_mel, resample_16k_to_24k, resample_24k_to_16k,
@@ -193,8 +216,7 @@ def run_vocos_roundtrip_test(device):
     print("=" * 75)
 
     try:
-        from vocos import Vocos
-        vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+        vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
         vocos.eval()
         print("✓ Nạp thành công Vocos Vocoder (24kHz)!")
     except Exception as e:

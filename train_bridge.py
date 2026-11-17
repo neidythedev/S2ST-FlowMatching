@@ -170,9 +170,23 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
 
+    class MockSpectrogram(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_buffer("window", torch.empty(0))
+        def forward(self, x): return x
+
+    class MockMelScale(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_buffer("fb", torch.empty(0))
+        def forward(self, x): return x
+
     class MockMelSpectrogram(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
+            self.spectrogram = MockSpectrogram()
+            self.mel_scale = MockMelScale()
         def forward(self, x):
             return x
 
@@ -180,6 +194,14 @@ try:
         sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
     if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
         sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
+
+    def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
+        from vocos import Vocos
+        orig_load = Vocos.load_state_dict
+        Vocos.load_state_dict = lambda self, sd, strict=False: orig_load(self, sd, strict=False)
+        vocos = Vocos.from_pretrained(repo_id)
+        Vocos.load_state_dict = orig_load
+        return vocos.to(device)
 except ImportError as e:
     print(f"[Fatal Error] PyTorch chưa được cài đặt: {e}")
     sys.exit(1)
@@ -752,8 +774,7 @@ def main():
             out_dir = "outputs/sanity"
             os.makedirs(out_dir, exist_ok=True)
             try:
-                from vocos import Vocos
-                vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+                vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
                 gen_mel = model.inference(s_lat[:1], num_steps=25)
                 with torch.no_grad():
                     gen_wav = vocos.decode(gen_mel.float()).squeeze().cpu()

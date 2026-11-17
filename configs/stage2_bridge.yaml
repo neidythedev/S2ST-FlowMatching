@@ -4,7 +4,7 @@
 # ==============================================================================
 
 model:
-  whisper_model: "openai/whisper-small" # Whisper Encoder trích xuất đặc trưng tiếng Việt
+  whisper_model: "vinai/PhoWhisper-small" # PhoWhisper-small tối ưu cho nhận diện đặc trưng âm học tiếng Việt (WER 9.0% vs 20.6% Whisper-small)
   encoder_dim: 768
   bridge_dim: 512
   bridge_layers: 6
