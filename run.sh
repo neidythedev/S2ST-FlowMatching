@@ -123,6 +123,32 @@ case "$ACTION" in
         echo "✓ Khôi phục Checkpoints thành công từ Google Drive!"
         ;;
 
+    upload)
+        echo "📤 Đang đẩy toàn bộ outputs (audio, HTML, metrics) lên GitHub..."
+        # Đếm số file sẽ upload
+        WAV_COUNT=$(find outputs/ -name "*.wav" 2>/dev/null | wc -l)
+        HTML_COUNT=$(find outputs/ -name "*.html" 2>/dev/null | wc -l)
+        JSON_COUNT=$(find outputs/ -name "*.json" 2>/dev/null | wc -l)
+        MD_COUNT=$(find outputs/ -name "*.md" 2>/dev/null | wc -l)
+        echo "   📊 Tìm thấy: ${WAV_COUNT} file .wav | ${HTML_COUNT} file .html | ${JSON_COUNT} file .json | ${MD_COUNT} file .md"
+
+        # Git add outputs
+        git add outputs/ -f
+        CHANGED=$(git diff --cached --stat 2>/dev/null | tail -1)
+        if [ -z "$CHANGED" ]; then
+            echo "ℹ️ Không có file mới nào cần đẩy lên. Outputs đã được cập nhật trên GitHub rồi!"
+            exit 0
+        fi
+
+        echo "   📦 Thay đổi: $CHANGED"
+        TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
+        git commit -m "📤 Upload outputs: ${WAV_COUNT} wavs, ${HTML_COUNT} html, ${JSON_COUNT} json (${TIMESTAMP})"
+        git push origin s2st-vi-en
+        echo ""
+        echo "✅ Đẩy outputs lên GitHub thành công!"
+        echo "👉 Tải về tại: https://github.com/neidythedev/S2ST-FlowMatching/tree/s2st-vi-en/outputs"
+        ;;
+
     sanity)
         echo "🧪 Đang chạy trọn bộ EDA & Sanity Check Suite (Vocos Round-trip + Whisper Vi health)..."
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
@@ -227,6 +253,7 @@ sys.exit(1)
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"
+        echo "  bash run.sh upload               -> Đẩy outputs (audio, HTML) lên GitHub để tải về"
         echo "=========================================================="
         exit 1
         ;;
