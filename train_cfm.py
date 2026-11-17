@@ -243,13 +243,35 @@ def extract_100_mel(waveform_24k, mel_filterbank, n_fft=1024, hop_length=256):
     return log_mel
 
 def resample_16k_to_24k(waveform_16k):
+    """
+    Chuyển đổi tần số lấy mẫu từ 16kHz lên 24kHz bằng phép biến đổi Fourier (FFT Sinc Resampling).
+    Loại bỏ hoàn toàn hiện tượng méo âm và nhiễu răng cưa (aliasing) do nội suy tuyến tính gây ra.
+    """
+    orig_shape = waveform_16k.shape
     if waveform_16k.dim() == 1:
-        waveform_16k = waveform_16k.unsqueeze(0).unsqueeze(0)
-    elif waveform_16k.dim() == 2:
-        waveform_16k = waveform_16k.unsqueeze(1)
-    new_len = int(waveform_16k.shape[-1] * (24000.0 / 16000.0))
-    resampled = F.interpolate(waveform_16k, size=new_len, mode='linear', align_corners=False)
-    return resampled.squeeze(1)
+        waveform_16k = waveform_16k.unsqueeze(0)
+    elif waveform_16k.dim() > 2:
+        waveform_16k = waveform_16k.view(-1, waveform_16k.shape[-1])
+
+    B, T = waveform_16k.shape
+    new_T = int(round(T * (24000.0 / 16000.0)))
+
+    X = torch.fft.rfft(waveform_16k.float(), dim=-1)
+    target_bins = new_T // 2 + 1
+    pad_bins = target_bins - X.shape[-1]
+
+    if pad_bins > 0:
+        X_pad = F.pad(X, (0, pad_bins))
+    else:
+        X_pad = X[:, :target_bins]
+
+    w_24k = torch.fft.irfft(X_pad, n=new_T, dim=-1) * (float(new_T) / float(T))
+
+    if len(orig_shape) == 1:
+        return w_24k.squeeze(0)
+    elif len(orig_shape) == 3:
+        return w_24k.view(orig_shape[0], orig_shape[1], new_T)
+    return w_24k
 
 # ==============================================================================
 # 2. KIẾN TRÚC MÔ HÌNH: OT-CFM TARGET DECODER
@@ -350,7 +372,7 @@ class CFMStage1System(nn.Module):
         return loss
 
     @torch.no_grad()
-    def inference(self, whisper_features, num_steps=25, target_len=None):
+    def inference(self, whisper_features, num_steps=32, target_len=None):
         self.eval()
         B, T_src, _ = whisper_features.shape
         if target_len is None:
@@ -363,11 +385,22 @@ class CFMStage1System(nn.Module):
         dtype = whisper_features.dtype
         x = torch.randn(B, self.n_mels, target_len, device=device, dtype=dtype)
         dt = 1.0 / num_steps
+
+        # Thuật toán giải ODE bậc 2 Runge-Kutta Midpoint: Triệt tiêu tích tụ sai số gây rè/rít
         for step in range(num_steps):
             t_val = step * dt
-            t = torch.full((B,), t_val, device=device, dtype=dtype)
-            v = self.decoder(x, t, cond_512, spk_emb)
-            x = x + v * dt
+            t_cur = torch.full((B,), t_val, device=device, dtype=dtype)
+            v1 = self.decoder(x, t_cur, cond_512, spk_emb)
+
+            # Bước phụ tại điểm giữa t + 0.5*dt
+            x_mid = x + v1 * (0.5 * dt)
+            t_mid = torch.full((B,), min(1.0, t_val + 0.5 * dt), device=device, dtype=dtype)
+            v2 = self.decoder(x_mid, t_mid, cond_512, spk_emb)
+
+            x = x + v2 * dt
+
+        # Chặn ngưỡng âm học chuẩn [-11.5, 3.0] của Vocos để triệt tiêu hoàn toàn nhiễu clipping
+        x = torch.clamp(x, min=-11.5, max=3.0)
         return x
 
 # ==============================================================================
@@ -523,21 +556,25 @@ def main():
         fix_24k = resample_16k_to_24k(fix_audio.to(device=device, dtype=torch.float32))
         fix_mel = extract_100_mel(fix_24k, mel_fb).to(dtype=dtype)
 
-        overfit_opt = torch.optim.AdamW(model.parameters(), lr=3.0e-4)
+        num_overfit_steps = 800
+        overfit_opt = torch.optim.AdamW(model.parameters(), lr=4.0e-4, weight_decay=1.0e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(overfit_opt, T_max=num_overfit_steps, eta_min=1.0e-5)
         model.train()
         t_start = time.time()
         initial_l = None
         final_l = None
 
-        for step in range(1, 501):
+        for step in range(1, num_overfit_steps + 1):
             overfit_opt.zero_grad()
             l = model.compute_loss(fix_latents, fix_mel)
             l.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             overfit_opt.step()
+            scheduler.step()
 
             if step == 1: initial_l = l.item()
             if step % 50 == 0 or step == 1:
-                print(f"   [Overfit Step {step:03d}/500] CFM Loss: {l.item():.4f}")
+                print(f"   [Overfit Step {step:03d}/{num_overfit_steps}] CFM Loss: {l.item():.4f}")
             final_l = l.item()
 
         print("-" * 75)
@@ -550,16 +587,20 @@ def main():
         os.makedirs(legacy_dir, exist_ok=True)
         try:
             vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
-            gen_mels = model.inference(fix_latents, num_steps=25, target_len=fix_mel.shape[-1])
+            gen_mels = model.inference(fix_latents, num_steps=32, target_len=fix_mel.shape[-1])
             with torch.no_grad():
                 print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_audio)} CÂU AUDIO QUA VOCOS...")
                 for idx in range(len(fix_audio)):
                     pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
+                    gt_mel_wav = vocos.decode(fix_mel[idx:idx+1].float()).squeeze().cpu()
                     gt_wav = fix_24k[idx].cpu()
 
                     out_pred = os.path.join(out_dir, f"sample_{idx:02d}_pred.wav")
+                    out_gt_mel = os.path.join(out_dir, f"sample_{idx:02d}_gt_mel_vocos.wav")
                     out_gt = os.path.join(out_dir, f"sample_{idx:02d}_groundtruth.wav")
+
                     save_wav_file(out_pred, pred_wav, 24000)
+                    save_wav_file(out_gt_mel, gt_mel_wav, 24000)
                     save_wav_file(out_gt, gt_wav, 24000)
 
                     if idx == 0:
@@ -568,9 +609,9 @@ def main():
                     txt_preview = fix_txt[idx][:45] + "..." if len(fix_txt[idx]) > 45 else fix_txt[idx]
                     print(f"   [Mẫu #{idx:02d}/16] {out_pred} | \"{txt_preview}\"")
             print("-" * 75)
-            print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH (CẢ FILE DỰ ĐOÁN & FILE GỐC) TẠI:")
+            print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH (CẢ FILE DỰ ĐOÁN, GT-MEL & FILE GỐC) TẠI:")
             print(f"  👉 Thư mục: {out_dir}/")
-            print(f"  👉 Bạn có thể nghe thử và so sánh từng câu trực tiếp trên giao diện Marimo!")
+            print(f"  👉 Bạn có thể nghe so sánh sample_00_pred.wav với sample_00_gt_mel_vocos.wav!")
         except Exception as e:
             print(f"[Vocos Info] Không thể giải mã audio: {e}")
         print("=" * 75 + "\n")

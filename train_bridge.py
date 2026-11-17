@@ -255,24 +255,53 @@ def extract_100_mel(waveform_24k, mel_fb, n_fft=1024, hop_length=256):
     return torch.log(torch.clamp(mel, min=1e-5))
 
 def resample_16k_to_24k(audio_16k):
-    """Nội suy tuyến tính PyTorch chuyển đổi 16kHz -> 24kHz (1.5x) siêu tốc."""
+    """FFT Sinc Resampling từ 16kHz -> 24kHz bằng PyTorch thuần (Triệt tiêu nhiễu aliasing)."""
+    orig_shape = audio_16k.shape
     if audio_16k.dim() == 1:
-        audio_16k = audio_16k.unsqueeze(0).unsqueeze(0)
-    elif audio_16k.dim() == 2:
-        audio_16k = audio_16k.unsqueeze(1)
-    t_new = int(audio_16k.shape[-1] * 1.5)
-    audio_24k = F.interpolate(audio_16k, size=t_new, mode="linear", align_corners=False)
-    return audio_24k.squeeze(1)
+        audio_16k = audio_16k.unsqueeze(0)
+    elif audio_16k.dim() > 2:
+        audio_16k = audio_16k.view(-1, audio_16k.shape[-1])
+
+    B, T = audio_16k.shape
+    new_T = int(round(T * (24000.0 / 16000.0)))
+
+    X = torch.fft.rfft(audio_16k.float(), dim=-1)
+    target_bins = new_T // 2 + 1
+    pad_bins = target_bins - X.shape[-1]
+
+    if pad_bins > 0:
+        X_pad = F.pad(X, (0, pad_bins))
+    else:
+        X_pad = X[:, :target_bins]
+
+    w_24k = torch.fft.irfft(X_pad, n=new_T, dim=-1) * (float(new_T) / float(T))
+    if len(orig_shape) == 1:
+        return w_24k.squeeze(0)
+    elif len(orig_shape) == 3:
+        return w_24k.view(orig_shape[0], orig_shape[1], new_T)
+    return w_24k
 
 def resample_24k_to_16k(audio_24k):
-    """Nội suy tuyến tính PyTorch chuyển đổi 24kHz -> 16kHz (2/3x) siêu tốc."""
+    """FFT Sinc Downsampling từ 24kHz -> 16kHz bằng PyTorch thuần."""
+    orig_shape = audio_24k.shape
     if audio_24k.dim() == 1:
-        audio_24k = audio_24k.unsqueeze(0).unsqueeze(0)
-    elif audio_24k.dim() == 2:
-        audio_24k = audio_24k.unsqueeze(1)
-    t_new = int(audio_24k.shape[-1] * (16000.0 / 24000.0))
-    audio_16k = F.interpolate(audio_24k, size=t_new, mode="linear", align_corners=False)
-    return audio_16k.squeeze(1)
+        audio_24k = audio_24k.unsqueeze(0)
+    elif audio_24k.dim() > 2:
+        audio_24k = audio_24k.view(-1, audio_24k.shape[-1])
+
+    B, T = audio_24k.shape
+    new_T = int(round(T * (16000.0 / 24000.0)))
+
+    X = torch.fft.rfft(audio_24k.float(), dim=-1)
+    target_bins = new_T // 2 + 1
+    X_cut = X[:, :target_bins]
+
+    w_16k = torch.fft.irfft(X_cut, n=new_T, dim=-1) * (float(new_T) / float(T))
+    if len(orig_shape) == 1:
+        return w_16k.squeeze(0)
+    elif len(orig_shape) == 3:
+        return w_16k.view(orig_shape[0], orig_shape[1], new_T)
+    return w_16k
 
 # ==============================================================================
 # 2. KIẾN TRÚC MÔ HÌNH: CROSS-ATTENTION BRIDGE & OT-CFM TARGET DECODER
@@ -431,7 +460,7 @@ class ViEnS2STSystem(nn.Module):
         return total_loss, cfm_loss, dur_loss
 
     @torch.no_grad()
-    def inference(self, src_whisper, speaker_emb=None, num_steps=25):
+    def inference(self, src_whisper, speaker_emb=None, num_steps=32):
         self.eval()
         B = src_whisper.shape[0]
         if speaker_emb is None:
@@ -443,10 +472,21 @@ class ViEnS2STSystem(nn.Module):
 
         x_t = torch.randn(B, self.n_mels, T_tgt, device=src_whisper.device, dtype=src_whisper.dtype)
         dt = 1.0 / num_steps
+
+        # 2nd-Order Midpoint ODE Solver
         for step in range(num_steps):
-            cur_t = torch.full((B,), step * dt, device=src_whisper.device, dtype=src_whisper.dtype)
-            v_pred = self.decoder(x_t, cur_t, cond, speaker_emb)
-            x_t = x_t + v_pred * dt
+            t_val = step * dt
+            cur_t = torch.full((B,), t_val, device=src_whisper.device, dtype=src_whisper.dtype)
+            v1 = self.decoder(x_t, cur_t, cond, speaker_emb)
+
+            x_mid = x_t + v1 * (0.5 * dt)
+            t_mid = torch.full((B,), min(1.0, t_val + 0.5 * dt), device=src_whisper.device, dtype=src_whisper.dtype)
+            v2 = self.decoder(x_mid, t_mid, cond, speaker_emb)
+
+            x_t = x_t + v2 * dt
+
+        # Chặn ngưỡng âm học chuẩn [-11.5, 3.0] chống clipping
+        x_t = torch.clamp(x_t, min=-11.5, max=3.0)
         return x_t
 
 # Alias tương thích ngược
