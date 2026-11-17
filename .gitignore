@@ -1,6 +1,7 @@
 # Environment & Secrets
 .env*
 *.env
+MOLAB_1CLICK_SETUP.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
