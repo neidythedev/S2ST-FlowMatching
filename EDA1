@@ -1,0 +1,122 @@
+===========================================================================
+📊 BƯỚC 1: EDA DỮ LIỆU & KIỂM TRA PHÂN PHỐI ĐỘ DÀI (GOOGLE FLEURS VI -> EN)
+===========================================================================
+📡 Đang kết nối Streaming Google FLEURS (Src: VI_VN -> Tgt: EN_US, split='train')...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+README.md: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 386k/386k [00:00<00:00, 182MB/s]
+✓ Kết nối dữ liệu thật thành công qua Streaming!
+🔗 Đang căn chỉnh song song vi_vn ↔ en_us bằng trường 'id' (FLoRes sentence ID)...
+   → Đã nạp 800 câu đích (en_us) độc lập vào bộ đệm.
+   ✓ Căn chỉnh thành công 600 cặp song song vi_vn ↔ en_us chuẩn xác!
+
+📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG]:
+   🔹 Cặp #01 [FLoRes ID 411]:
+      🇻🇳 Vi (Nguồn): "phát minh bánh xe nan hoa làm cho những cỗ xe ngựa chiến của người assyria nhẹ hơn nhanh hơn và sẵn sàng hơn để đánh bại các binh lính và cỗ xe khác"
+      🇬🇧 En (Đích) : "the invention of spoke wheels made assyrian chariots lighter faster and better prepared to outrun soldiers and other chariots"
+   🔹 Cặp #02 [FLoRes ID 314]:
+      🇻🇳 Vi (Nguồn): "karno là một thầy giáo dạy tiếng anh nổi tiếng nhưng gây ra nhiều tranh cãi là người đã giảng dạy tại trường modern education và king's glory và tuyên bố từng có 9.000 học viên vào lúc đỉnh cao sự nghiệp"
+      🇬🇧 En (Đích) : "karno is a well-known but controversial english tutor who taught under modern education and king's glory who claimed to have 9,000 students at the peak of his career"
+   🔹 Cặp #03 [FLoRes ID 948]:
+      🇻🇳 Vi (Nguồn): "hồ onega cũng được kết nối với volga vì vậy vẫn có thể đi từ biển caspi qua nga"
+      🇬🇧 En (Đích) : "lake onega is also connected to volga so coming from the caspian sea through russia is still possible"
+-----------------------------------------------------------------
+
+🔍 Đang phân tích thống kê trên 30 cặp câu song song...
+  ⚠️ Cảnh báo cặp #2: Audio quá dài (>15s): Vi=17.70s, En=12.30s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #16: Audio quá dài (>15s): Vi=17.10s, En=12.96s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #18: Audio quá dài (>15s): Vi=19.56s, En=18.54s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #20: Audio quá dài (>15s): Vi=18.72s, En=15.60s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #25: Audio quá dài (>15s): Vi=17.76s, En=11.64s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #28: Audio quá dài (>15s): Vi=15.12s, En=17.40s (Có nguy cơ OOM)
+  ⚠️ Cảnh báo cặp #30: Audio quá dài (>15s): Vi=15.90s, En=10.38s (Có nguy cơ OOM)
+---------------------------------------------------------------------------
+📈 KẾT QUẢ PHÂN TÍCH THỐNG KÊ EDA:
+  • Độ dài Tiếng Việt (Nguồn): Trung bình 11.76s | Min: 4.32s | Max: 19.56s
+  • Độ dài Tiếng Anh  (Đích) : Trung bình 10.03s | Min: 3.84s | Max: 18.54s
+  • Tỷ lệ độ dài En / Vi    : Trung bình 0.88x (Hợp lý trong khoảng 0.7x ~ 1.5x)
+  • Số lượng mẫu bất thường : 7 / 30 (23.3%)
+ℹ️ Dữ liệu có vài câu ngoại lai, cơ chế max_audio_sec=12.0s trong pipeline sẽ tự động cắt gọt an toàn.
+===========================================================================
+
+
+===========================================================================
+🧪 BƯỚC 2: SANITY CHECK #1 - VOCOS ROUND-TRIP TEST (KIỂM TRA HÀM MEL 100)
+Mục tiêu: Đảm bảo Mel 100-band qua Vocos tái tạo âm thanh trong trẻo, không bị rè/méo.
+===========================================================================
+[Thất bại] Không thể nạp Vocos: cannot import name '_hz_to_mel' from 'torchaudio.functional.functional' (unknown location). Vui lòng cài đặt: pip install vocos
+
+===========================================================================
+🧪 BƯỚC 3: SANITY CHECK #2 - KIỂM TRA ĐỘ KHỎE CỦA WHISPER TRÊN TIẾNG VIỆT (openai/whisper-small)
+Mục tiêu: Đảm bảo Whisper Encoder nghe tiếng Việt chuẩn xác trước khi đóng băng làm nguồn.
+===========================================================================
+⏳ Đang nạp Whisper (openai/whisper-small)...
+preprocessor_config.json: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 185k/185k [00:00<00:00, 238MB/s]
+tokenizer_config.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 283k/283k [00:00<00:00, 380MB/s]
+vocab.json: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 836k/836k [00:00<00:00, 32.0MB/s]
+tokenizer.json: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2.48M/2.48M [00:00<00:00, 168MB/s]
+merges.txt: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 494k/494k [00:00<00:00, 128MB/s]
+normalizer.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 52.7k/52.7k [00:00<00:00, 82.7MB/s]
+added_tokens.json: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 34.6k/34.6k [00:00<00:00, 57.8MB/s]
+special_tokens_map.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2.19k/2.19k [00:00<00:00, 3.02MB/s]
+config.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1.97k/1.97k [00:00<00:00, 6.28MB/s]
+model.safetensors: downloading bytes: ███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████|  643MB, 56.3MB/s  
+model.safetensors: reconstructing file: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████|  967MB /  967MB, 85.8MB/s  
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 479/479 [00:00<00:00, 3613.54it/s]
+generation_config.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 3.87k/3.87k [00:00<00:00, 9.23MB/s]
+✓ Nạp Whisper hoàn tất!
+📡 Đang kết nối Streaming Google FLEURS (Src: VI_VN -> Tgt: EN_US, split='train')...
+✓ Kết nối dữ liệu thật thành công qua Streaming!
+🔗 Đang căn chỉnh song song vi_vn ↔ en_us bằng trường 'id' (FLoRes sentence ID)...
+   → Đã nạp 800 câu đích (en_us) độc lập vào bộ đệm.
+HTTP Error 429 thrown while requesting GET https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/parquet-data/vi_vn/train-00000-of-00001.parquet
+Rate limited. Waiting 30.0s before retry [Retry 1/5].
+   ✓ Căn chỉnh thành công 600 cặp song song vi_vn ↔ en_us chuẩn xác!
+
+📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG]:
+   🔹 Cặp #01 [FLoRes ID 411]:
+      🇻🇳 Vi (Nguồn): "phát minh bánh xe nan hoa làm cho những cỗ xe ngựa chiến của người assyria nhẹ hơn nhanh hơn và sẵn sàng hơn để đánh bại các binh lính và cỗ xe khác"
+      🇬🇧 En (Đích) : "the invention of spoke wheels made assyrian chariots lighter faster and better prepared to outrun soldiers and other chariots"
+   🔹 Cặp #02 [FLoRes ID 314]:
+      🇻🇳 Vi (Nguồn): "karno là một thầy giáo dạy tiếng anh nổi tiếng nhưng gây ra nhiều tranh cãi là người đã giảng dạy tại trường modern education và king's glory và tuyên bố từng có 9.000 học viên vào lúc đỉnh cao sự nghiệp"
+      🇬🇧 En (Đích) : "karno is a well-known but controversial english tutor who taught under modern education and king's glory who claimed to have 9,000 students at the peak of his career"
+   🔹 Cặp #03 [FLoRes ID 948]:
+      🇻🇳 Vi (Nguồn): "hồ onega cũng được kết nối với volga vì vậy vẫn có thể đi từ biển caspi qua nga"
+      🇬🇧 En (Đích) : "lake onega is also connected to volga so coming from the caspian sea through russia is still possible"
+-----------------------------------------------------------------
+
+🎙️ Đang cho Whisper nhận diện thử 10 câu tiếng Việt thực tế...
+
+  🔹 Cặp #01 [WER: 20.6%]:
+     🎯 Chuẩn (Ref): "phát minh bánh xe nan hoa làm cho những cỗ xe ngựa chiến của người assyria nhẹ hơn nhanh hơn và sẵn sàng hơn để đánh bại các binh lính và cỗ xe khác"
+     🗣️ Nhận diện   : "Phát minh bánh xe nang hoa làm cho những cổ xe ngửa chiến của người Assyria nhẹ hơn, nhanh hơn và sẵn sàng hơn để đánh bại các binh lính vào cổ xe khác."
+  🔹 Cặp #02 [WER: 50.0%]:
+     🎯 Chuẩn (Ref): "karno là một thầy giáo dạy tiếng anh nổi tiếng nhưng gây ra nhiều tranh cãi là người đã giảng dạy tại trường modern education và king's glory và tuyên bố từng có 9.000 học viên vào lúc đỉnh cao sự nghiệp"
+     🗣️ Nhận diện   : "Kano là một thời giáo dải tiếng Anh nổi tiếng nhưng gây ra nhiều tranh cãi là người đã dạng dậy tại trường Modern Education và Kinkori."
+  🔹 Cặp #03 [WER: 31.6%]:
+     🎯 Chuẩn (Ref): "hồ onega cũng được kết nối với volga vì vậy vẫn có thể đi từ biển caspi qua nga"
+     🗣️ Nhận diện   : "Hồ Onega cũng được cất nó với vồn ga, vì vậy vẫn có thể đi từ biến Caspi qua Nga."
+  🔹 Cặp #04 [WER: 15.8%]:
+     🎯 Chuẩn (Ref): "thật không may khi bạn làm một đĩa dvd phần biên của nó có lẽ cũng sẽ bị cắt đi và nếu video có phụ đề quá gần với phần phía dưới chúng sẽ không hiển thị hết"
+     🗣️ Nhận diện   : "Thật không may khi bạn là một địa DVD, phần biên của nó có lẽ cũng sẽ bị cắt đi và nếu video có phụ đề quá gần với phần phía dưới chúng sẽ không có lẽ."
+  🔹 Cặp #05 [WER: 17.6%]:
+     🎯 Chuẩn (Ref): "theo vụ kiện cáo rác thải từ trại của liên hợp quốc không được xử lý phù hợp khiến vi khuẩn chảy vào nhánh sông artibonite một trong những con sông lớn nhất haiti"
+     🗣️ Nhận diện   : "Theo vụ kiện cáo, rác thải từ trại của Liên Hợp Quốc không được xử lý phù hợp, khiến vi khuẩn chảy vào nhánh xong Artiponit, một trong những con xong lớn nhất 2T."
+  🔹 Cặp #06 [WER: 52.2%]:
+     🎯 Chuẩn (Ref): "dấu cung lên trông giống chữ v và dấu cung xuống giống như một cái ghim hoặc hình vuông thiếu mất cạnh dưới"
+     🗣️ Nhận diện   : "Giáo cùng lên trong gióng chữ V và giáo cùng xuống, giống như một cái ghiêm hoạt hình vua thiếu mắt cạnh dưới."
+  🔹 Cặp #07 [WER: 26.3%]:
+     🎯 Chuẩn (Ref): "blake cũng đã bị kết án vì cố gắng làm sai lệch tiến trình của vụ án công lý"
+     🗣️ Nhận diện   : "Đây, cũng đã bị cất án vì cố gắng làm sai lợt tí trình của vụ án công lý."
+  🔹 Cặp #08 [WER: 55.0%]:
+     🎯 Chuẩn (Ref): "quận canal tiếng hà lan: grachtengordel là một quận nổi tiếng ở thế kỷ 17 bao quanh binnenstad của am-xtéc-đam"
+     🗣️ Nhận diện   : "Quận Cannell, tiếng Hà Lan Red Teng Odeo là một quần nổi tiếng ở tháng 17 bao quan Viennestad của Amsterdam."
+  🔹 Cặp #09 [WER: 25.0%]:
+     🎯 Chuẩn (Ref): "một năm trước cặp vợ chồng này đã kết hôn tại tiểu bang texas rồi chuyển đến thành phố buffalo để tổ chức ăn mừng cùng với bạn bè và người thân"
+     🗣️ Nhận diện   : "Một năm trước, cặp vợ chồng này đã cất hôm tại Tiểu Ban Tết Sật rồi chuyển đến thành phố Puffalo để tổ chức ăn mừng cùng với bạn bè và người thân."
+  🔹 Cặp #10 [WER: 9.4%]:
+     🎯 Chuẩn (Ref): "dù đã rời chương trình năm 1993 anh ấy vẫn giữ danh hiệu giám đốc sản xuất và tiếp tục nhận hàng chục triệu đô la tiền bản quyền cho mỗi mùa"
+     🗣️ Nhận diện   : "Dù đã rời chương trình năm 1993, anh ấy vẫn giữ danh hiệu giám đốc sản xuất và tiếp tục nhận hàng chục triệu đô la bởi tiền bản quyền cho mỗi mùa."
+---------------------------------------------------------------------------
+📊 Word Error Rate (WER) Trung Bình: 30.3%
+⚠️ Chấp nhận được (30.3% WER). Để đạt độ chính xác cao nhất cho bài báo, nên cân nhắc vinai/PhoWhisper-base hoặc whisper-large-v3.
+===========================================================================

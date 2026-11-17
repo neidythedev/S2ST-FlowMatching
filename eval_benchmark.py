@@ -74,8 +74,12 @@ def apply_torchaudio_mock_if_needed():
 
         ta_func_func.hz_to_mel = _hz_to_mel
         ta_func_func.mel_to_hz = _mel_to_hz
+        ta_func_func._hz_to_mel = _hz_to_mel
+        ta_func_func._mel_to_hz = _mel_to_hz
         ta_func.hz_to_mel = _hz_to_mel
         ta_func.mel_to_hz = _mel_to_hz
+        ta_func._hz_to_mel = _hz_to_mel
+        ta_func._mel_to_hz = _mel_to_hz
         ta.functional = ta_func
         ta.transforms = ta_trans
         ta._extension = ta_ext
