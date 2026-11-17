@@ -211,16 +211,20 @@ sys.exit(1)
         # 3. Cài đặt TTS engines (XTTS-v2 & F5-TTS) nếu cần
         if [[ "$CASE_CHOICE" == "sota" || "$CASE_CHOICE" == "both_tts" || "$CASE_CHOICE" == "all" || "$CASE_CHOICE" == "xtts" || "$CASE_CHOICE" == "6" ]]; then
             echo "📦 [Deps 3/4] Cài đặt XTTS-v2 (coqui-tts + torchcodec)..."
+            export COQUI_TOS_AGREED=1  # Bỏ qua prompt license interactive
             pip install torchcodec -q 2>/dev/null || true
             pip install coqui-tts -q 2>/dev/null || true
         fi
         if [[ "$CASE_CHOICE" == "sota" || "$CASE_CHOICE" == "both_tts" || "$CASE_CHOICE" == "all" || "$CASE_CHOICE" == "f5" || "$CASE_CHOICE" == "f5tts" || "$CASE_CHOICE" == "7" ]]; then
             echo "📦 [Deps 4/4] Cài đặt F5-TTS (f5-tts + google-cloud-storage)..."
+            # Gỡ bỏ flash-attn bị lỗi (nếu có) → F5-TTS sẽ dùng torch SDPA fallback
+            pip uninstall flash-attn -y 2>/dev/null || true
             pip install google-cloud-storage -q 2>/dev/null || true
             pip install f5-tts -q 2>/dev/null || true
         fi
 
         echo "✓ Cài đặt dependencies hoàn tất! Bắt đầu chạy benchmark..."
+        export COQUI_TOS_AGREED=1
         python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" --mt-model "$MT_MODEL" 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 

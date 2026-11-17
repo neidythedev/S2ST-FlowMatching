@@ -134,29 +134,51 @@ try:
     import torch.nn.functional as F
 
     class MockSpectrogram(nn.Module):
-        def __init__(self, *args, **kwargs):
+        """Mock torchaudio.transforms.Spectrogram — tạo buffer 'window' đúng kích thước
+        dựa trên tham số constructor (n_fft, win_length) để tương thích với state_dict
+        của các model như XTTS-v2 (cần window=[400], fb=[257,64])."""
+        def __init__(self, n_fft=1024, win_length=None, hop_length=None, power=None,
+                     normalized=False, wkwargs=None, center=True, pad_mode="reflect",
+                     onesided=True, **kwargs):
             super().__init__()
-            self.register_buffer("window", torch.empty(1024))
+            wl = win_length if win_length is not None else n_fft
+            self.register_buffer("window", torch.empty(wl))
         def forward(self, x): return x
 
     class MockMelScale(nn.Module):
-        def __init__(self, *args, **kwargs):
+        """Mock torchaudio.transforms.MelScale — tạo buffer 'fb' đúng kích thước
+        (n_stft × n_mels) thay vì giá trị cứng."""
+        def __init__(self, n_mels=100, sample_rate=24000, f_min=0., f_max=None,
+                     n_stft=None, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
-            self.register_buffer("fb", torch.empty(513, 100))
+            n_stft_val = n_stft if n_stft is not None else 513
+            self.register_buffer("fb", torch.empty(n_stft_val, n_mels))
         def forward(self, x): return x
 
     class MockMelSpectrogram(nn.Module):
-        def __init__(self, *args, **kwargs):
+        """Mock torchaudio.transforms.MelSpectrogram — tính toán kích thước buffer
+        tự động từ tham số (n_fft, win_length, n_mels) để khớp với checkpoint
+        của bất kỳ model nào (Vocos 1024/100, XTTS 512/64, v.v.)."""
+        def __init__(self, sample_rate=24000, n_fft=1024, win_length=None, hop_length=None,
+                     f_min=0., f_max=None, pad=0, n_mels=100, window_fn=None,
+                     power=None, normalized=False, wkwargs=None, center=True,
+                     pad_mode="reflect", onesided=True, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
-            self.spectrogram = MockSpectrogram()
-            self.mel_scale = MockMelScale()
+            wl = win_length if win_length is not None else n_fft
+            n_stft = n_fft // 2 + 1
+            self.spectrogram = MockSpectrogram(n_fft=n_fft, win_length=wl)
+            self.mel_scale = MockMelScale(n_mels=n_mels, n_stft=n_stft, sample_rate=sample_rate)
         def forward(self, x):
             return x
 
     if "torchaudio.transforms" in sys.modules:
         sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
+        sys.modules["torchaudio.transforms"].Spectrogram = MockSpectrogram
+        sys.modules["torchaudio.transforms"].MelScale = MockMelScale
     if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
         sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
+        sys.modules["torchaudio"].transforms.Spectrogram = MockSpectrogram
+        sys.modules["torchaudio"].transforms.MelScale = MockMelScale
 except ImportError as e:
     print(f"[Fatal Error] PyTorch chưa được cài đặt: {e}")
     sys.exit(1)
@@ -918,6 +940,9 @@ def load_voice_clone_tts(tts_engine, device):
     if tts_engine == "xtts":
         print("⏳ Đang nạp coqui/XTTS-v2 (Zero-shot Voice Cloning từ speaker_wav)...")
 
+        # Tự động đồng ý license CPML (bỏ qua prompt interactive)
+        os.environ["COQUI_TOS_AGREED"] = "1"
+
         # Đảm bảo torchcodec có sẵn (cần cho torchaudio backend trên PyTorch 2.9+)
         try:
             import torchcodec
@@ -942,12 +967,51 @@ def load_voice_clone_tts(tts_engine, device):
             model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
             print("✓ Nạp XTTS-v2 thành công!")
             return model
+        except RuntimeError as e:
+            err_msg = str(e)
+            if "size mismatch" in err_msg or "Missing key" in err_msg:
+                print(f"[XTTS-v2] State dict mismatch — thử xóa cache và tải lại...")
+                # Xóa cache XTTS bị lỗi
+                xtts_cache = os.path.expanduser("~/.local/share/tts/tts_models--multilingual--multi-dataset--xtts_v2")
+                if os.path.isdir(xtts_cache):
+                    import shutil
+                    shutil.rmtree(xtts_cache, ignore_errors=True)
+                    print(f"  ✓ Đã xóa cache: {xtts_cache}")
+                # Nâng cấp coqui-tts
+                subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "coqui-tts", "-q"])
+                try:
+                    # Reload module
+                    for mod_name in list(sys.modules.keys()):
+                        if mod_name.startswith("TTS"):
+                            del sys.modules[mod_name]
+                    from TTS.api import TTS
+                    model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+                    print("✓ Nạp XTTS-v2 thành công (sau khi xóa cache)!")
+                    return model
+                except Exception as e2:
+                    print(f"[Cảnh báo TTS] Vẫn không thể nạp XTTS-v2 sau retry ({e2}).")
+                    return None
+            else:
+                print(f"[Cảnh báo TTS] Lỗi khi nạp XTTS-v2 ({e}).")
+                return None
         except Exception as e:
             print(f"[Cảnh báo TTS] Lỗi khi nạp XTTS-v2 ({e}).")
             return None
 
     elif tts_engine == "f5tts":
         print("⏳ Đang nạp SWivid/F5-TTS (Flow-Matching In-Context Voice Cloning)...")
+
+        # Kiểm tra flash-attn: nếu cài rồi nhưng bị lỗi (broken), gỡ bỏ để F5-TTS
+        # dùng torch SDPA fallback thay vì crash
+        try:
+            from flash_attn import flash_attn_func
+        except (ImportError, AttributeError, ModuleNotFoundError):
+            print("⚠️ flash-attn bị lỗi hoặc chưa cài. Gỡ bỏ để F5-TTS dùng torch SDPA fallback...")
+            subprocess.call([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y", "-q"])
+            # Xóa module cache để Python không nhớ import cũ
+            for mod_name in list(sys.modules.keys()):
+                if "flash_attn" in mod_name:
+                    del sys.modules[mod_name]
 
         # Đảm bảo google-cloud-storage có sẵn (dependency ngầm của F5-TTS)
         try:

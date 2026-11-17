@@ -181,29 +181,43 @@ try:
     import torch.nn.functional as F
 
     class MockSpectrogram(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, n_fft=1024, win_length=None, hop_length=None, power=None,
+                     normalized=False, wkwargs=None, center=True, pad_mode="reflect",
+                     onesided=True, **kwargs):
             super().__init__()
-            self.register_buffer("window", torch.empty(1024))
+            wl = win_length if win_length is not None else n_fft
+            self.register_buffer("window", torch.empty(wl))
         def forward(self, x): return x
 
     class MockMelScale(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, n_mels=100, sample_rate=24000, f_min=0., f_max=None,
+                     n_stft=None, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
-            self.register_buffer("fb", torch.empty(513, 100))
+            n_stft_val = n_stft if n_stft is not None else 513
+            self.register_buffer("fb", torch.empty(n_stft_val, n_mels))
         def forward(self, x): return x
 
     class MockMelSpectrogram(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, sample_rate=24000, n_fft=1024, win_length=None, hop_length=None,
+                     f_min=0., f_max=None, pad=0, n_mels=100, window_fn=None,
+                     power=None, normalized=False, wkwargs=None, center=True,
+                     pad_mode="reflect", onesided=True, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
-            self.spectrogram = MockSpectrogram()
-            self.mel_scale = MockMelScale()
+            wl = win_length if win_length is not None else n_fft
+            n_stft = n_fft // 2 + 1
+            self.spectrogram = MockSpectrogram(n_fft=n_fft, win_length=wl)
+            self.mel_scale = MockMelScale(n_mels=n_mels, n_stft=n_stft, sample_rate=sample_rate)
         def forward(self, x):
             return x
 
     if "torchaudio.transforms" in sys.modules:
         sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
+        sys.modules["torchaudio.transforms"].Spectrogram = MockSpectrogram
+        sys.modules["torchaudio.transforms"].MelScale = MockMelScale
     if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
         sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
+        sys.modules["torchaudio"].transforms.Spectrogram = MockSpectrogram
+        sys.modules["torchaudio"].transforms.MelScale = MockMelScale
 
     def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
         """Nạp Vocos vocoder an toàn với strict=False và loại bỏ feature_extractor để chống lỗi shape mismatch."""
