@@ -489,13 +489,13 @@ class ViEnS2STSystem(nn.Module):
         return total_loss, cfm_loss, dur_loss
 
     @torch.no_grad()
-    def inference(self, src_whisper, speaker_emb=None, num_steps=32):
+    def inference(self, src_whisper, speaker_emb=None, target_len=None, num_steps=32):
         self.eval()
         B = src_whisper.shape[0]
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
 
-        translated_latents, dur_scale = self.bridge(src_whisper, target_len=None)
+        translated_latents, dur_scale = self.bridge(src_whisper, target_len=target_len)
         T_tgt = translated_latents.shape[1]
         cond = translated_latents.transpose(1, 2)
 
@@ -886,21 +886,25 @@ def main():
             try:
                 vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
                 gen_mels = model.inference(s_lat, num_steps=32)
+                gen_mels_oracle = model.inference(s_lat, target_len=tgt_m.shape[-1], num_steps=32)
                 with torch.no_grad():
                     print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_src)} FILE AUDIO VI -> EN QUA VOCOS...")
                     for idx in range(len(fix_src)):
                         pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
+                        pred_oracle_wav = vocos.decode(gen_mels_oracle[idx:idx+1].float()).squeeze().cpu()
                         vocos_upper_wav = vocos.decode(tgt_m[idx:idx+1].float()).squeeze().cpu()
                         gt_wav = tgt_24[idx].cpu()
                         src_wav_16k = fix_src[idx].cpu()
 
                         out_src = os.path.join(out_dir, f"sample_{idx:02d}_vi_input.wav")
                         out_pred = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred.wav")
+                        out_oracle = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred_oracle.wav")
                         out_mel = os.path.join(out_dir, f"sample_{idx:02d}_en_mel_vocos.wav")
                         out_gt = os.path.join(out_dir, f"sample_{idx:02d}_en_groundtruth.wav")
 
                         save_wav_file(out_src, src_wav_16k, 16000)
                         save_wav_file(out_pred, pred_wav, 24000)
+                        save_wav_file(out_oracle, pred_oracle_wav, 24000)
                         save_wav_file(out_mel, vocos_upper_wav, 24000)
                         save_wav_file(out_gt, gt_wav, 24000)
 
