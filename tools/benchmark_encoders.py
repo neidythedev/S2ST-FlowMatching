@@ -82,12 +82,61 @@ import numpy as np
 from datasets import load_dataset
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-# Chuẩn hóa chuỗi văn bản phục vụ tính WER / CER
+# Bản đồ chuẩn hóa dấu thanh điệu tiếng Việt (kiểu mới sang kiểu truyền thống)
+TONE_CONVERSIONS = {
+    'oà': 'òa', 'oá': 'óa', 'oả': 'ỏa', 'oã': 'õa', 'oạ': 'ọa',
+    'oè': 'òe', 'oé': 'óe', 'oẻ': 'ỏe', 'oẽ': 'õe', 'oẹ': 'ọe',
+    'uỳ': 'ùy', 'uý': 'úy', 'uỷ': 'ủy', 'uỹ': 'ũy', 'uỵ': 'ụy',
+}
+
+def int_to_vietnamese_words(n: int) -> str:
+    """Chuyển đổi số nguyên (0-999) sang chữ tiếng Việt chuẩn xác."""
+    units = ['không', 'một', 'hai', 'ba', 'bốn', 'năm', 'sáu', 'bảy', 'tám', 'chín']
+    if n < 10: return units[n]
+    if n == 10: return 'mười'
+    if n < 20:
+        rem = n % 10
+        if rem == 5: return 'mười lăm'
+        return 'mười ' + units[rem]
+    if n < 100:
+        tens = n // 10
+        rem = n % 10
+        tens_str = units[tens] + ' mươi'
+        if rem == 0: return tens_str
+        if rem == 1: return tens_str + ' mốt'
+        if rem == 4: return tens_str + ' tư'
+        if rem == 5: return tens_str + ' lăm'
+        return tens_str + ' ' + units[rem]
+    if n < 1000:
+        hundreds = n // 100
+        rem = n % 100
+        res = units[hundreds] + ' trăm'
+        if rem == 0: return res
+        if rem < 10: return res + ' lẻ ' + units[rem]
+        return res + ' ' + int_to_vietnamese_words(rem)
+    return str(n)
+
+# Chuẩn hóa chuỗi văn bản học thuật (bỏ dấu cách, dấu câu, số vs chữ, dấu thanh)
 def normalize_vietnamese_text(text: str) -> str:
     if not text:
         return ""
     text = text.lower().strip()
+    
+    # 1. Chuẩn hóa quy tắc dấu thanh điệu (hóa vs hoá, tòa vs toà)
+    for old_tone, new_tone in TONE_CONVERSIONS.items():
+        text = text.replace(old_tone, new_tone)
+        
+    # 2. Xóa bỏ toàn bộ dấu câu
     text = re.sub(r"[,\.\?!;:\-\(\)\"\'\«\»\[\]\{\}]", " ", text)
+    
+    # 3. Chuẩn hóa số thành chữ (ví dụ: '55' -> 'năm mươi lăm', '7' -> 'bảy')
+    def replace_num(match):
+        val = int(match.group(0))
+        if val <= 999:
+            return int_to_vietnamese_words(val)
+        return match.group(0)
+
+    text = re.sub(r"\b\d+\b", replace_num, text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
