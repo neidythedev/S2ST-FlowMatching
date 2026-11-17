@@ -149,7 +149,7 @@ case "$ACTION" in
         # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
         pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses sacrebleu -q 2>/dev/null || true
-        python eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10
+        python -u eval_benchmark.py --case "$CASE_CHOICE" --num-samples 10 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 
     encoders)
@@ -174,7 +174,7 @@ case "$ACTION" in
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"
         echo "  bash run.sh plot [tên_exp]       -> Vẽ biểu đồ ASCII và xuất file ảnh SVG/PNG đồ thị loss"
-        echo "  bash run.sh eval [0|1|2|3|4|5]   -> Chạy benchmark đo metric (0: Cascaded, 5: SeamlessM4T)"
+        echo "  bash run.sh eval [0|6|5|4|all]   -> Chạy benchmark (0: MMS-TTS, 6: F5-TTS, 5: SeamlessM4T, 4: Đề xuất)"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"
