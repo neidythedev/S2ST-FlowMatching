@@ -147,12 +147,13 @@ case "$ACTION" in
         CASE_CHOICE="${2:-sota}"
         S2TT_MODE="${3:-both}"
         NUM_SAMPLES="${4:-10}"
+        MT_MODEL="${5:-auto}"
         echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm..."
-        echo "   • Kịch bản: $CASE_CHOICE | Chế độ S2TT: $S2TT_MODE | Số mẫu: $NUM_SAMPLES"
+        echo "   • Kịch bản: $CASE_CHOICE | Chế độ S2TT: $S2TT_MODE | Số mẫu: $NUM_SAMPLES | MT Model: $MT_MODEL"
         # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
         pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses sacrebleu -q 2>/dev/null || true
-        python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" 2>&1 | tee -a "$LOG_DIR/eval.log"
+        python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" --mt-model "$MT_MODEL" 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 
     encoders)

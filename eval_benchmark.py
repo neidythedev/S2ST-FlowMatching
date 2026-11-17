@@ -243,7 +243,7 @@ def load_vocos(device):
 # ==============================================================================
 
 CASE_DESCRIPTIONS = {
-    0: "Case 0: Cascaded Baseline (PhoWhisper + OpusMT + MMS-TTS-Eng)",
+    0: "Case 0: Cascaded Baseline (PhoWhisper + VinAI-Translate/NLLB + MMS-TTS-Eng)",
     1: "Case 1: Untrained CrossAttentionBridge + Untrained CFM (Zero-Baseline)",
     2: "Case 2: Untrained Bridge + Trained CFM (Acoustic Only)",
     3: "Case 3: Trained Bridge + Untrained CFM (Semantic Only)",
@@ -346,6 +346,109 @@ def transcribe_en_audio(wav_tensor, sample_rate, asr_feat, asr_tok, asr_mod, dev
             return transcription
     except Exception as e:
         return ""
+
+def load_mt_model(mt_choice, device):
+    """
+    Nạp mô hình Dịch máy (MT) chất lượng cao cho cặp ngôn ngữ Vi -> En.
+    Hỗ trợ:
+      - 'vinai' (khuyên dùng): vinai/vinai-translate-vi2en-v2 (SOTA chuyên biệt Vi->En)
+      - 'nllb': facebook/nllb-200-distilled-600M (Meta SOTA Multilingual)
+      - 'opus': Helsinki-NLP/opus-mt-vi-en (Legacy baseline)
+      - 'auto': Ưu tiên VinAI -> NLLB -> Opus-MT
+    """
+    candidates = []
+    choice = (mt_choice or "auto").lower()
+    if choice in ["vinai", "vinai-translate"]:
+        candidates = ["vinai", "nllb", "opus"]
+    elif choice in ["nllb", "nllb-200"]:
+        candidates = ["nllb", "vinai", "opus"]
+    elif choice in ["opus", "opus-mt"]:
+        candidates = ["opus", "vinai", "nllb"]
+    else:  # auto
+        candidates = ["vinai", "nllb", "opus"]
+
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+    for cand in candidates:
+        if cand == "vinai":
+            model_id = "vinai/vinai-translate-vi2en-v2"
+            print(f"⏳ Đang nạp SOTA MT: VinAI-Translate ({model_id})...")
+            try:
+                tok = AutoTokenizer.from_pretrained(model_id, src_lang="vi_VN")
+                mod = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device).eval()
+                if hasattr(mod, "generation_config") and mod.generation_config is not None:
+                    mod.generation_config.max_length = None
+                print("✓ Nạp thành công VinAI-Translate-vi2en-v2 (SOTA Vi -> En)!")
+                return tok, mod, "vinai"
+            except Exception as e:
+                print(f"[Cảnh báo MT] Không nạp được VinAI-Translate ({e}). Thử model kế tiếp...")
+
+        elif cand == "nllb":
+            model_id = "facebook/nllb-200-distilled-600M"
+            print(f"⏳ Đang nạp SOTA MT: Meta NLLB-200 ({model_id})...")
+            try:
+                tok = AutoTokenizer.from_pretrained(model_id, src_lang="vie_Latn")
+                mod = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device).eval()
+                if hasattr(mod, "generation_config") and mod.generation_config is not None:
+                    mod.generation_config.max_length = None
+                print("✓ Nạp thành công Meta NLLB-200-distilled-600M!")
+                return tok, mod, "nllb"
+            except Exception as e:
+                print(f"[Cảnh báo MT] Không nạp được Meta NLLB-200 ({e}). Thử model kế tiếp...")
+
+        elif cand == "opus":
+            model_id = "Helsinki-NLP/opus-mt-vi-en"
+            print(f"⏳ Đang nạp Fallback MT: Opus-MT ({model_id})...")
+            try:
+                tok = AutoTokenizer.from_pretrained(model_id)
+                mod = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device).eval()
+                if hasattr(mod, "generation_config") and mod.generation_config is not None:
+                    mod.generation_config.max_length = None
+                print("✓ Nạp Opus-MT thành công!")
+                return tok, mod, "opus"
+            except Exception as e:
+                print(f"[Cảnh báo MT] Không nạp được Opus-MT ({e}).")
+
+    print("[Lỗi MT] Không nạp được bất kỳ mô hình MT nào!")
+    return None, None, "none"
+
+def translate_text_vi2en(mt_tok, mt_mod, mt_flavor, vi_text, device):
+    """Thực hiện dịch câu tiếng Việt sang tiếng Anh với hỗ trợ VinAI, NLLB hoặc Opus-MT."""
+    if mt_tok is None or mt_mod is None or not vi_text:
+        return "hello world"
+
+    clean_text = str(vi_text).strip()
+    if not clean_text:
+        return "hello world"
+
+    try:
+        inputs = mt_tok(clean_text, return_tensors="pt", padding=True).to(device)
+        gen_kwargs = {"max_new_tokens": 128}
+
+        if mt_flavor == "vinai":
+            tgt_lang_id = None
+            if hasattr(mt_tok, "lang_code_to_id") and isinstance(mt_tok.lang_code_to_id, dict):
+                tgt_lang_id = mt_tok.lang_code_to_id.get("en_XX")
+            if tgt_lang_id is not None:
+                gen_kwargs["decoder_start_token_id"] = tgt_lang_id
+                gen_kwargs["forced_bos_token_id"] = tgt_lang_id
+            gen_kwargs["num_beams"] = 4
+
+        elif mt_flavor == "nllb":
+            tgt_lang_id = None
+            if hasattr(mt_tok, "lang_code_to_id") and isinstance(mt_tok.lang_code_to_id, dict):
+                tgt_lang_id = mt_tok.lang_code_to_id.get("eng_Latn")
+            if tgt_lang_id is not None:
+                gen_kwargs["forced_bos_token_id"] = tgt_lang_id
+            gen_kwargs["num_beams"] = 4
+
+        with torch.no_grad():
+            output_ids = mt_mod.generate(**inputs, **gen_kwargs)
+            trans_en = mt_tok.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            return trans_en if trans_en else "hello"
+    except Exception as e:
+        print(f"  ⚠️ Lỗi khi dịch MT ({mt_flavor}): {e}")
+        return "hello"
 
 # ==============================================================================
 # HÀM ĐÁNH GIÁ TỪNG TRƯỜNG HỢP (CASE 0 -> 5)
@@ -520,14 +623,13 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
 
     print("⏳ Đang nạp các mô hình thành phần Cascaded Vi -> En (Pretrained chuẩn):")
     print("  1. ASR: vinai/PhoWhisper-small (Nhận diện giọng nói tiếng Việt tối ưu WER 9.0%)")
-    print("  2. MT:  Helsinki-NLP/opus-mt-vi-en (Dịch thuật Việt - Anh)")
+    print("  2. MT:  VinAI-Translate-vi2en-v2 / Meta NLLB-200 (SOTA Dịch thuật Việt - Anh)")
     print("  3. TTS: facebook/mms-tts-eng (Tổng hợp giọng nói tiếng Anh VITS)")
 
     try:
         from transformers import (
             WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration,
-            MarianTokenizer, MarianMTModel, AutoTokenizer, AutoModelForSeq2SeqLM,
-            VitsModel
+            AutoTokenizer, AutoModelForSeq2SeqLM, VitsModel
         )
     except ImportError as e:
         print(f"[Lỗi] Thiếu thư viện transformers để chạy Cascaded Baseline: {e}")
@@ -542,15 +644,8 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         asr_model.generation_config.forced_decoder_ids = None
         asr_model.generation_config.max_length = None
 
-    # Nạp MT Opus-MT (vi-en)
-    try:
-        mt_tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-        mt_model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-    except Exception:
-        mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-        mt_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-    if hasattr(mt_model, "generation_config") and mt_model.generation_config is not None:
-        mt_model.generation_config.max_length = None
+    # Nạp MT (Ưu tiên VinAI-Translate-vi2en-v2 -> Meta NLLB-200 -> Opus-MT)
+    mt_tok, mt_model, mt_flavor = load_mt_model(getattr(args, "mt_model", "auto"), device)
 
     # Nạp TTS MMS-TTS-Eng
     tts_tok = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
@@ -603,14 +698,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
 
         # 2. MT: Vietnamese Text -> English Text
         mt_input = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        inputs_mt = mt_tok(mt_input, return_tensors="pt").to(device)
-        translated_en = ""
-        with torch.no_grad():
-            try:
-                translated_ids = mt_model.generate(**inputs_mt, max_new_tokens=128)
-                translated_en = mt_tok.batch_decode(translated_ids, skip_special_tokens=True)[0].strip()
-            except Exception:
-                translated_en = "hello"
+        translated_en = translate_text_vi2en(mt_tok, mt_model, mt_flavor, mt_input, device)
 
         # 3. TTS: English Text -> Waveform (16kHz)
         tts_text = translated_en if translated_en else "hello"
@@ -872,7 +960,7 @@ def load_voice_clone_tts(tts_engine, device):
             return None
     return None
 
-def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small"):
+def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small", mt_choice="auto"):
     """Nạp trước các mô hình S2TT để dùng chung giữa các engine TTS, tránh nạp lại nhiều lần."""
     modules = {}
     if any(m in s2tt_modes_needed for m in ["2step", "both"]):
@@ -889,12 +977,9 @@ def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small
             modules["2step"] = None
 
     if any(m in s2tt_modes_needed for m in ["3step", "both"]):
-        print("⏳ [3-Step Pipeline] Nạp PhoWhisper-small (ASR) + Opus-MT (MT)...")
+        print("⏳ [3-Step Pipeline] Nạp PhoWhisper-small (ASR) + MT (VinAI-Translate / NLLB-200)...")
         try:
-            from transformers import (
-                WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration,
-                MarianTokenizer, MarianMTModel, AutoTokenizer, AutoModelForSeq2SeqLM
-            )
+            from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
             asr_feat = WhisperFeatureExtractor.from_pretrained("vinai/PhoWhisper-small")
             asr_tok = WhisperTokenizer.from_pretrained("vinai/PhoWhisper-small", language="vi", task="transcribe")
             asr_mod = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device).eval()
@@ -903,17 +988,9 @@ def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small
                 asr_mod.generation_config.forced_decoder_ids = None
                 asr_mod.generation_config.max_length = None
 
-            try:
-                mt_tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-                mt_mod = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-            except Exception:
-                mt_tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-vi-en")
-                mt_mod = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-vi-en").to(device).eval()
-            if hasattr(mt_mod, "generation_config") and mt_mod.generation_config is not None:
-                mt_mod.generation_config.max_length = None
-
-            modules["3step"] = (asr_feat, asr_tok, asr_mod, mt_tok, mt_mod)
-            print("✓ Nạp PhoWhisper + Opus-MT thành công!")
+            mt_tok, mt_mod, mt_flavor = load_mt_model(mt_choice, device)
+            modules["3step"] = (asr_feat, asr_tok, asr_mod, mt_tok, mt_mod, mt_flavor)
+            print(f"✓ Nạp PhoWhisper + MT ({mt_flavor.upper()}) thành công!")
         except Exception as e:
             print(f"[Cảnh báo S2TT] Không nạp được PhoWhisper+MT ({e}).")
             modules["3step"] = None
@@ -939,7 +1016,7 @@ def translate_speech_vi2en(src_w, ref_vi_text, mode, s2tt_modules, device):
         transcribed_vi = ref_vi_text
 
     elif mode == "3step" and s2tt_modules.get("3step") is not None:
-        asr_feat, asr_tok, asr_mod, mt_tok, mt_mod = s2tt_modules["3step"]
+        asr_feat, asr_tok, asr_mod, mt_tok, mt_mod, mt_flavor = s2tt_modules["3step"]
         in_proc = asr_feat(src_w.numpy(), sampling_rate=16000, return_tensors="pt")
         in_feats = in_proc.input_features.to(device)
         with torch.no_grad():
@@ -949,13 +1026,7 @@ def translate_speech_vi2en(src_w, ref_vi_text, mode, s2tt_modules, device):
             except Exception:
                 transcribed_vi = ref_vi_text
         mt_in = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        inputs_mt = mt_tok(mt_in, return_tensors="pt").to(device)
-        with torch.no_grad():
-            try:
-                t_ids = mt_mod.generate(**inputs_mt, max_new_tokens=128)
-                translated_en = mt_tok.batch_decode(t_ids, skip_special_tokens=True)[0].strip()
-            except Exception:
-                translated_en = "hello"
+        translated_en = translate_text_vi2en(mt_tok, mt_mod, mt_flavor, mt_in, device)
 
     if not translated_en:
         translated_en = "hello world"
@@ -1159,7 +1230,7 @@ def evaluate_cascaded_voice_clone_suite(case_num, tts_engine, s2tt_mode_arg, arg
     modes = ["2step", "3step"] if s2tt_mode_arg == "both" else [s2tt_mode_arg]
     
     if s2tt_modules is None:
-        s2tt_modules = get_s2tt_modules(modes, device, getattr(args, "whisper_s2tt_model", "openai/whisper-small"))
+        s2tt_modules = get_s2tt_modules(modes, device, getattr(args, "whisper_s2tt_model", "openai/whisper-small"), getattr(args, "mt_model", "auto"))
 
     tts_model = load_voice_clone_tts(tts_engine, device)
     if tts_model is None:
@@ -1405,6 +1476,8 @@ def main():
                         help="Phương thức dịch thuật: '2step' (Whisper task=translate), '3step' (PhoWhisper + MT), hoặc 'both' (cả 2 chế độ)")
     parser.add_argument("--whisper-s2tt-model", type=str, default="openai/whisper-small",
                         help="Mô hình Whisper cho 2-step S2TT: openai/whisper-small hoặc openai/whisper-large-v3")
+    parser.add_argument("--mt-model", type=str, default="auto", choices=["auto", "vinai", "nllb", "opus"],
+                        help="Mô hình dịch máy (MT) cho 3-step & Case 0: 'vinai' (vinai/vinai-translate-vi2en-v2 SOTA), 'nllb' (facebook/nllb-200-distilled-600M), 'opus', hoặc 'auto' (ưu tiên VinAI -> NLLB)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1455,7 +1528,7 @@ def main():
     s2tt_modules = None
     if any(c in [6, 7] for c in cases_to_run):
         modes_needed = ["2step", "3step"] if args.s2tt_mode == "both" else [args.s2tt_mode]
-        s2tt_modules = get_s2tt_modules(modes_needed, device, args.whisper_s2tt_model)
+        s2tt_modules = get_s2tt_modules(modes_needed, device, args.whisper_s2tt_model, args.mt_model)
 
     all_summaries = []
 
