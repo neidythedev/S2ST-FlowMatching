@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# S2ST EN-VI: HUẤN LUYỆN TONE-AWARE BRIDGE & FLOW MATCHING
+# S2ST VI-EN: HUẤN LUYỆN CROSS-ATTENTION BRIDGE & FLOW MATCHING
 # Tuân thủ nghiêm ngặt quy chuẩn SKILL2.md cho GPU Cloud Runtime (Molab)
-# Hỗ trợ: Dữ liệu thật Streaming Google FLEURS + Whisper-Small Encoder (Frozen)
+# Hỗ trợ: Dữ liệu thật Streaming Google FLEURS (Vi -> En) + Whisper Encoder (Frozen)
 # ==============================================================================
 
 import argparse
 import importlib.machinery
-import json
 import math
 import os
+import random
 import sys
 import time
 import types
 import warnings
-from pathlib import Path
 
-# Tắt cảnh báo không cần thiết
+# Tắt cảnh báo phiền toái từ transformers và huggingface_hub
 warnings.filterwarnings("ignore")
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 
 # ==============================================================================
 # RUNTIME RESILIENCE: TORCHAUDIO IN-MEMORY MOCK (PYTHON 3.13 ABI GUARD)
@@ -31,7 +33,6 @@ def apply_torchaudio_mock_if_needed():
         _ = torchaudio.__version__
         return "native"
     except Exception:
-        # Xóa các module torchaudio bị load dở
         for mod in list(sys.modules.keys()):
             if mod.startswith("torchaudio"):
                 del sys.modules[mod]
@@ -55,43 +56,35 @@ def apply_torchaudio_mock_if_needed():
         def _hz_to_mel(freq: float, mel_scale: str = "htk") -> float:
             return 2595.0 * math.log10(1.0 + (freq / 700.0))
 
-        def _mel_to_hz(mels, mel_scale: str = "htk"):
-            return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
+        def _mel_to_hz(mel: float, mel_scale: str = "htk") -> float:
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
-        ta_func_func._hz_to_mel = _hz_to_mel
-        ta_func_func._mel_to_hz = _mel_to_hz
-        ta_func.functional = ta_func_func
-        ta_func._hz_to_mel = _hz_to_mel
-        ta_func._mel_to_hz = _mel_to_hz
+        ta_func_func.hz_to_mel = _hz_to_mel
+        ta_func_func.mel_to_hz = _mel_to_hz
+        ta_func.hz_to_mel = _hz_to_mel
+        ta_func.mel_to_hz = _mel_to_hz
         ta.functional = ta_func
-
-        class _MockMel:
-            def __init__(self, *args, **kwargs):
-                pass
-            def __call__(self, x, *args, **kwargs):
-                return x
-
-        ta_trans.MelSpectrogram = _MockMel
         ta.transforms = ta_trans
+        ta._extension = ta_ext
 
         sys.modules["torchaudio"] = ta
         sys.modules["torchaudio.functional"] = ta_func
         sys.modules["torchaudio.functional.functional"] = ta_func_func
         sys.modules["torchaudio.transforms"] = ta_trans
         sys.modules["torchaudio._extension"] = ta_ext
-        return "mocked"
+        return "mock"
 
-apply_torchaudio_mock_if_needed()
+_ = apply_torchaudio_mock_if_needed()
 
-# Cấu hình logging ra cả terminal và file
-class Logger:
-    def __init__(self, log_file):
+# Tee output để vừa hiển thị terminal vừa ghi log file
+class TeeLogger(object):
+    def __init__(self, filepath):
         self.terminal = sys.stdout
-        self.log = open(log_file, "a", encoding="utf-8")
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self.log = open(filepath, "a", encoding="utf-8")
 
     def write(self, message):
         self.terminal.write(message)
-        self.terminal.flush()
         self.log.write(message)
         self.log.flush()
 
@@ -111,12 +104,11 @@ def load_yaml_config(config_path):
             "n_mels": 100,
             "spk_dim": 192,
             "decoder_hidden": 384,
-            "use_tone_head": True,
-            "num_tones": 6,
+            "use_tone_head": False,
+            "num_tones": 0,
         },
         "loss_weights": {
             "cfm_weight": 1.0,
-            "tone_weight": 0.2,
             "dur_weight": 0.1,
         },
         "training": {
@@ -134,11 +126,11 @@ def load_yaml_config(config_path):
         },
         "data": {
             "dataset_name": "google/fleurs",
-            "src_lang": "en_us",
-            "tgt_lang": "vi_vn",
+            "src_lang": "vi_vn",
+            "tgt_lang": "en_us",
             "sample_rate_src": 16000,
             "sample_rate_tgt": 24000,
-            "max_audio_sec": 6.0,
+            "max_audio_sec": 12.0,
             "streaming": True,
         },
         "paths": {
@@ -230,42 +222,12 @@ def resample_24k_to_16k(audio_24k):
     audio_16k = F.interpolate(audio_24k, size=t_new, mode="linear", align_corners=False)
     return audio_16k.squeeze(1)
 
-# Bảng gán nhãn 6 thanh điệu tiếng Việt
-VIETNAMESE_VOWEL_TONES = {
-    'à': 1, 'ằ': 1, 'ầ': 1, 'è': 1, 'ề': 1, 'ì': 1, 'ò': 1, 'ồ': 1, 'ờ': 1, 'ù': 1, 'ừ': 1, 'ỳ': 1,
-    'á': 2, 'ắ': 2, 'ấ': 2, 'é': 2, 'ế': 2, 'í': 2, 'ó': 2, 'ố': 2, 'ớ': 2, 'ú': 2, 'ứ': 2, 'ý': 2,
-    'ả': 3, 'ẳ': 3, 'ẩ': 3, 'ẻ': 3, 'ể': 3, 'ỉ': 3, 'ỏ': 3, 'ổ': 3, 'ở': 3, 'ủ': 3, 'ử': 3, 'ỷ': 3,
-    'ã': 4, 'ẵ': 4, 'ẫ': 4, 'ẽ': 4, 'ễ': 4, 'ĩ': 4, 'õ': 4, 'ỗ': 4, 'ỡ': 4, 'ũ': 4, 'ữ': 4, 'ỹ': 4,
-    'ạ': 5, 'ặ': 5, 'ậ': 5, 'ẹ': 5, 'ệ': 5, 'ị': 5, 'ọ': 5, 'ộ': 5, 'ợ': 5, 'ụ': 5, 'ự': 5, 'ỵ': 5,
-}
-
-def parse_tones(vietnamese_text, target_len=75):
-    words = str(vietnamese_text).lower().strip().split()
-    tones = []
-    for w in words:
-        t = 0
-        for ch in w:
-            if ch in VIETNAMESE_VOWEL_TONES:
-                t = VIETNAMESE_VOWEL_TONES[ch]
-                break
-        tones.append(t)
-    if not tones:
-        tones = [0]
-    t_tensor = torch.tensor(tones, dtype=torch.long)
-    if t_tensor.shape[0] != target_len:
-        t_tensor = F.interpolate(
-            t_tensor.float().view(1, 1, -1),
-            size=target_len,
-            mode="nearest"
-        ).long().view(-1)
-    return t_tensor
-
 # ==============================================================================
-# 2. KIẾN TRÚC MÔ HÌNH: TONE-AWARE BRIDGE + OT-CFM DECODER
+# 2. KIẾN TRÚC MÔ HÌNH: CROSS-ATTENTION BRIDGE & OT-CFM TARGET DECODER
 # ==============================================================================
 
 class DurationPredictor(nn.Module):
-    """Dự đoán tỷ lệ co dãn thời lượng (duration scale) từ tiếng Anh sang tiếng Việt."""
+    """Dự đoán tỷ lệ co dãn thời lượng (duration scale) từ tiếng Việt sang tiếng Anh."""
     def __init__(self, in_dim=512):
         super().__init__()
         self.conv = nn.Sequential(
@@ -277,25 +239,60 @@ class DurationPredictor(nn.Module):
         h = self.conv(x.transpose(1, 2))
         return torch.sigmoid(h.mean(dim=[-1, -2])) * 1.4 + 0.8  # scale trong khoảng [0.8, 2.2]
 
-class ToneAwareBridge(nn.Module):
-    """Cầu nối dịch thuật bảo toàn thanh điệu (Novelty Core)."""
-    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, num_tones=6):
+class CrossAttentionBridge(nn.Module):
+    """Cầu nối dịch thuật Non-Autoregressive sử dụng Cross-Attention Transformer Decoder.
+    Giải quyết triệt để vấn đề đảo ngữ pháp (non-monotonic word reordering) giữa Tiếng Việt và Tiếng Anh.
+    """
+    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8):
         super().__init__()
-        self.downsample = nn.Conv1d(in_dim, hidden_dim, kernel_size=2, stride=2)
-        encoder_layer = nn.TransformerEncoderLayer(
+        self.hidden_dim = hidden_dim
+        self.src_proj = nn.Linear(in_dim, hidden_dim)
+
+        # Encoder tự chú ý trên đặc trưng nguồn (tiếng Việt)
+        src_enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
             batch_first=True, activation="gelu"
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.tone_head = nn.Linear(hidden_dim, num_tones)
+        self.src_encoder = nn.TransformerEncoder(src_enc_layer, num_layers=max(2, num_layers // 2))
+
+        # Decoder chú ý chéo (Cross-Attention) sang đặc trưng đích (tiếng Anh)
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+            batch_first=True, activation="gelu"
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+
+        # Bộ dự đoán tỷ lệ co dãn thời lượng
         self.duration_predictor = DurationPredictor(in_dim=hidden_dim)
-        
-    def forward(self, whisper_features):
-        x = self.downsample(whisper_features.transpose(1, 2)).transpose(1, 2)
-        latents = self.transformer(x)
-        tone_logits = self.tone_head(latents)
-        dur_scale = self.duration_predictor(latents)
-        return latents, tone_logits, dur_scale
+
+        # Positional Embeddings học được cho Query đích
+        self.pos_emb = nn.Embedding(4096, hidden_dim)
+
+    def forward(self, whisper_features, target_len=None):
+        """
+        whisper_features: [B, T_src, in_dim]
+        target_len: Số frame Mel đích T_tgt (lúc train) hoặc None (lúc inference)
+        """
+        B, T_src, _ = whisper_features.shape
+        src_h = self.src_proj(whisper_features)
+        memory = self.src_encoder(src_h)
+
+        dur_scale = self.duration_predictor(memory)  # [B]
+
+        if target_len is None:
+            # Lúc Inference: Ước lượng T_tgt từ dur_scale
+            avg_scale = float(dur_scale.mean().item())
+            target_len = max(20, min(2048, int(T_src * avg_scale)))
+
+        positions = torch.arange(target_len, device=whisper_features.device).clamp(max=4095)
+        queries = self.pos_emb(positions).unsqueeze(0).expand(B, -1, -1)
+
+        # Cross-Attention: Cho phép từ tiếng Anh đảo vị trí tùy ý so với tiếng Việt
+        latents = self.decoder(tgt=queries, memory=memory)
+        return latents, dur_scale
+
+# Alias tương thích ngược
+ToneAwareBridge = CrossAttentionBridge
 
 class AcousticSpeakerEncoder(nn.Module):
     """Trích xuất d-vector âm sắc (Speaker Timbre Embedding - 192d) qua Mean/Std statistics."""
@@ -340,25 +337,26 @@ class FlowMatchingTargetDecoder(nn.Module):
             h = h + block(h)
         return self.out_proj(h)
 
-class EnViS2STSystem(nn.Module):
-    """Hệ thống tích hợp toàn diện: Whisper -> Bridge -> CFM Decoder -> 100 Mel."""
+class ViEnS2STSystem(nn.Module):
+    """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192):
         super().__init__()
         self.n_mels = n_mels
-        self.bridge = ToneAwareBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers)
+        self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim, hidden_dim=384)
 
-    def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_tones=None, target_dur_ratio=None,
-                     loss_weights=None):
-        weights = loss_weights or {"cfm_weight": 1.0, "tone_weight": 0.2, "dur_weight": 0.1}
+    def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None, **kwargs):
+        weights = loss_weights or {"cfm_weight": 1.0, "dur_weight": 0.1}
         B, _, T_tgt = target_mel.shape
-        translated_latents, tone_logits, dur_scale = self.bridge(src_whisper)
-        
+
+        # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích
+        translated_latents, dur_scale = self.bridge(src_whisper, target_len=T_tgt)
+
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
-            
-        cond = F.interpolate(translated_latents.transpose(1, 2), size=T_tgt, mode="linear", align_corners=False)
+
+        cond = translated_latents.transpose(1, 2)  # [B, bridge_dim, T_tgt]
 
         # 1. CFM Optimal Transport Loss
         t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
@@ -371,33 +369,14 @@ class EnViS2STSystem(nn.Module):
         v_pred = self.decoder(x_t, t, cond, speaker_emb)
         cfm_loss = F.mse_loss(v_pred, u_t)
 
-        # 2. Auxiliary Tone Classification Loss & Accuracy
-        if target_tones is not None:
-            if tone_logits.shape[1] != target_tones.shape[1]:
-                t_logits_interp = F.interpolate(
-                    tone_logits.transpose(1, 2), size=target_tones.shape[1],
-                    mode="linear", align_corners=False
-                ).transpose(1, 2)
-            else:
-                t_logits_interp = tone_logits
-            tone_loss = F.cross_entropy(t_logits_interp.reshape(-1, 6), target_tones.reshape(-1))
-            preds = t_logits_interp.reshape(-1, 6).argmax(dim=-1)
-            targets = target_tones.reshape(-1)
-            tone_acc = (preds == targets).float().mean().item() * 100.0
-        else:
-            tone_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
-            tone_acc = 0.0
-
-        # 3. Duration Predictor Loss
+        # 2. Duration Loss
         if target_dur_ratio is not None:
             dur_loss = F.smooth_l1_loss(dur_scale.view(-1), target_dur_ratio.view(-1))
         else:
             dur_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
 
-        total_loss = (weights["cfm_weight"] * cfm_loss + 
-                      weights["tone_weight"] * tone_loss + 
-                      weights["dur_weight"] * dur_loss)
-        return total_loss, cfm_loss, tone_loss, dur_loss, tone_acc
+        total_loss = weights["cfm_weight"] * cfm_loss + weights["dur_weight"] * dur_loss
+        return total_loss, cfm_loss, dur_loss
 
     @torch.no_grad()
     def inference(self, src_whisper, speaker_emb=None, num_steps=25):
@@ -405,11 +384,10 @@ class EnViS2STSystem(nn.Module):
         B = src_whisper.shape[0]
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
-            
-        translated_latents, _, dur_scale = self.bridge(src_whisper)
-        avg_scale = float(dur_scale.mean().item())
-        T_tgt = max(30, int(translated_latents.shape[1] * 2 * avg_scale))
-        cond = F.interpolate(translated_latents.transpose(1, 2), size=T_tgt, mode="linear", align_corners=False)
+
+        translated_latents, dur_scale = self.bridge(src_whisper, target_len=None)
+        T_tgt = translated_latents.shape[1]
+        cond = translated_latents.transpose(1, 2)
 
         x_t = torch.randn(B, self.n_mels, T_tgt, device=src_whisper.device, dtype=src_whisper.dtype)
         dt = 1.0 / num_steps
@@ -419,18 +397,24 @@ class EnViS2STSystem(nn.Module):
             x_t = x_t + v_pred * dt
         return x_t
 
+# Alias tương thích ngược
+EnViS2STSystem = ViEnS2STSystem
+
 # ==============================================================================
-# 3. PIPELINE DỮ LIỆU ÂM THANH THẬT STREAMING (GOOGLE FLEURS)
+# 3. PIPELINE DỮ LIỆU ÂM THANH THẬT STREAMING (GOOGLE FLEURS VI -> EN)
 # ==============================================================================
 
 class RealStreamingSpeechPipeline:
-    """Nạp dữ liệu âm thanh thật trực tuyến En-Vi với căn chỉnh song song bằng trường 'id' (FLoRes)."""
-    def __init__(self, split='train', max_sec=15.0):
+    """Nạp dữ liệu âm thanh thật trực tuyến Vi-En với căn chỉnh song song bằng trường 'id' (FLoRes)."""
+    def __init__(self, split='train', max_sec=12.0, src_lang='vi_vn', tgt_lang='en_us'):
         self.split = split
         self.max_sec = max_sec
+        self.src_lang = src_lang
+        self.tgt_lang = tgt_lang
         self.is_online = False
-        self._parallel_pairs = []  # Danh sách cặp (en_item, vi_item) đã căn chỉnh song song
+        self._parallel_pairs = []
         self._pair_index = 0
+
         try:
             import soundfile
         except ImportError:
@@ -442,74 +426,71 @@ class RealStreamingSpeechPipeline:
 
         try:
             from datasets import load_dataset, Audio
-            print(f"📡 Đang kết nối Streaming Google FLEURS (En-US & Vi-VN, split='{split}')...")
-            self.ds_en = load_dataset('google/fleurs', 'en_us', split=split, streaming=True)
-            self.ds_vi = load_dataset('google/fleurs', 'vi_vn', split=split, streaming=True)
-            # Tắt tự động decode qua torchcodec để soundfile giải mã trực tiếp từ raw bytes
+            print(f"📡 Đang kết nối Streaming Google FLEURS (Src: {src_lang.upper()} -> Tgt: {tgt_lang.upper()}, split='{split}')...")
+            self.ds_src = load_dataset('google/fleurs', src_lang, split=split, streaming=True)
+            self.ds_tgt = load_dataset('google/fleurs', tgt_lang, split=split, streaming=True)
+
             try:
-                self.ds_en = self.ds_en.cast_column('audio', Audio(decode=False))
-                self.ds_vi = self.ds_vi.cast_column('audio', Audio(decode=False))
+                self.ds_src = self.ds_src.cast_column('audio', Audio(decode=False))
+                self.ds_tgt = self.ds_tgt.cast_column('audio', Audio(decode=False))
             except Exception:
                 pass
+
             self.is_online = True
             print("✓ Kết nối dữ liệu thật thành công qua Streaming!")
-            # Căn chỉnh song song En-Vi bằng trường 'id' (mỗi id ↔ 1 câu FLoRes duy nhất)
             self._build_parallel_pairs()
         except Exception as e:
-            print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu âm học chuẩn xác.")
+            print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu mô phỏng chuẩn xác.")
             self.is_online = False
 
     def _build_parallel_pairs(self):
-        """Buffer Vi items theo 'id', rồi match từng En item → đảm bảo 100% cặp song song chuẩn FLoRes."""
-        print(f"🔗 Đang căn chỉnh song song En-Vi bằng trường 'id' (FLoRes sentence ID, split='{self.split}')...")
-        vi_by_id = {}
-        count_vi = 0
-        limit_vi = 800 if self.split == 'train' else 200
+        """Buffer các mục của ngôn ngữ đích theo 'id', rồi match từng mục của ngôn ngữ nguồn."""
+        print(f"🔗 Đang căn chỉnh song song {self.src_lang} ↔ {self.tgt_lang} bằng trường 'id' (FLoRes sentence ID)...")
+        tgt_by_id = {}
+        count_tgt = 0
+        limit_tgt = 800 if self.split == 'train' else 200
         limit_pairs = 600 if self.split == 'train' else 50
 
-        for item in self.ds_vi:
+        for item in self.ds_tgt:
             fid = item.get('id')
-            if fid is not None and fid not in vi_by_id:
-                vi_by_id[fid] = item
-                count_vi += 1
-            if count_vi >= limit_vi:
+            if fid is not None and fid not in tgt_by_id:
+                tgt_by_id[fid] = item
+                count_tgt += 1
+            if count_tgt >= limit_tgt:
                 break
-        print(f"   → Đã nạp {count_vi} câu tiếng Việt độc lập vào bộ đệm.")
+        print(f"   → Đã nạp {count_tgt} câu đích ({self.tgt_lang}) độc lập vào bộ đệm.")
 
         pairs = []
-        for item in self.ds_en:
+        for item in self.ds_src:
             fid = item.get('id')
-            if fid is not None and fid in vi_by_id:
-                pairs.append((item, vi_by_id[fid]))
+            if fid is not None and fid in tgt_by_id:
+                pairs.append((item, tgt_by_id[fid]))
                 if len(pairs) >= limit_pairs:
                     break
+
         self._parallel_pairs = pairs
         self._pair_index = 0
-        print(f"   ✓ Căn chỉnh thành công {len(pairs)} cặp song song En ↔ Vi chuẩn xác!")
-        
-        # In ngay 3 cặp mẫu đầu tiên để kiểm chứng ngữ nghĩa
+        print(f"   ✓ Căn chỉnh thành công {len(pairs)} cặp song song {self.src_lang} ↔ {self.tgt_lang} chuẩn xác!")
+
         if pairs:
             print("\n📋 [KIỂM CHỨNG DỮ LIỆU SONG SONG]:")
             for i in range(min(3, len(pairs))):
-                en_txt = pairs[i][0].get('transcription', '').strip()
-                vi_txt = pairs[i][1].get('transcription', '').strip()
+                src_txt = pairs[i][0].get('transcription', '').strip()
+                tgt_txt = pairs[i][1].get('transcription', '').strip()
                 cid = pairs[i][0].get('id', 'N/A')
                 print(f"   🔹 Cặp #{i+1:02d} [FLoRes ID {cid}]:")
-                print(f"      🇬🇧 En: \"{en_txt}\"")
-                print(f"      🇻🇳 Vi: \"{vi_txt}\"")
+                print(f"      🇻🇳 Vi (Nguồn): \"{src_txt}\"")
+                print(f"      🇬🇧 En (Đích) : \"{tgt_txt}\"")
             print("-" * 65 + "\n")
         else:
             print("[Cảnh báo] Không tìm được cặp song song nào! Kiểm tra trường 'id' trong dataset.")
             self.is_online = False
 
     def reset(self):
-        """Reset chỉ mục để mọi kịch bản (Case 0 -> Case 4) cùng đánh giá trên đúng các mẫu giống hệt nhau."""
         self._pair_index = 0
 
     def shuffle(self):
-        """Xáo trộn ngẫu nhiên thứ tự các cặp song song En-Vi sau mỗi Epoch để chống học vẹt."""
         if self._parallel_pairs:
-            import random
             random.shuffle(self._parallel_pairs)
             self._pair_index = 0
 
@@ -520,112 +501,102 @@ class RealStreamingSpeechPipeline:
         if isinstance(audio_data, dict):
             if "bytes" in audio_data and audio_data["bytes"]:
                 arr, sr = sf.read(io.BytesIO(audio_data["bytes"]))
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=-1)
+                if arr.ndim > 1: arr = arr.mean(axis=-1)
                 return torch.from_numpy(arr).float()[:limit]
             if "array" in audio_data and audio_data["array"] is not None:
                 arr = audio_data["array"]
-                if hasattr(arr, "ndim") and arr.ndim > 1:
-                    arr = arr.mean(axis=-1)
+                if hasattr(arr, "ndim") and arr.ndim > 1: arr = arr.mean(axis=-1)
                 return torch.from_numpy(arr).float()[:limit]
             if "path" in audio_data and os.path.exists(audio_data["path"]):
                 arr, sr = sf.read(audio_data["path"])
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=-1)
+                if arr.ndim > 1: arr = arr.mean(axis=-1)
                 return torch.from_numpy(arr).float()[:limit]
         elif isinstance(audio_data, str) and os.path.exists(audio_data):
             arr, sr = sf.read(audio_data)
-            if arr.ndim > 1:
-                arr = arr.mean(axis=-1)
+            if arr.ndim > 1: arr = arr.mean(axis=-1)
             return torch.from_numpy(arr).float()[:limit]
         raise ValueError("Không tìm thấy audio hợp lệ")
 
-    def fetch_batch(self, batch_size=4, return_en_text=False):
+    def fetch_batch(self, batch_size=4, return_text=True):
         src_waves = []
         tgt_waves = []
-        transcripts = []
-        en_transcripts = []
+        transcripts = []      # Target transcripts (English)
+        src_transcripts = []  # Source transcripts (Vietnamese)
 
         if self.is_online and self._parallel_pairs:
             for _ in range(batch_size):
                 try:
                     if self._pair_index >= len(self._parallel_pairs):
-                        self._pair_index = 0  # Wrap-around khi hết dữ liệu
-                    item_en, item_vi = self._parallel_pairs[self._pair_index]
+                        self._pair_index = 0
+                    item_src, item_tgt = self._parallel_pairs[self._pair_index]
                     self._pair_index += 1
-                    w_en = self._extract_audio_tensor(item_en['audio'])
-                    w_vi = self._extract_audio_tensor(item_vi['audio'])
-                    src_waves.append(w_en)
-                    tgt_waves.append(w_vi)
-                    transcripts.append(item_vi.get('transcription', 'xin chào việt nam'))
-                    en_transcripts.append(item_en.get('transcription', 'hello world'))
+                    w_src = self._extract_audio_tensor(item_src['audio'])
+                    w_tgt = self._extract_audio_tensor(item_tgt['audio'])
+                    src_waves.append(w_src)
+                    tgt_waves.append(w_tgt)
+                    transcripts.append(item_tgt.get('transcription', 'hello world'))
+                    src_transcripts.append(item_src.get('transcription', 'xin chào'))
                 except Exception as ex:
-                    print(f"[Data Info] Lỗi nạp cặp song song ({ex}), bỏ qua...")
                     self._pair_index += 1
                     continue
 
-        # Fallback tạo sóng âm hài chuẩn nếu mạng nghẽn hoặc offline
         while len(src_waves) < batch_size:
             t_sec = torch.linspace(0, self.max_sec, int(16000 * self.max_sec))
+            f0_vi = 160.0 + 40.0 * torch.sin(2 * math.pi * 2.0 * t_sec)
+            src_waves.append(torch.sin(2 * math.pi * f0_vi * t_sec))
             f0_en = 130.0 + 30.0 * torch.sin(2 * math.pi * 1.5 * t_sec)
-            w_en = torch.sin(2 * math.pi * f0_en * t_sec) * 0.4
-            f0_vi = 180.0 + 45.0 * torch.sin(2 * math.pi * 2.2 * t_sec)
-            w_vi = torch.sin(2 * math.pi * f0_vi * t_sec) * 0.4
-            src_waves.append(w_en)
-            tgt_waves.append(w_vi)
-            transcripts.append('mô hình dịch tiếng nói bảo tồn thanh điệu')
-            en_transcripts.append('speech to speech translation model')
+            tgt_waves.append(torch.sin(2 * math.pi * f0_en * t_sec))
+            transcripts.append("synthetic english translation")
+            src_transcripts.append("âm thanh mô phỏng tiếng việt")
 
-        max_src = max(w.shape[0] for w in src_waves)
-        max_tgt = max(w.shape[0] for w in tgt_waves)
-        padded_src = torch.stack([F.pad(w, (0, max_src - w.shape[0])) for w in src_waves], dim=0)
-        padded_tgt_16k = torch.stack([F.pad(w, (0, max_tgt - w.shape[0])) for w in tgt_waves], dim=0)
-        if return_en_text:
-            return padded_src, padded_tgt_16k, transcripts, en_transcripts
-        return padded_src, padded_tgt_16k, transcripts
+        max_src_len = max(w.shape[-1] for w in src_waves)
+        max_tgt_len = max(w.shape[-1] for w in tgt_waves)
+        pad_src = torch.stack([F.pad(w, (0, max_src_len - w.shape[-1])) for w in src_waves])
+        pad_tgt = torch.stack([F.pad(w, (0, max_tgt_len - w.shape[-1])) for w in tgt_waves])
+
+        if return_text:
+            return pad_src, pad_tgt, transcripts, src_transcripts
+        return pad_src, pad_tgt
 
 # ==============================================================================
-# 4. VÒNG LẶP HUẤN LUYỆN CHÍNH
+# 4. CHƯƠNG TRÌNH HUẤN LUYỆN CHÍNH (MAIN TRAINER)
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Huấn luyện ToneAwareBridge S2ST (Frozen CFM Teacher)")
-    parser.add_argument("--config", type=str, default="configs/stage2_bridge.yaml", help="Đường dẫn file cấu hình YAML")
-    parser.add_argument("--exp-name", type=str, default="bridge", help="Tên thử nghiệm")
-    parser.add_argument("--resume", action="store_true", help="Khôi phục huấn luyện từ checkpoint gần nhất")
-    parser.add_argument("--smoke-test", action="store_true", help="Chạy kiểm thử 2 bước rồi dừng (kiểm tra CUDA/Forward/Backward)")
-    parser.add_argument("--sanity-check", action="store_true", help="Chạy bài test overfit 50 bước trên 4 mẫu cố định để kiểm chứng luồng gradient")
-    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth", help="Đường dẫn checkpoint CFM pretrained để làm Acoustic Teacher")
-    parser.add_argument("--no-freeze-cfm", action="store_true", help="Không đóng băng CFM (mặc định luôn đóng băng để bảo toàn âm học chuẩn)")
+    parser = argparse.ArgumentParser(description="Huấn luyện CrossAttentionBridge S2ST Vi -> En")
+    parser.add_argument("--config", type=str, default="configs/stage2_bridge.yaml")
+    parser.add_argument("--exp-name", type=str, default="bridge_vien")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--sanity-check", action="store_true",
+                        help="Kiểm tra gradient nhanh 50 bước trên 4 mẫu câu")
+    parser.add_argument("--overfit-16", action="store_true",
+                        help="Sanity Check #3: Huấn luyện overfit 500 bước trên 16 cặp câu Vi-En và xuất audio")
+    parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth")
+    parser.add_argument("--no-freeze-cfm", action="store_true")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
-    paths = cfg["paths"]
     train_cfg = cfg["training"]
-    loss_weights = cfg["loss_weights"]
+    paths = cfg["paths"]
+    loss_weights = cfg.get("loss_weights", {"cfm_weight": 1.0, "dur_weight": 0.1})
 
-    os.makedirs(paths["log_dir"], exist_ok=True)
-    os.makedirs(paths["checkpoint_dir"], exist_ok=True)
-    
     log_file = os.path.join(paths["log_dir"], f"{args.exp_name}.log")
-    sys.stdout = Logger(log_file)
+    sys.stdout = TeeLogger(log_file)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_bf16 = train_cfg.get("bf16", True) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported() and train_cfg.get("bf16", True)) else torch.float32
 
     print("=" * 75)
-    print(f"🚀 KHỞI ĐỘNG HUẤN LUYỆN TONE-AWARE BRIDGE: [{args.exp_name.upper()}]")
-    print(f"Thiết bị: {device} | Dtype: {dtype} | BF16 Hỗ trợ: {use_bf16}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print("🚀 BẮT ĐẦU HUẤN LUYỆN S2ST VIỆT -> ANH (CROSS-ATTENTION BRIDGE & OT-CFM)")
+    print(f"   • Device: {device} | Precision: {dtype} | Batch Size: {train_cfg['batch_size']}")
+    print(f"   • Cặp ngôn ngữ: {cfg['data'].get('src_lang', 'vi_vn')} -> {cfg['data'].get('tgt_lang', 'en_us')}")
     print("=" * 75)
 
-    # 1. Nạp Whisper-Small Encoder (Đóng băng - Frozen)
-    whisper_id = cfg["model"].get("whisper_model", "openai/whisper-small")
+    # 1. Nạp Whisper Feature Extractor & Encoder
+    whisper_id = cfg["model"]["whisper_model"]
     feat_extractor = None
     whisper_enc = None
-
     try:
         from transformers import WhisperFeatureExtractor, WhisperModel
         print(f"⏳ Đang nạp Whisper Feature Extractor & Encoder ({whisper_id})...")
@@ -633,12 +604,12 @@ def main():
         whisper_enc = WhisperModel.from_pretrained(whisper_id).encoder.eval().to(device=device, dtype=dtype)
         for p in whisper_enc.parameters():
             p.requires_grad = False
-        print("✓ Whisper-Small Encoder đã được đóng băng (Frozen) an toàn!")
+        print("✓ Whisper Encoder đã được đóng băng (Frozen) an toàn!")
     except Exception as e:
         print(f"[Whisper Warning] Chưa thể nạp transformers ({e}). Sẽ dùng đặc trưng mô phỏng.")
 
-    # 2. Khởi tạo mô hình ToneAwareBridge & CFM Decoder
-    model = EnViS2STSystem(
+    # 2. Khởi tạo mô hình ViEnS2STSystem
+    model = ViEnS2STSystem(
         encoder_dim=cfg["model"]["encoder_dim"],
         bridge_dim=cfg["model"]["bridge_dim"],
         bridge_layers=cfg["model"]["bridge_layers"],
@@ -648,7 +619,7 @@ def main():
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
-    # Nạp Pretrained CFM Decoder làm Acoustic Teacher
+    # Nạp Pretrained CFM nếu có
     if os.path.exists(args.cfm_ckpt):
         print(f"⏳ Đang nạp weights Pretrained CFM từ: {args.cfm_ckpt}...")
         ckpt_cfm = torch.load(args.cfm_ckpt, map_location=device)
@@ -662,15 +633,13 @@ def main():
         model.decoder.load_state_dict(dec_st if dec_st else st, strict=False)
         print("✓ Nạp weights Pretrained CFM thành công!")
     else:
-        print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt}! CFM sẽ dùng weights ngẫu nhiên.")
+        print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt}! CFM sẽ dùng weights ngẫu nhiên (hoặc huấn luyện từ đầu).")
 
-    # Đóng băng CFM nếu không có cờ --no-freeze-cfm
     if not args.no_freeze_cfm:
         for p in model.decoder.parameters():
             p.requires_grad = False
-        print("🔒 Đã ĐÓNG BĂNG (FREEZE) CFM Decoder. Toàn bộ áp lực học tập trung 100% vào ToneAwareBridge!")
+        print("🔒 Đã ĐÓNG BĂNG (FREEZE) CFM Decoder. Toàn bộ áp lực học tập trung 100% vào CrossAttentionBridge!")
 
-    # Liệt kê tham số có thể huấn luyện (Trainable Parameters)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_trainable = sum(p.numel() for p in trainable_params)
     num_total = sum(p.numel() for p in model.parameters())
@@ -687,7 +656,6 @@ def main():
     global_step = 0
     best_loss = float("inf")
 
-    # Khôi phục Checkpoint nếu có cờ --resume
     ckpt_path = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(paths["checkpoint_dir"], "model-last.pth")
@@ -700,7 +668,7 @@ def main():
             try:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             except Exception as e:
-                print(f"[Optimizer Info] Không khớp danh sách tham số cũ ({e}) do CFM đã được đóng băng. Sử dụng Optimizer mới cho Bridge!")
+                print(f"[Optimizer Info] Khởi tạo optimizer mới ({e}).")
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
@@ -708,20 +676,22 @@ def main():
 
     # 3. Pipeline Dữ liệu
     max_sec = cfg["data"].get("max_audio_sec", 12.0)
-    data_pipeline = RealStreamingSpeechPipeline(max_sec=max_sec)
+    src_l = cfg["data"].get("src_lang", "vi_vn")
+    tgt_l = cfg["data"].get("tgt_lang", "en_us")
+    data_pipeline = RealStreamingSpeechPipeline(split='train', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l)
 
-    # --------------------------------------------------------------------------
-    # BÀI KIỂM TRA TIỀN HUẤN LUYỆN (SANITY OVERFIT CHECK TRÊN 4 MẪU)
-    # --------------------------------------------------------------------------
-    if args.sanity_check:
+    # 4. Chế độ Sanity Check & Overfit 16 mẫu
+    if args.sanity_check or args.overfit_16:
+        is_deep = args.overfit_16
+        num_samples = 16 if is_deep else 4
+        num_steps = 500 if is_deep else 50
         print("\n" + "=" * 75)
-        print("🧪 BẮT ĐẦU BÀI KIỂM TRA TIỀN HUẤN LUYỆN (SANITY CHECK: OVERFIT 4 MẪU)")
-        print("Mục tiêu: Đảm bảo Gradient chảy thông suốt từ CFM về Bridge và Loss giảm dốc đứng.")
+        print(f"🧪 BẮT ĐẦU KIỂM TRA OVERFIT ({num_steps} BƯỚC TRÊN {num_samples} CẶP CÂU VI -> EN)")
+        print("Mục tiêu: Đảm bảo Gradient chảy thông suốt qua Cross-Attention Bridge và kiểm tra khả năng học.")
         print("=" * 75)
         model.train()
-        fix_src, fix_tgt, fix_vi_texts = data_pipeline.fetch_batch(batch_size=4)
-        
-        # Trích xuất Whisper Latents cố định
+        fix_src, fix_tgt, fix_en_texts, fix_vi_texts = data_pipeline.fetch_batch(batch_size=num_samples)
+
         if feat_extractor is not None and whisper_enc is not None:
             in_proc = feat_extractor(fix_src.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
             f = in_proc.input_features.to(device=device, dtype=dtype)
@@ -732,36 +702,54 @@ def main():
             real_l = max(10, int(fix_src.shape[-1] / 320))
             s_lat = fl[:, :real_l, :]
         else:
-            s_lat = torch.randn(4, 100, 768, device=device, dtype=dtype)
+            s_lat = torch.randn(num_samples, 100, 768, device=device, dtype=dtype)
 
         tgt_24 = resample_16k_to_24k(fix_tgt.to(device=device, dtype=torch.float32))
         tgt_m = extract_100_mel(tgt_24, mel_fb).to(dtype=dtype)
-        t_list = [parse_tones(txt, target_len=tgt_m.shape[-1] // 2) for txt in fix_vi_texts]
-        t_tens = torch.stack(t_list, dim=0).to(device=device)
-        d_ratio = torch.tensor([float(tgt_m.shape[-1]) / float(s_lat.shape[1] * 2)] * 4, device=device, dtype=dtype)
+        d_ratio = torch.tensor([float(tgt_m.shape[-1]) / float(s_lat.shape[1])] * num_samples, device=device, dtype=dtype)
 
         initial_loss = None
         final_loss = None
-        for s in range(50):
+        t_start = time.time()
+        for s in range(num_steps):
             optimizer.zero_grad()
-            l_tot, cfm_l, t_l, d_l, t_acc = model.compute_loss(
-                s_lat, tgt_m, target_tones=t_tens, target_dur_ratio=d_ratio, loss_weights=loss_weights
+            l_tot, cfm_l, d_l = model.compute_loss(
+                s_lat, tgt_m, target_dur_ratio=d_ratio, loss_weights=loss_weights
             )
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             if s == 0: initial_loss = l_tot.item()
-            if (s + 1) % 10 == 0 or s == 0:
-                print(f"   [Sanity Step {s+1:02d}/50] Total Loss: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} | Tone: {t_l.item():.4f} (Acc: {t_acc:.1f}%) | Dur: {d_l.item():.4f}")
+            log_interval = 50 if is_deep else 10
+            if (s + 1) % log_interval == 0 or s == 0:
+                print(f"   [Overfit Step {s+1:03d}/{num_steps}] Total Loss: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} | Dur: {d_l.item():.4f}")
             final_loss = l_tot.item()
 
         print("-" * 75)
         if final_loss < initial_loss:
-            print(f"✅ SANITY CHECK PASS! Loss giảm từ {initial_loss:.4f} xuống {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%).")
-            print("   Hệ thống sẵn sàng 100% để huấn luyện chính thức!")
+            print(f"✅ OVERFIT PASS! Loss giảm từ {initial_loss:.4f} xuống {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%) trong {time.time()-t_start:.1f}s.")
         else:
-            print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}). Kiểm tra lại Learning Rate!")
+            print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
+
+        # Nếu là Overfit sâu 500 bước -> Xuất file audio nghe thử qua Vocos
+        if is_deep:
+            out_dir = "outputs/sanity"
+            os.makedirs(out_dir, exist_ok=True)
+            try:
+                from vocos import Vocos
+                vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+                gen_mel = model.inference(s_lat[:1], num_steps=25)
+                with torch.no_grad():
+                    gen_wav = vocos.decode(gen_mel.float()).squeeze().cpu()
+                out_wav = os.path.join(out_dir, "bridge_vi_en_overfit16_sample0.wav")
+                save_wav_file(out_wav, gen_wav, 24000)
+                print(f"🎧 Đã xuất file audio kiểm tra khả năng học tại: {out_wav}")
+                print(f"   🇻🇳 Input Vi: \"{fix_vi_texts[0]}\"")
+                print(f"   🎯 Target En: \"{fix_en_texts[0]}\"")
+            except Exception as e:
+                print(f"[Vocos Info] Chưa xuất được audio: {e}")
+
         print("=" * 75 + "\n")
         return
 
@@ -771,7 +759,6 @@ def main():
     auto_steps = max(20, num_pairs // batch_size)
     steps_per_epoch = 2 if args.smoke_test else auto_steps
 
-    # Thiết lập Cosine Warm-up Learning Rate Scheduler
     total_train_steps = epochs * steps_per_epoch
     warmup_steps = min(train_cfg.get("warmup_steps", 150), max(10, total_train_steps // 6))
 
@@ -790,16 +777,14 @@ def main():
     for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0.0
-        epoch_tone_acc = 0.0
         t0 = time.time()
 
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
 
-            # Nạp âm thanh thật En-Vi
-            src_audio_16k, tgt_audio_16k, vi_texts = data_pipeline.fetch_batch(batch_size=batch_size)
+            src_audio_16k, tgt_audio_16k, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=batch_size)
 
-            # Trích xuất Whisper Latents từ audio tiếng Anh
+            # Trích xuất Whisper Latents từ audio tiếng Việt nguồn
             if feat_extractor is not None and whisper_enc is not None:
                 in_proc = feat_extractor(
                     src_audio_16k.numpy(),
@@ -821,21 +806,15 @@ def main():
             else:
                 src_latents = torch.randn(batch_size, 100, 768, device=device, dtype=dtype)
 
-            # Chuyển đổi audio tiếng Việt sang 24kHz và trích xuất 100-Mel
+            # Chuyển đổi audio tiếng Anh sang 24kHz và trích xuất 100-Mel đích
             tgt_24k = resample_16k_to_24k(tgt_audio_16k.to(device=device, dtype=torch.float32))
             tgt_mel = extract_100_mel(tgt_24k, mel_fb).to(dtype=dtype)
 
-            # Trích xuất nhãn thanh điệu
-            tones_list = [parse_tones(txt, target_len=tgt_mel.shape[-1] // 2) for txt in vi_texts]
-            tones = torch.stack(tones_list, dim=0).to(device=device)
-
-            dur_ratio = torch.tensor([float(tgt_mel.shape[-1]) / float(src_latents.shape[1] * 2)] * batch_size,
+            dur_ratio = torch.tensor([float(tgt_mel.shape[-1]) / float(src_latents.shape[1])] * batch_size,
                                      device=device, dtype=dtype)
 
-            # Tính Loss Multi-Task
-            total_loss, cfm_l, tone_l, dur_l, tone_acc = model.compute_loss(
-                src_latents, tgt_mel, target_tones=tones, target_dur_ratio=dur_ratio,
-                loss_weights=loss_weights
+            total_loss, cfm_l, dur_l = model.compute_loss(
+                src_latents, tgt_mel, target_dur_ratio=dur_ratio, loss_weights=loss_weights
             )
 
             total_loss.backward()
@@ -845,22 +824,20 @@ def main():
 
             global_step += 1
             epoch_loss += total_loss.item()
-            epoch_tone_acc += tone_acc
 
             if global_step % 10 == 0 or args.smoke_test:
                 cur_lr = scheduler.get_last_lr()[0]
                 print(f"   [E{epoch:02d}|Step {global_step:04d}] Total Loss: {total_loss.item():.4f} | "
-                      f"CFM: {cfm_l.item():.4f} | Tone: {tone_l.item():.4f} (Acc: {tone_acc:.1f}%) | Dur: {dur_l.item():.4f} | LR: {cur_lr:.2e}")
+                      f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | LR: {cur_lr:.2e}")
 
         avg_loss = epoch_loss / max(1, steps_per_epoch)
-        avg_acc = epoch_tone_acc / max(1, steps_per_epoch)
         elapsed = time.time() - t0
-        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f} | Tone Acc: {avg_acc:.1f}% | Best Loss: {min(best_loss, avg_loss):.4f}")
+        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f} | Best Loss: {min(best_loss, avg_loss):.4f}")
 
-        # Xáo trộn dữ liệu sau mỗi Epoch để chống học vẹt
         data_pipeline.shuffle()
 
-        # Lưu Checkpoint Atomic
+        # Lưu Checkpoint Last & Best
+        os.makedirs(paths["checkpoint_dir"], exist_ok=True)
         ckpt_data = {
             "epoch": epoch,
             "step": global_step,
@@ -869,21 +846,13 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "config": cfg,
         }
-
-        tmp_ckpt = ckpt_path + ".tmp"
-        torch.save(ckpt_data, tmp_ckpt)
-        os.replace(tmp_ckpt, ckpt_path)
-
+        torch.save(ckpt_data, os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth"))
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_ckpt = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
-            torch.save(ckpt_data, best_ckpt)
+            torch.save(ckpt_data, os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth"))
             print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best Loss: {best_loss:.4f}")
 
-    print("=" * 75)
-    print("✅ HUẤN LUYỆN TONE-AWARE BRIDGE KẾT THÚC THÀNH CÔNG!")
-    print(f"Checkpoint lưu tại: {ckpt_path}")
-    print("=" * 75)
+    print("\n🎉 HUẤN LUYỆN CROSS-ATTENTION BRIDGE (VI -> EN) HOÀN TẤT THÀNH CÔNG!")
 
 if __name__ == "__main__":
     main()

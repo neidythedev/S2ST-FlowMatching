@@ -43,7 +43,11 @@ case "$ACTION" in
         # 4. Khởi chạy ngầm độc lập (detached background)
         if [[ "$EXP_NAME" == *"cfm"* ]]; then
             SCRIPT="train_cfm.py"
-            CONFIG="configs/stage1_cfm.yaml"
+            if [ -f "configs/stage1_cfm_en.yaml" ]; then
+                CONFIG="configs/stage1_cfm_en.yaml"
+            else
+                CONFIG="configs/stage1_cfm.yaml"
+            fi
         else
             SCRIPT="train_bridge.py"
             CONFIG="configs/stage2_bridge.yaml"
@@ -109,10 +113,23 @@ case "$ACTION" in
         ;;
 
     sanity)
-        echo "🧪 Đang chạy bài kiểm tra Tiền Huấn luyện (Sanity Overfit Check 50 steps trên 4 mẫu)..."
+        echo "🧪 Đang chạy trọn bộ EDA & Sanity Check Suite (Vocos Round-trip + Whisper Vi health)..."
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
         pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
-        python train_bridge.py --sanity-check
+        python sanity_and_eda_suite.py --all
+        ;;
+
+    overfit)
+        TARGET="${2:-bridge}"
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
+        if [[ "$TARGET" == *"cfm"* ]]; then
+            echo "🧪 Đang chạy Sanity Check #3: Overfit 500 bước trên 16 câu Tiếng Anh cho Stage 1 CFM..."
+            python train_cfm.py --config configs/stage1_cfm_en.yaml --overfit-16
+        else
+            echo "🧪 Đang chạy Sanity Check #3: Overfit 500 bước trên 16 cặp câu Vi-En cho Stage 2 Bridge..."
+            python train_bridge.py --overfit-16
+        fi
         ;;
 
     eval)
@@ -126,10 +143,13 @@ case "$ACTION" in
 
     *)
         echo "=========================================================="
-        echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH:"
-        echo "  bash run.sh start [tên_exp]      -> Chạy huấn luyện ngầm"
+        echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH (S2ST VI -> EN):"
+        echo "  bash run.sh sanity               -> Chạy trọn bộ EDA & Sanity Check (Vocos + Whisper)"
+        echo "  bash run.sh overfit [cfm|bridge] -> Overfit 500 bước trên 16 câu & xuất audio nghe thử"
+        echo "  bash run.sh start cfm_en         -> Huấn luyện Stage 1 OT-CFM Tiếng Anh"
+        echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"
-        echo "  bash run.sh eval [0|1|2|3|4|all] -> Chạy benchmark đo metric (0: Pretrained Baseline)"
+        echo "  bash run.sh eval [0|1|2|3|4|5]   -> Chạy benchmark đo metric (0: Cascaded, 5: SeamlessM4T)"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"

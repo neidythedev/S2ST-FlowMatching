@@ -1,10 +1,10 @@
 # ==============================================================================
-# CẤU HÌNH HUẤN LUYỆN TONE-AWARE BRIDGE (EN -> VI S2ST)
+# CẤU HÌNH HUẤN LUYỆN CROSS-ATTENTION BRIDGE (VI -> EN S2ST)
 # Tuân thủ quy chuẩn SKILL2.md cho Molab GPU Runtime
 # ==============================================================================
 
 model:
-  whisper_model: "openai/whisper-small"
+  whisper_model: "openai/whisper-small" # Whisper Encoder trích xuất đặc trưng tiếng Việt
   encoder_dim: 768
   bridge_dim: 512
   bridge_layers: 6
@@ -12,12 +12,11 @@ model:
   n_mels: 100
   spk_dim: 192
   decoder_hidden: 384
-  use_tone_head: true
-  num_tones: 6
+  use_tone_head: false
+  num_tones: 0
 
 loss_weights:
   cfm_weight: 1.0
-  tone_weight: 0.2
   dur_weight: 0.1
 
 training:
@@ -35,8 +34,8 @@ training:
 
 data:
   dataset_name: "google/fleurs"
-  src_lang: "en_us"
-  tgt_lang: "vi_vn"
+  src_lang: "vi_vn"
+  tgt_lang: "en_us"
   sample_rate_src: 16000
   sample_rate_tgt: 24000
   max_audio_sec: 12.0
