@@ -217,10 +217,10 @@ sys.exit(1)
         fi
         if [[ "$CASE_CHOICE" == "sota" || "$CASE_CHOICE" == "both_tts" || "$CASE_CHOICE" == "all" || "$CASE_CHOICE" == "f5" || "$CASE_CHOICE" == "f5tts" || "$CASE_CHOICE" == "7" ]]; then
             echo "📦 [Deps 4/4] Cài đặt F5-TTS (f5-tts + google-cloud-storage)..."
-            # Gỡ bỏ flash-attn bị lỗi (nếu có) → F5-TTS sẽ dùng torch SDPA fallback
-            pip uninstall flash-attn -y 2>/dev/null || true
             pip install google-cloud-storage -q 2>/dev/null || true
             pip install f5-tts -q 2>/dev/null || true
+            # Gỡ flash-attn SAU khi cài f5-tts (vì f5-tts re-install nó nhưng bị broken trên Molab)
+            pip uninstall flash-attn -y 2>/dev/null || true
         fi
 
         echo "✓ Cài đặt dependencies hoàn tất! Bắt đầu chạy benchmark..."

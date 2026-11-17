@@ -103,14 +103,32 @@ def apply_torchaudio_mock_if_needed():
                 encoding = "PCM_S"
             return AudioMetaData()
 
+        def _resample(waveform, orig_freq, new_freq, **kwargs):
+            """Thay thế torchaudio.functional.resample bằng torch interpolate."""
+            if orig_freq == new_freq:
+                return waveform
+            ratio = new_freq / orig_freq
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+                return out.squeeze(0).squeeze(0)
+            elif waveform.ndim == 2:
+                waveform = waveform.unsqueeze(1)
+                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+                return out.squeeze(1)
+            else:
+                return torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+
         ta_func_func.hz_to_mel = _hz_to_mel
         ta_func_func.mel_to_hz = _mel_to_hz
         ta_func_func._hz_to_mel = _hz_to_mel
         ta_func_func._mel_to_hz = _mel_to_hz
+        ta_func_func.resample = _resample
         ta_func.hz_to_mel = _hz_to_mel
         ta_func.mel_to_hz = _mel_to_hz
         ta_func._hz_to_mel = _hz_to_mel
         ta_func._mel_to_hz = _mel_to_hz
+        ta_func.resample = _resample
         ta.functional = ta_func
         ta.transforms = ta_trans
         ta._extension = ta_ext
@@ -1027,11 +1045,31 @@ def load_voice_clone_tts(tts_engine, device):
             print("📦 f5-tts chưa cài đặt. Đang tự động cài đặt...")
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "f5-tts", "-q"])
-                from f5_tts.api import F5TTS
             except Exception as e:
                 print(f"[Cảnh báo TTS] Không thể cài đặt f5-tts ({e}).")
                 print("👉 Bạn hãy chạy thủ công: pip install google-cloud-storage f5-tts")
                 return None
+
+        # Gỡ flash-attn bị lỗi SAU khi install f5-tts (vì f5-tts re-install nó)
+        try:
+            from flash_attn import flash_attn_func
+        except Exception:
+            print("⚠️ flash-attn broken → gỡ bỏ, F5-TTS sẽ dùng torch SDPA...")
+            subprocess.call([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y", "-q"])
+            for mod_name in list(sys.modules.keys()):
+                if "flash_attn" in mod_name:
+                    del sys.modules[mod_name]
+
+        # Reload f5_tts sau khi gỡ flash-attn
+        for mod_name in list(sys.modules.keys()):
+            if "f5_tts" in mod_name:
+                del sys.modules[mod_name]
+        try:
+            from f5_tts.api import F5TTS
+        except Exception as e:
+            print(f"[Cảnh báo TTS] Không thể nạp f5-tts sau khi gỡ flash-attn ({e}).")
+            print("👉 Bạn hãy chạy thủ công: pip install google-cloud-storage f5-tts")
+            return None
 
         try:
             f5_dev = "cuda" if (torch.cuda.is_available() and device.type == "cuda") else "cpu"

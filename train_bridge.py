@@ -60,14 +60,31 @@ def apply_torchaudio_mock_if_needed():
         def _mel_to_hz(mel: float, mel_scale: str = "htk") -> float:
             return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
+        def _resample(waveform, orig_freq, new_freq, **kwargs):
+            if orig_freq == new_freq:
+                return waveform
+            ratio = new_freq / orig_freq
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+                return out.squeeze(0).squeeze(0)
+            elif waveform.ndim == 2:
+                waveform = waveform.unsqueeze(1)
+                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+                return out.squeeze(1)
+            else:
+                return torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+
         ta_func_func.hz_to_mel = _hz_to_mel
         ta_func_func.mel_to_hz = _mel_to_hz
         ta_func_func._hz_to_mel = _hz_to_mel
         ta_func_func._mel_to_hz = _mel_to_hz
+        ta_func_func.resample = _resample
         ta_func.hz_to_mel = _hz_to_mel
         ta_func.mel_to_hz = _mel_to_hz
         ta_func._hz_to_mel = _hz_to_mel
         ta_func._mel_to_hz = _mel_to_hz
+        ta_func.resample = _resample
         ta.functional = ta_func
         ta.transforms = ta_trans
         ta._extension = ta_ext
