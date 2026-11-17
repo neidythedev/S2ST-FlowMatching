@@ -908,56 +908,76 @@ def sanitize_text_for_f5(text):
     return clean if clean else "xin chao"
 
 def load_voice_clone_tts(tts_engine, device):
-    """Nạp engine TTS phục vụ Voice Cloning (XTTS-v2 hoặc F5-TTS)."""
+    """Nạp engine TTS phục vụ Voice Cloning (XTTS-v2 hoặc F5-TTS).
+    
+    Lưu ý: Trên Molab Python 3.13+, coqui-tts cần torchcodec để xử lý audio I/O,
+    và F5-TTS cần google-cloud-storage. Các deps này nên được cài từ run.sh trước.
+    """
+    import subprocess
+
     if tts_engine == "xtts":
         print("⏳ Đang nạp coqui/XTTS-v2 (Zero-shot Voice Cloning từ speaker_wav)...")
+
+        # Đảm bảo torchcodec có sẵn (cần cho torchaudio backend trên PyTorch 2.9+)
+        try:
+            import torchcodec
+        except ImportError:
+            print("📦 Đang cài torchcodec (cần cho torchaudio backend)...")
+            subprocess.call([sys.executable, "-m", "pip", "install", "torchcodec", "-q"])
+
+        # Thử nạp coqui-tts, cài nếu chưa có
         try:
             from TTS.api import TTS
-            model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-            print("✓ Nạp XTTS-v2 thành công!")
-            return model
         except ImportError:
             print("📦 coqui-tts chưa cài đặt. Đang tự động cài đặt...")
             try:
-                import subprocess
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "coqui-tts", "-q"])
                 from TTS.api import TTS
-                model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-                print("✓ Cài đặt & nạp XTTS-v2 thành công!")
-                return model
             except Exception as e:
-                print(f"[Cảnh báo TTS] Không thể tự động cài đặt XTTS-v2 ({e}).")
-                print("👉 Bạn hãy chạy thủ công: pip install coqui-tts")
+                print(f"[Cảnh báo TTS] Không thể cài đặt coqui-tts ({e}).")
+                print("👉 Bạn hãy chạy thủ công: pip install torchcodec coqui-tts")
                 return None
+
+        try:
+            model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+            print("✓ Nạp XTTS-v2 thành công!")
+            return model
         except Exception as e:
             print(f"[Cảnh báo TTS] Lỗi khi nạp XTTS-v2 ({e}).")
             return None
 
     elif tts_engine == "f5tts":
         print("⏳ Đang nạp SWivid/F5-TTS (Flow-Matching In-Context Voice Cloning)...")
+
+        # Đảm bảo google-cloud-storage có sẵn (dependency ngầm của F5-TTS)
+        try:
+            import google.cloud.storage
+        except (ImportError, ModuleNotFoundError):
+            print("📦 Đang cài google-cloud-storage (dependency của F5-TTS)...")
+            subprocess.call([sys.executable, "-m", "pip", "install", "google-cloud-storage", "-q"])
+
+        # Thử nạp f5-tts, cài nếu chưa có
         try:
             from f5_tts.api import F5TTS
+        except ImportError:
+            print("📦 f5-tts chưa cài đặt. Đang tự động cài đặt...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "f5-tts", "-q"])
+                from f5_tts.api import F5TTS
+            except Exception as e:
+                print(f"[Cảnh báo TTS] Không thể cài đặt f5-tts ({e}).")
+                print("👉 Bạn hãy chạy thủ công: pip install google-cloud-storage f5-tts")
+                return None
+
+        try:
             f5_dev = "cuda" if (torch.cuda.is_available() and device.type == "cuda") else "cpu"
             model = F5TTS(device=f5_dev)
             print("✓ Nạp F5-TTS thành công!")
             return model
-        except ImportError:
-            print("📦 f5-tts chưa cài đặt. Đang tự động cài đặt...")
-            try:
-                import subprocess
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "f5-tts", "-q"])
-                from f5_tts.api import F5TTS
-                f5_dev = "cuda" if (torch.cuda.is_available() and device.type == "cuda") else "cpu"
-                model = F5TTS(device=f5_dev)
-                print("✓ Cài đặt & nạp F5-TTS thành công!")
-                return model
-            except Exception as e:
-                print(f"[Cảnh báo TTS] Không thể tự động cài đặt F5-TTS ({e}).")
-                print("👉 Bạn hãy chạy thủ công: pip install f5-tts")
-                return None
         except Exception as e:
             print(f"[Cảnh báo TTS] Lỗi khi nạp F5-TTS ({e}).")
             return None
+
     return None
 
 def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small", mt_choice="auto"):

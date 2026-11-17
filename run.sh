@@ -150,9 +150,51 @@ case "$ACTION" in
         MT_MODEL="${5:-auto}"
         echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm..."
         echo "   • Kịch bản: $CASE_CHOICE | Chế độ S2TT: $S2TT_MODE | Số mẫu: $NUM_SAMPLES | MT Model: $MT_MODEL"
-        # Tự động gỡ bỏ bản torchaudio C++ bị vỡ symbol ABI trên Python 3.13
+
+        # 0. Gỡ bỏ torchaudio C++ bị vỡ symbol ABI trên Python 3.13
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
-        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses sacrebleu -q 2>/dev/null || true
+
+        # 1. Cài đặt các thư viện nền tảng
+        echo "📦 [Deps 1/4] Cài đặt thư viện nền tảng (datasets, soundfile, vocos, sacrebleu)..."
+        pip install "datasets<4.0.0" soundfile vocos sacrebleu -q 2>/dev/null || true
+
+        # 2. Nâng cấp sentencepiece + protobuf (sửa lỗi VinAI-Translate parse sentencepiece.bpe.model)
+        echo "📦 [Deps 2/4] Nâng cấp sentencepiece & protobuf (fix VinAI-Translate)..."
+        pip install --upgrade sentencepiece protobuf sacremoses -q 2>/dev/null || true
+        # Xóa HF cache VinAI bị corrupted nếu có (sẽ tự tải lại bản mới)
+        VINAI_CACHE="$HOME/.cache/huggingface/hub/models--vinai--vinai-translate-vi2en-v2"
+        if [ -d "$VINAI_CACHE" ]; then
+            # Kiểm tra xem sentencepiece.bpe.model có bị lỗi không
+            if python -c "
+import sentencepiece as spm
+import glob, sys
+bpe_files = glob.glob('$VINAI_CACHE/**/sentencepiece.bpe.model', recursive=True)
+if bpe_files:
+    sp = spm.SentencePieceProcessor()
+    sp.Load(bpe_files[0])
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+                echo "✓ VinAI-Translate cache hợp lệ."
+            else
+                echo "⚠️ VinAI-Translate cache bị lỗi, đang xóa để tải lại..."
+                rm -rf "$VINAI_CACHE"
+            fi
+        fi
+
+        # 3. Cài đặt TTS engines (XTTS-v2 & F5-TTS) nếu cần
+        if [[ "$CASE_CHOICE" == "sota" || "$CASE_CHOICE" == "both_tts" || "$CASE_CHOICE" == "all" || "$CASE_CHOICE" == "xtts" || "$CASE_CHOICE" == "6" ]]; then
+            echo "📦 [Deps 3/4] Cài đặt XTTS-v2 (coqui-tts + torchcodec)..."
+            pip install torchcodec -q 2>/dev/null || true
+            pip install coqui-tts -q 2>/dev/null || true
+        fi
+        if [[ "$CASE_CHOICE" == "sota" || "$CASE_CHOICE" == "both_tts" || "$CASE_CHOICE" == "all" || "$CASE_CHOICE" == "f5" || "$CASE_CHOICE" == "f5tts" || "$CASE_CHOICE" == "7" ]]; then
+            echo "📦 [Deps 4/4] Cài đặt F5-TTS (f5-tts + google-cloud-storage)..."
+            pip install google-cloud-storage -q 2>/dev/null || true
+            pip install f5-tts -q 2>/dev/null || true
+        fi
+
+        echo "✓ Cài đặt dependencies hoàn tất! Bắt đầu chạy benchmark..."
         python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" --mt-model "$MT_MODEL" 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 
