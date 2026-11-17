@@ -14,6 +14,7 @@ import sys
 import time
 import types
 import warnings
+import wave
 
 # Tắt cảnh báo phiền toái từ transformers và huggingface_hub
 warnings.filterwarnings("ignore")
@@ -224,6 +225,26 @@ except ImportError as e:
 # ==============================================================================
 # 1. PURE PYTORCH AUDIO UTILITIES (100-MEL CHO VOCOS 24KHZ)
 # ==============================================================================
+
+def save_wav_file(filepath, waveform, sample_rate):
+    """Ghi audio thành file .wav chuẩn PCM 16-bit mà không cần phụ thuộc torchaudio C++."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    if hasattr(waveform, "cpu"):
+        wav_data = waveform.squeeze().cpu()
+    else:
+        wav_data = torch.as_tensor(waveform).squeeze().cpu()
+    if wav_data.ndim > 1:
+        wav_data = wav_data[0]
+    wav_np = wav_data.float().numpy()
+    max_val = max(1e-6, float(abs(wav_np).max()))
+    if max_val > 1.0:
+        wav_np = wav_np / max_val
+    int_samples = (wav_np * 32767.0).astype("int16")
+    with wave.open(filepath, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(int_samples.tobytes())
 
 def build_mel_filterbank(sr=24000, n_fft=1024, n_mels=100, fmin=0.0, fmax=12000.0, device="cpu"):
     """
