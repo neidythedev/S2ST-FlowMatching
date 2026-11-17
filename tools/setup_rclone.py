@@ -26,6 +26,13 @@ def main():
     with open(env_file, "r", encoding="utf-8") as f:
         content = f.read().strip()
 
+    # Định nghĩa các thư mục rclone.conf cần cập nhật (cho cả root và user marimo)
+    target_paths = [
+        conf_file,
+        Path("/root/.config/rclone/rclone.conf"),
+        Path("/home/marimo/.config/rclone/rclone.conf"),
+    ]
+
     # Trường hợp 1: File đã là định dạng INI của rclone ([gdrive] ...)
     if "[gdrive]" in content:
         lines = content.splitlines()
@@ -39,9 +46,15 @@ def main():
                     break
                 rclone_lines.append(line)
         
-        with open(conf_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(rclone_lines) + "\n")
-        print(f"✓ Đã cấu hình rclone thành công vào {conf_file} (từ định dạng INI)!")
+        final_text = "\n".join(rclone_lines) + "\n"
+        for p in set(target_paths):
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(final_text)
+                print(f"✓ Đã cấu hình rclone thành công vào {p}")
+            except Exception:
+                pass
         return 0
 
     # Trường hợp 2: File là biến môi trường KEY=VALUE
@@ -67,9 +80,14 @@ client_secret = {client_secret}
 scope = {scope}
 token = {token}
 """
-        with open(conf_file, "w", encoding="utf-8") as f:
-            f.write(ini_content)
-        print(f"✓ Đã cấu hình rclone thành công vào {conf_file} (từ biến môi trường)!")
+        for p in set(target_paths):
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(ini_content)
+                print(f"✓ Đã cấu hình rclone thành công vào {p}")
+            except Exception:
+                pass
         return 0
 
     print("[setup_rclone] Không trích xuất được thông tin cấu hình Google Drive hợp lệ.")
