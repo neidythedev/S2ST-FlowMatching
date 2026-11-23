@@ -1094,18 +1094,24 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
             except TypeError:
                 gen = model.generate(**audio_inputs, tgt_lang="eng", generate_speech=True)
             if hasattr(gen, "waveform"):
-                speech_out = gen.waveform[0]
+                wav_all = gen.waveform
                 lens = getattr(gen, "waveform_lengths", None)
-                if lens is not None:
-                    speech_out = speech_out[: int(lens[0])]
                 seqs = getattr(gen, "sequences", None)
                 if seqs is not None:
                     try:
-                        translated_en = processor.decode(seqs[0].tolist(), skip_special_tokens=True).strip()
+                        seq0 = seqs[0] if seqs.ndim > 1 else seqs
+                        translated_en = processor.decode(seq0.tolist(), skip_special_tokens=True).strip()
                     except Exception:
                         translated_en = ""
             else:
-                speech_out = gen[0][0] if gen[0].ndim > 1 else gen[0]
+                wav_all = gen[0]
+                lens = gen[1] if len(gen) > 1 else None
+            # Batch 1: waveform có thể là (1, T) hoặc (T,); waveform_lengths có thể là (1,) hoặc 0-dim
+            speech_out = wav_all[0] if wav_all.ndim > 1 else wav_all
+            if torch.is_tensor(lens) and lens.numel() > 0:
+                n_valid = int(lens.reshape(-1)[0].item())
+                if 0 < n_valid <= speech_out.shape[-1]:
+                    speech_out = speech_out[:n_valid]
             speech_out = speech_out.float().cpu().squeeze()
         infer_time = time.perf_counter() - t_start
         s2tt_hyps.append(translated_en)
@@ -2114,39 +2120,45 @@ def main():
     for c in cases_to_run:
         if hasattr(data_pipeline, "reset"):
             data_pipeline.reset()
-        if c == 0:
-            summary = evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools)
-            if summary: all_summaries.append(summary)
-        elif c == 5:
-            summary = evaluate_seamless_case(args, device, data_pipeline, en_asr_tools)
-            if summary: all_summaries.append(summary)
-        elif c == 6:
-            sums = evaluate_cascaded_voice_clone_suite(
-                case_num=6,
-                tts_engine="xtts",
-                variants=s2tt_variants,
-                args=args,
-                device=device,
-                mel_fb=mel_fb,
-                data_pipeline=data_pipeline,
-                en_asr_tools=en_asr_tools,
-            )
-            all_summaries.extend(sums)
-        elif c == 7:
-            sums = evaluate_cascaded_voice_clone_suite(
-                case_num=7,
-                tts_engine="f5tts",
-                variants=s2tt_variants,
-                args=args,
-                device=device,
-                mel_fb=mel_fb,
-                data_pipeline=data_pipeline,
-                en_asr_tools=en_asr_tools,
-            )
-            all_summaries.extend(sums)
-        else:
-            summary = evaluate_case(c, args, device, dtype, vocos, mel_fb, data_pipeline, feat_extractor, whisper_enc, en_asr_tools)
-            if summary: all_summaries.append(summary)
+        # Một Case lỗi không được làm dừng cả lượt benchmark (VD: sota = Seamless + XTTS + F5)
+        try:
+            if c == 0:
+                summary = evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools)
+                if summary: all_summaries.append(summary)
+            elif c == 5:
+                summary = evaluate_seamless_case(args, device, data_pipeline, en_asr_tools)
+                if summary: all_summaries.append(summary)
+            elif c == 6:
+                sums = evaluate_cascaded_voice_clone_suite(
+                    case_num=6,
+                    tts_engine="xtts",
+                    variants=s2tt_variants,
+                    args=args,
+                    device=device,
+                    mel_fb=mel_fb,
+                    data_pipeline=data_pipeline,
+                    en_asr_tools=en_asr_tools,
+                )
+                all_summaries.extend(sums)
+            elif c == 7:
+                sums = evaluate_cascaded_voice_clone_suite(
+                    case_num=7,
+                    tts_engine="f5tts",
+                    variants=s2tt_variants,
+                    args=args,
+                    device=device,
+                    mel_fb=mel_fb,
+                    data_pipeline=data_pipeline,
+                    en_asr_tools=en_asr_tools,
+                )
+                all_summaries.extend(sums)
+            else:
+                summary = evaluate_case(c, args, device, dtype, vocos, mel_fb, data_pipeline, feat_extractor, whisper_enc, en_asr_tools)
+                if summary: all_summaries.append(summary)
+        except Exception as case_err:
+            import traceback
+            print(f"\n❌ Case {c} bị lỗi và được bỏ qua: {case_err}")
+            traceback.print_exc()
 
         # Giải phóng bộ nhớ GPU sau mỗi Case chống tràn VRAM
         import gc
