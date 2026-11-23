@@ -9,6 +9,7 @@
 #   - Đồng bộ checkpoint lên Google Drive (không chặn tiến trình train)
 # File này KHÔNG import torchaudio nên không cần Mock Shim.
 # ==============================================================================
+import math
 import os
 import re
 import shutil
@@ -109,15 +110,17 @@ class ResidualBlock1D(nn.Module):
         return out * mask.unsqueeze(1).to(out.dtype) if mask is not None else out
 
 
-class FlowMatchingTargetDecoder(nn.Module):
-    """OT-CFM decoder: v_theta(x_t, t, c, s) -> vận tốc trên 100-Mel.
-    Tên tham số: in_proj / res_blocks.*.conv1|norm|conv2 / out_proj (Stage 1 và Stage 2 dùng chung)."""
-    def __init__(self, n_mels=100, cond_dim=512, spk_dim=192, hidden_dim=384, num_res_blocks=4):
+class CFMDecoderV1(nn.Module):
+    """Decoder v1 (cũ, giữ lại để SO SÁNH): t chỉ là 1 kênh hằng số ở lớp đầu, conv k=3 không dilation
+    (tầm nhìn ~±10 frame ≈ 0.1s), 4 khối, ~4.6M tham số."""
+    def __init__(self, n_mels=100, cond_dim=512, spk_dim=192, hidden_dim=384, num_res_blocks=4, **_):
         super().__init__()
         self.n_mels = n_mels
         self.cond_dim = cond_dim
         self.spk_dim = spk_dim
         self.hidden_dim = hidden_dim
+        self.config = {"arch": "v1", "n_mels": n_mels, "cond_dim": cond_dim, "spk_dim": spk_dim,
+                       "hidden_dim": hidden_dim, "num_res_blocks": num_res_blocks}
         total_in_channels = n_mels + 1 + cond_dim + spk_dim
         self.in_proj = nn.Conv1d(total_in_channels, hidden_dim, kernel_size=3, padding=1)
         self.res_blocks = nn.ModuleList([ResidualBlock1D(hidden_dim) for _ in range(num_res_blocks)])
@@ -137,6 +140,134 @@ class FlowMatchingTargetDecoder(nn.Module):
         for block in self.res_blocks:
             h = block(h, mask)
         return self.out_proj(h)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """t ∈ [0,1] -> vector sin/cos nhiều tần số (chuẩn của diffusion / flow-matching)."""
+    def __init__(self, dim=256):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / max(1, half - 1))
+        ang = (t.float() * 1000.0)[:, None] * freqs[None, :]
+        return torch.cat([ang.sin(), ang.cos()], dim=-1)
+
+
+class FiLMResBlock1D(nn.Module):
+    """Khối residual v2:
+       h += Conv1x1(c)                         (điều kiện nội dung c đưa vào TỪNG khối)
+       x = DilatedConv(h) -> MaskedGroupNorm -> FiLM(t, speaker) -> GELU -> Conv -> + h
+    FiLM: x * (1 + scale) + shift, scale/shift sinh từ embedding toàn cục (t + speaker)."""
+    def __init__(self, channels, cond_dim, glob_dim, dilation=1):
+        super().__init__()
+        self.cond_in = nn.Conv1d(cond_dim, channels, kernel_size=1)
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.norm = MaskedGroupNorm(8, channels)
+        self.film = nn.Linear(glob_dim, 2 * channels)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        # Khởi tạo 0 cho nhánh residual -> mỗi khối ban đầu là ánh xạ đồng nhất (train ổn định hơn)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+
+    def forward(self, h, cond, glob, mask=None):
+        m = mask.unsqueeze(1).to(h.dtype) if mask is not None else None
+        x = h + self.cond_in(cond)
+        if m is not None:
+            x = x * m
+        x = self.conv1(x)
+        x = self.norm(x, mask)
+        scale, shift = self.film(glob).unsqueeze(-1).chunk(2, dim=1)
+        x = x * (1.0 + scale) + shift
+        x = self.act(x)
+        if m is not None:
+            x = x * m
+        x = self.conv2(x)
+        out = h + x
+        return out * m if m is not None else out
+
+
+class CFMDecoderV2(nn.Module):
+    """Decoder v2 (khuyến nghị):
+    - t: sinusoidal -> MLP; speaker: Linear; cộng lại thành embedding toàn cục đưa vào MỌI khối qua FiLM
+    - c (nội dung): nối ở đầu vào + Conv1x1 vào từng khối
+    - Conv giãn (dilation 1,3,9,27 lặp lại) -> tầm nhìn ~±90 frame ≈ ±1 giây
+    - 8 khối, hidden 512 (~20M tham số)"""
+    def __init__(self, n_mels=100, cond_dim=512, spk_dim=192, hidden_dim=512, num_res_blocks=8,
+                 dilations=(1, 3, 9, 27), time_dim=256, **_):
+        super().__init__()
+        self.n_mels = n_mels
+        self.cond_dim = cond_dim
+        self.spk_dim = spk_dim
+        self.hidden_dim = hidden_dim
+        dilations = list(dilations)
+        self.config = {"arch": "v2", "n_mels": n_mels, "cond_dim": cond_dim, "spk_dim": spk_dim,
+                       "hidden_dim": hidden_dim, "num_res_blocks": num_res_blocks,
+                       "dilations": dilations, "time_dim": time_dim}
+        glob_dim = hidden_dim
+        self.time_emb = SinusoidalTimeEmbedding(time_dim)
+        self.time_mlp = nn.Sequential(nn.Linear(time_dim, glob_dim), nn.SiLU(), nn.Linear(glob_dim, glob_dim))
+        self.spk_mlp = nn.Linear(spk_dim, glob_dim)
+        self.in_proj = nn.Conv1d(n_mels + cond_dim, hidden_dim, kernel_size=3, padding=1)
+        self.res_blocks = nn.ModuleList([
+            FiLMResBlock1D(hidden_dim, cond_dim, glob_dim, dilation=dilations[i % len(dilations)])
+            for i in range(num_res_blocks)
+        ])
+        self.out_norm = MaskedGroupNorm(8, hidden_dim)
+        self.out_proj = nn.Conv1d(hidden_dim, n_mels, kernel_size=3, padding=1)
+
+    def forward(self, x_t, t, cond, spk_emb, mask=None):
+        m = mask.unsqueeze(1).to(x_t.dtype) if mask is not None else None
+        glob = self.time_mlp(self.time_emb(t).to(x_t.dtype)) + self.spk_mlp(spk_emb.to(x_t.dtype))
+        net_in = torch.cat([x_t, cond], dim=1)
+        if m is not None:
+            net_in = net_in * m
+        h = self.in_proj(net_in)
+        if m is not None:
+            h = h * m
+        for block in self.res_blocks:
+            h = block(h, cond, glob, mask)
+        h = F.gelu(self.out_norm(h, mask))
+        if m is not None:
+            h = h * m
+        return self.out_proj(h)
+
+
+DECODER_PRESETS = {
+    "v1": {"arch": "v1", "hidden_dim": 384, "num_res_blocks": 4},
+    "v2": {"arch": "v2", "hidden_dim": 512, "num_res_blocks": 8, "dilations": [1, 3, 9, 27], "time_dim": 256},
+    "v2-small": {"arch": "v2", "hidden_dim": 384, "num_res_blocks": 4, "dilations": [1, 3, 9, 27], "time_dim": 256},
+}
+DEFAULT_DECODER = "v2"
+
+
+def FlowMatchingTargetDecoder(n_mels=100, cond_dim=512, spk_dim=192, arch=None, preset=None, **kwargs):
+    """Tạo decoder CFM. Dùng chung cho Stage 1, Stage 2 và eval (một định nghĩa duy nhất).
+    - preset: "v1" | "v2" | "v2-small" (mặc định v2)
+    - hoặc truyền thẳng cấu hình đã lưu trong checkpoint: FlowMatchingTargetDecoder(**decoder.config)"""
+    cfg = dict(DECODER_PRESETS[preset or DEFAULT_DECODER]) if (preset or not arch) else {}
+    cfg.update({k: v for k, v in kwargs.items() if v is not None})
+    if arch:
+        cfg["arch"] = arch
+    a = cfg.pop("arch", "v2")
+    cls = CFMDecoderV1 if a == "v1" else CFMDecoderV2
+    return cls(n_mels=n_mels, cond_dim=cond_dim, spk_dim=spk_dim, **cfg)
+
+
+def sample_t(batch, device, dtype, mode="uniform"):
+    """Lấy mẫu thời điểm t khi train: 'uniform' hoặc 'logit_normal' (dồn về giữa, thường giúp chi tiết tốt hơn)."""
+    if mode == "logit_normal":
+        return torch.sigmoid(torch.randn(batch, device=device)).to(dtype)
+    return torch.rand(batch, device=device, dtype=dtype)
+
+
+def masked_mel_l1(pred_mel, ref_mel, mask):
+    """Mel L1 giữa Mel sinh ra và Mel thật, chỉ trên frame thật (đo độ sát phổ âm)."""
+    return masked_l1(pred_mel.float(), ref_mel.float(), mask).item()
 
 
 # ------------------------------------------------------------------------------

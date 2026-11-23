@@ -10,6 +10,7 @@ import sys
 import time
 import math
 import argparse
+import json
 import types
 import importlib.machinery
 import wave
@@ -100,7 +101,7 @@ if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transform
     sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
 
 from train_utils import (
-    FlowMatchingTargetDecoder, ResidualBlock1D,
+    FlowMatchingTargetDecoder, ResidualBlock1D, DECODER_PRESETS, sample_t, masked_mel_l1,
     encode_whisper, latent_lengths, mel_lengths, length_mask, masked_mse,
     EnglishASR, corpus_wer, resample_24k_to_16k_fft, sync_to_drive,
 )
@@ -173,7 +174,9 @@ def load_yaml_config(config_path):
             "n_mels": 100,
             "spk_dim": 192,
             "decoder_hidden": 384,
-            "num_res_blocks": 4
+            "num_res_blocks": 4,
+            "decoder_preset": "v2",      # v1 (cũ) | v2 (FiLM + dilated) | v2-small
+            "t_sampling": "uniform"      # uniform | logit_normal
         },
         "training": {
             "batch_size": 4,
@@ -325,14 +328,18 @@ class AcousticSpeakerEncoder(nn.Module):
         return F.normalize(spk_emb, p=2, dim=-1)
 
 class CFMStage1System(nn.Module):
-    def __init__(self, encoder_dim=768, cond_dim=512, n_mels=100, spk_dim=192, hidden_dim=384):
+    def __init__(self, encoder_dim=768, cond_dim=512, n_mels=100, spk_dim=192, hidden_dim=None,
+                 decoder_preset="v2", decoder_config=None, t_sampling="uniform"):
         super().__init__()
         self.n_mels = n_mels
+        self.t_sampling = t_sampling
         self.cond_proj = nn.Linear(encoder_dim, cond_dim)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
-        self.decoder = FlowMatchingTargetDecoder(
-            n_mels=n_mels, cond_dim=cond_dim, spk_dim=spk_dim, hidden_dim=hidden_dim
-        )
+        if decoder_config:   # dựng lại đúng kiến trúc đã lưu trong checkpoint
+            self.decoder = FlowMatchingTargetDecoder(**decoder_config)
+        else:
+            self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=cond_dim, spk_dim=spk_dim,
+                                                     preset=decoder_preset)
 
     def condition(self, whisper_features, T_target):
         """Điều kiện c [B, cond_dim, T_target] — Stage 2 dùng đúng hàm này làm NHÃN cho Bridge."""
@@ -346,7 +353,7 @@ class CFMStage1System(nn.Module):
         spk_emb = self.spk_encoder(whisper_features)
 
         if t is None:
-            t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
+            t = sample_t(B, target_mel.device, target_mel.dtype, self.t_sampling)
         if x_0 is None:
             x_0 = torch.randn_like(target_mel)
         x_1 = target_mel
@@ -500,6 +507,11 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--overfit-16", action="store_true",
                         help="Sanity Check #3: Overfit 500 bước trên 16 câu và xuất file .wav nghe thử")
+    parser.add_argument("--decoder", type=str, default=None,
+                        help="Ghi đè decoder_preset trong config: v1 | v2 | v2-small (thêm '+ln' = t logit-normal)")
+    parser.add_argument("--compare-decoders", type=str, default=None,
+                        help="So sánh kiến trúc, VD 'v1,v2-small,v2,v2+ln': train ngắn cùng dữ liệu/seed rồi đo Mel L1, WER, val loss")
+    parser.add_argument("--compare-steps", type=int, default=3000, help="Số bước train cho mỗi biến thể khi so sánh")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
@@ -532,13 +544,27 @@ def main():
     except Exception as e:
         print(f"[Cảnh báo Whisper] {e}. Sẽ dùng đặc trưng mô phỏng.")
 
-    model = CFMStage1System(
-        encoder_dim=cfg["model"]["encoder_dim"],
-        cond_dim=cfg["model"]["cond_dim"],
-        n_mels=cfg["model"]["n_mels"],
-        spk_dim=cfg["model"]["spk_dim"],
-        hidden_dim=cfg["model"]["decoder_hidden"]
-    ).to(device=device, dtype=dtype)
+    def parse_variant(name):
+        """'v2+ln' -> ('v2', 'logit_normal')"""
+        base, _, suf = str(name).partition("+")
+        if base not in DECODER_PRESETS:
+            raise ValueError(f"Không có decoder preset '{base}'. Chọn trong: {list(DECODER_PRESETS)}")
+        return base, ("logit_normal" if suf == "ln" else cfg["model"].get("t_sampling", "uniform"))
+
+    def build_model(variant=None, decoder_config=None, t_sampling=None):
+        preset, ts = parse_variant(variant or args.decoder or cfg["model"].get("decoder_preset", "v2"))
+        return CFMStage1System(
+            encoder_dim=cfg["model"]["encoder_dim"],
+            cond_dim=cfg["model"]["cond_dim"],
+            n_mels=cfg["model"]["n_mels"],
+            spk_dim=cfg["model"]["spk_dim"],
+            decoder_preset=preset, decoder_config=decoder_config,
+            t_sampling=t_sampling or ts,
+        ).to(device=device, dtype=dtype)
+
+    model = build_model()
+    n_params = sum(p.numel() for p in model.decoder.parameters())
+    print(f"🧩 Decoder: {model.decoder.config['arch']} | {n_params/1e6:.2f}M tham số | t-sampling: {model.t_sampling}")
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
@@ -604,6 +630,8 @@ def main():
         try:
             vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
             gen_mels = model.inference(fix_latents, num_steps=32, target_len=fix_mel.shape[-1])
+            print(f"📏 Mel L1 (pred vs Mel thật, chỉ frame thật): {masked_mel_l1(gen_mels, fix_mel, fix_mask):.4f} "
+                  "— càng thấp càng sát gt_mel_vocos")
             with torch.no_grad():
                 print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_audio)} CÂU AUDIO QUA VOCOS...")
                 for idx in range(len(fix_audio)):
@@ -686,22 +714,35 @@ def main():
     en_asr = EnglishASR(device)
     gt_wer = None
 
-    def eval_resynthesis_wer():
+    def eval_resynthesis(n_clips=None, save_dir=None, seed=2024):
+        """Sinh Mel từ latent của tập val (độ dài thật, noise cố định theo seed) rồi đo:
+        - Mel L1 so với Mel thật (toàn bộ tập val, chỉ frame thật)
+        - WER: Vocos -> Whisper-En nghe lại (n_clips câu đầu)
+        save_dir: lưu pred / gt_mel_vocos / groundtruth của 4 câu đầu để nghe so sánh."""
         nonlocal vocos, gt_wer
+        n_clips = eval_wer_clips if n_clips is None else n_clips
         if vocos is None:
             vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
             vocos.eval()
+        torch.manual_seed(seed)
         hyps, refs, gt_hyps = [], [], []
-        done = 0
+        l1_sum, l1_n, done = 0.0, 0, 0
         for v_audio, v_lens, v_txt in val_set:
-            lat, mel, _ = featurize(v_audio, v_lens)
+            lat, mel, msk = featurize(v_audio, v_lens)
             gen_mel = model.inference(lat, num_steps=32, target_len=mel.shape[-1])
+            l1_sum += masked_mel_l1(gen_mel, mel, msk) * v_audio.shape[0]
+            l1_n += v_audio.shape[0]
             for i in range(v_audio.shape[0]):
-                if done >= eval_wer_clips:
+                if done >= n_clips:
                     break
                 n_frames = mel_lengths([v_lens[i]])[0]
                 with torch.no_grad():
                     wav24 = vocos.decode(gen_mel[i:i + 1, :, :n_frames].float()).squeeze().cpu()
+                    if save_dir and done < 4:
+                        os.makedirs(save_dir, exist_ok=True)
+                        save_wav_file(os.path.join(save_dir, f"val_{done:02d}_pred.wav"), wav24, 24000)
+                        gtv = vocos.decode(mel[i:i + 1, :, :n_frames].float()).squeeze().cpu()
+                        save_wav_file(os.path.join(save_dir, f"val_{done:02d}_gt_mel_vocos.wav"), gtv, 24000)
                 hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(wav24)))
                 refs.append(v_txt[i])
                 if gt_wer is None:
@@ -709,7 +750,101 @@ def main():
                 done += 1
         if gt_wer is None:
             gt_wer = corpus_wer(gt_hyps, refs)
-        return corpus_wer(hyps, refs), hyps[:2], refs[:2]
+        return {"wer": corpus_wer(hyps, refs), "gt_wer": gt_wer, "mel_l1": l1_sum / max(1, l1_n),
+                "examples": list(zip(refs[:2], hyps[:2]))}
+
+    def eval_val_loss():
+        model.eval()
+        tot, n = 0.0, 0
+        with torch.no_grad():
+            for (v_audio, v_lens, _), (vt, vx0) in zip(val_set, val_noise):
+                v_lat, v_mel, v_mask = featurize(v_audio, v_lens)
+                vx0 = vx0[:, :, :v_mel.shape[-1]].to(device=device, dtype=dtype)
+                tot += model.compute_loss(v_lat, v_mel, mel_mask=v_mask,
+                                          t=vt.to(device=device, dtype=dtype), x_0=vx0).item()
+                n += 1
+        return tot / max(1, n)
+
+    # ==========================================================================
+    # CHẾ ĐỘ SO SÁNH KIẾN TRÚC DECODER (công bằng: cùng dữ liệu, cùng thứ tự, cùng seed, cùng số bước)
+    # ==========================================================================
+    if args.compare_decoders:
+        variants = [v.strip() for v in args.compare_decoders.split(",") if v.strip()]
+        n_steps = 20 if args.smoke_test else int(args.compare_steps)
+        out_root = "outputs/sanity/decoder_compare"
+        os.makedirs(out_root, exist_ok=True)
+        results = []
+        print("\n" + "=" * 75)
+        print(f"⚖️ SO SÁNH DECODER: {variants} | {n_steps} bước/biến thể | batch {batch_size} | cùng seed & thứ tự dữ liệu")
+        print("=" * 75)
+        for v in variants:
+            torch.manual_seed(0)
+            model = build_model(v)
+            n_par = sum(p.numel() for p in model.decoder.parameters())
+            opt_c = torch.optim.AdamW(model.parameters(), lr=float(train_cfg["learning_rate"]),
+                                      weight_decay=float(train_cfg["weight_decay"]), betas=(0.9, 0.999))
+            sch_c = torch.optim.lr_scheduler.LambdaLR(
+                opt_c, lambda st: max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, st / n_steps)))))
+            pipe = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
+                                                    allow_synthetic=args.smoke_test,
+                                                    shuffle_seed=None if args.smoke_test else 42)
+            print(f"\n▶️ [{v}] decoder {model.decoder.config['arch']} | {n_par/1e6:.2f}M tham số | t: {model.t_sampling}")
+            model.train()
+            t0 = time.time()
+            run_loss = 0.0
+            for st in range(1, n_steps + 1):
+                opt_c.zero_grad()
+                audio_16k, _ = pipe.fetch_batch(batch_size=batch_size)
+                lat, mel, msk = featurize(audio_16k, pipe.last_lengths)
+                loss = model.compute_loss(lat, mel, mel_mask=msk)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(train_cfg["max_grad_norm"]))
+                opt_c.step()
+                sch_c.step()
+                run_loss += loss.item()
+                if st % 250 == 0 or st == n_steps:
+                    print(f"   [{v}] bước {st}/{n_steps} | train loss TB 250 bước: {run_loss / min(250, st):.4f}")
+                    run_loss = 0.0
+            sec_per_step = (time.time() - t0) / n_steps
+            val_l = eval_val_loss()
+            ev = eval_resynthesis(save_dir=os.path.join(out_root, v.replace("+", "_")))
+            res = {"variant": v, "params_M": round(n_par / 1e6, 2), "steps": n_steps, "sec_per_step": round(sec_per_step, 3),
+                   "val_loss": round(val_l, 4), "mel_l1": round(ev["mel_l1"], 4), "wer": round(ev["wer"], 1),
+                   "gt_wer": round(ev["gt_wer"], 1)}
+            results.append(res)
+            print(f"   ✅ [{v}] val loss {val_l:.4f} | Mel L1 {ev['mel_l1']:.4f} | WER {ev['wer']:.1f}% "
+                  f"(audio gốc {ev['gt_wer']:.1f}%) | {sec_per_step:.2f}s/bước")
+            for r, h in ev["examples"]:
+                print(f"      • ref: {r[:70]}\n        cfm: {h[:70]}")
+            del opt_c, sch_c
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Bảng tổng hợp + xếp hạng
+        lines = ["# ⚖️ SO SÁNH KIẾN TRÚC DECODER (Stage 1 CFM)", "",
+                 f"Cùng dữ liệu FLEURS {data_lang}, cùng thứ tự, seed 0, {n_steps} bước/biến thể, batch {batch_size}. "
+                 f"Đánh giá trên {sum(x[0].shape[0] for x in val_set)} câu validation cố định "
+                 f"(WER trên {eval_wer_clips} câu đầu; WER audio gốc qua cùng ASR = {results[0]['gt_wer'] if results else 'nan'}%).", "",
+                 "| Biến thể | Tham số | Val loss ↓ | Mel L1 ↓ | WER tái tạo ↓ | s/bước |",
+                 "| :--- | :---: | :---: | :---: | :---: | :---: |"]
+        for r in results:
+            lines.append(f"| {r['variant']} | {r['params_M']}M | {r['val_loss']:.4f} | {r['mel_l1']:.4f} | {r['wer']:.1f}% | {r['sec_per_step']:.2f} |")
+        if results:
+            best_wer = min(results, key=lambda r: r["wer"])
+            best_l1 = min(results, key=lambda r: r["mel_l1"])
+            lines += ["", f"- WER thấp nhất (rõ chữ nhất): **{best_wer['variant']}**",
+                      f"- Mel L1 thấp nhất (sát phổ nhất): **{best_l1['variant']}**",
+                      "- Chênh WER < ~3 điểm với 16 câu là trong vùng nhiễu → ưu tiên Mel L1 và nghe thử "
+                      f"`{out_root}/<biến thể>/val_XX_pred.wav` so với `val_XX_gt_mel_vocos.wav`."]
+        report = "\n".join(lines)
+        with open(os.path.join(out_root, "compare_report.md"), "w", encoding="utf-8") as f:
+            f.write(report)
+        with open(os.path.join(out_root, "compare_results.json"), "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        print("\n" + report)
+        print(f"\n📁 Báo cáo: {out_root}/compare_report.md | audio nghe thử: {out_root}/<biến thể>/")
+        print("👉 Chọn biến thể tốt nhất rồi đặt 'decoder_preset' (và 't_sampling') trong configs/stage1_cfm_en.yaml")
+        return
 
     # ---- Resume ----
     os.makedirs(paths["checkpoint_dir"], exist_ok=True)
@@ -718,9 +853,17 @@ def main():
     start_epoch, global_step, best_val_loss, history = 0, 0, float("inf"), []
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device)
-        if ck.get("stage1_meta", {}).get("lang") not in (None, data_lang):
-            raise RuntimeError(f"{ckpt_path} là checkpoint ngôn ngữ {ck['stage1_meta']['lang']} — không resume.")
-        model.load_state_dict(ck.get("full_system_state_dict", {}), strict=False)
+        meta = ck.get("stage1_meta", {})
+        if meta.get("lang") not in (None, data_lang):
+            raise RuntimeError(f"{ckpt_path} là checkpoint ngôn ngữ {meta['lang']} — không resume.")
+        if meta.get("decoder_config") and meta["decoder_config"] != model.decoder.config:
+            print(f"[Resume] Checkpoint dùng decoder {meta['decoder_config'].get('arch')} -> dựng lại đúng kiến trúc đã lưu")
+            model = build_model(decoder_config=meta["decoder_config"], t_sampling=meta.get("t_sampling"))
+            optimizer = torch.optim.AdamW(model.parameters(), lr=float(train_cfg["learning_rate"]),
+                                          weight_decay=float(train_cfg["weight_decay"]), betas=(0.9, 0.999))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lambda st: max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, st / total_steps)))))
+        model.load_state_dict(ck["full_system_state_dict"], strict=True)
         if "optimizer_state_dict" in ck:
             try:
                 optimizer.load_state_dict(ck["optimizer_state_dict"])
@@ -769,28 +912,21 @@ def main():
         print(f"==> Hoàn tất Epoch {epoch:02d} trong {time.time()-t0:.1f}s | Avg Train Loss: {avg_train:.4f}")
 
         # Validation cố định
-        model.eval()
-        val_loss, n_val = 0.0, 0
-        with torch.no_grad():
-            for (v_audio, v_lens, _), (vt, vx0) in zip(val_set, val_noise):
-                v_lat, v_mel, v_mask = featurize(v_audio, v_lens)
-                vx0 = vx0[:, :, :v_mel.shape[-1]].to(device=device, dtype=dtype)
-                val_loss += model.compute_loss(v_lat, v_mel, mel_mask=v_mask,
-                                               t=vt.to(device=device, dtype=dtype), x_0=vx0).item()
-                n_val += 1
-        avg_val = val_loss / max(1, n_val)
+        avg_val = eval_val_loss()
         print(f"   Val Loss (cố định): {avg_val:.4f} | Best: {min(best_val_loss, avg_val):.4f}")
 
-        wer = None
+        wer, mel_l1 = None, None
         if not args.smoke_test and eval_wer_every > 0 and ((epoch + 1) % eval_wer_every == 0 or epoch == epochs - 1):
             try:
-                wer, ex_h, ex_r = eval_resynthesis_wer()
-                print(f"   🎧 WER tái tạo: {wer:.1f}% (audio gốc qua cùng ASR: {gt_wer:.1f}%) — càng gần càng tốt")
-                for h, r in zip(ex_h, ex_r):
+                ev = eval_resynthesis(save_dir=f"outputs/sanity/{args.exp_name}_epoch{epoch:02d}")
+                wer, mel_l1 = ev["wer"], ev["mel_l1"]
+                print(f"   🎧 WER tái tạo: {wer:.1f}% (audio gốc qua cùng ASR: {gt_wer:.1f}%) | Mel L1: {mel_l1:.4f}")
+                for r, h in ev["examples"]:
                     print(f"      • ref: {r[:70]}\n        cfm: {h[:70]}")
             except Exception as e:
                 print(f"   [WER] Không đo được: {e}")
-        history.append({"epoch": epoch, "train": avg_train, "val": avg_val, "wer": wer, "gt_wer": gt_wer})
+        history.append({"epoch": epoch, "train": avg_train, "val": avg_val, "wer": wer, "gt_wer": gt_wer,
+                        "mel_l1": mel_l1})
 
         ckpt_data = {
             "epoch": epoch,
@@ -801,7 +937,8 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "history": history,
-            "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "version": 2,
+            "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "version": 3,
+                            "decoder_config": model.decoder.config, "t_sampling": model.t_sampling,
                             "cond_dim": cfg["model"]["cond_dim"], "spk_dim": cfg["model"]["spk_dim"]},
             "config": cfg,
         }

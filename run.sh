@@ -243,6 +243,20 @@ sys.exit(1)
         python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
+    compare-decoder)
+        # So sánh kiến trúc decoder Stage 1 một cách công bằng (cùng dữ liệu, thứ tự, seed, số bước)
+        # Cú pháp: bash run.sh compare-decoder [số_bước] [danh_sách_biến_thể]
+        STEPS="${2:-3000}"
+        VARIANTS="${3:-v1,v2-small,v2,v2+ln}"
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece -q 2>/dev/null || true
+        echo "⚖️ So sánh decoder: $VARIANTS | $STEPS bước/biến thể"
+        python -u train_cfm.py --config configs/stage1_cfm_en.yaml --exp-name decoder_compare             --compare-decoders "$VARIANTS" --compare-steps "$STEPS" 2>&1 | tee "$LOG_DIR/decoder_compare.log"
+        if [ -d "outputs/sanity/decoder_compare" ]; then
+            rclone copy outputs/sanity/decoder_compare "gdrive:runs/decoder_compare/" -P || echo "⚠️ Không đẩy được lên Drive"
+        fi
+        ;;
+
     rclone-token)
         # ------------------------------------------------------------------
         # Ghi token Google Drive MỚI vào rclone.conf (không cần trả lời y/n, không bị lỗi dán nhiều dòng)
@@ -405,6 +419,7 @@ PYEOF
         echo "💡 CÚ PHÁP CHUẨN ĐÚNG CÁC LỆNH (S2ST VI -> EN):"
         echo "  bash run.sh sanity               -> Chạy trọn bộ EDA & Sanity Check (Vocos + Whisper)"
         echo "  bash run.sh overfit [cfm|bridge] -> Overfit 500 bước trên 16 câu & xuất audio nghe thử"
+        echo "  bash run.sh compare-decoder [bước] [biến_thể] -> So sánh kiến trúc decoder (mặc định 3000 bước, v1,v2-small,v2,v2+ln)"
         echo "  bash run.sh start cfm_en         -> Huấn luyện Stage 1 OT-CFM Tiếng Anh"
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"

@@ -307,7 +307,7 @@ except ImportError as e:
 
 # Import module hệ thống từ train_bridge.py
 from train_bridge import (
-    ViEnS2STSystem, EnViS2STSystem, CrossAttentionBridge, ToneAwareBridge, load_stage1_into,
+    ViEnS2STSystem, EnViS2STSystem, CrossAttentionBridge, ToneAwareBridge, load_stage1_into, load_stage2_into,
     RealStreamingSpeechPipeline, build_mel_filterbank, extract_100_mel,
     resample_16k_to_24k, resample_24k_to_16k
 )
@@ -704,32 +704,29 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
     model = ViEnS2STSystem(encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100).to(device=device, dtype=dtype)
     model.eval()
 
+    # Case 1: Bridge ngẫu nhiên + CFM ngẫu nhiên | Case 2: Bridge ngẫu nhiên + CFM Stage 1
+    # Case 3: Bridge đã train + CFM ngẫu nhiên    | Case 4: Bridge đã train + CFM Stage 1 (hệ đề xuất)
     if case_num in [3, 4]:
-        if os.path.exists(args.bridge_ckpt):
-            print(f"⏳ Đang nạp weights cho Bridge từ: {args.bridge_ckpt}...")
-            ckpt = torch.load(args.bridge_ckpt, map_location=device)
-            if "stage2_meta" not in ckpt:
-                raise RuntimeError(f"{args.bridge_ckpt} không có stage2_meta (bản cũ En->Vi?) — train lại Stage 2.")
-            state_dict = ckpt["model_state_dict"]
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing or unexpected:
-                print(f"  ⚠️ Khóa thiếu: {len(missing)} | khóa thừa: {len(unexpected)}")
-            print("✓ Nạp weights Bridge thành công!")
-        else:
-            print(f"[Cảnh báo] Không tìm thấy {args.bridge_ckpt}! Sử dụng weights ngẫu nhiên.")
+        if not os.path.exists(args.bridge_ckpt):
+            raise RuntimeError(f"Case {case_num} cần {args.bridge_ckpt} (chạy 'bash run.sh restore bridge_vien' hoặc train Stage 2).")
+        print(f"⏳ Đang nạp Stage 2 (Bridge + CFM đóng băng) từ: {args.bridge_ckpt}...")
+        load_stage2_into(model, args.bridge_ckpt, device)
+        model.to(device=device, dtype=dtype)
+        print("✓ Nạp Stage 2 thành công!")
+        if case_num == 3:
+            # Giữ Bridge đã train, nhưng thay CFM bằng bản KHỞI TẠO NGẪU NHIÊN cùng kiến trúc
+            torch.manual_seed(0)
+            model.decoder = type(model.decoder)(**{k: v for k, v in model.decoder.config.items() if k != "arch"}).to(device=device, dtype=dtype)
+            print("ℹ️ Case 3: CFM được khởi tạo NGẪU NHIÊN (Bridge giữ trọng số đã train).")
+    elif case_num == 2:
+        if not (args.cfm_ckpt and os.path.exists(args.cfm_ckpt)):
+            raise RuntimeError(f"Case 2 cần {args.cfm_ckpt} (chạy 'bash run.sh restore cfm_en' hoặc train Stage 1).")
+        print(f"⏳ Case 2: Bridge NGẪU NHIÊN + CFM Stage 1 từ {args.cfm_ckpt}...")
+        load_stage1_into(model, args.cfm_ckpt, device)
+        model.to(device=device, dtype=dtype)
     else:
-        print("ℹ️ Case yêu cầu Bridge CHƯA TRAIN -> Khởi tạo trọng số ngẫu nhiên.")
-
-    if case_num in [2, 4]:
-        if args.cfm_ckpt and os.path.exists(args.cfm_ckpt):
-            print(f"⏳ Đang nạp CFM Stage 1 từ: {args.cfm_ckpt}...")
-            # strict=True + kiểm tra stage1_meta: không còn nạp "im lặng" sai kiến trúc / nhầm bản En->Vi
-            load_stage1_into(model, args.cfm_ckpt, device)
-            model.to(device=device, dtype=dtype)
-        else:
-            print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt} -> CFM ngẫu nhiên.")
-    else:
-        print("ℹ️ Case yêu cầu CFM CHƯA TRAIN -> Khởi tạo trọng số ngẫu nhiên.")
+        print("ℹ️ Case 1: Bridge NGẪU NHIÊN + CFM NGẪU NHIÊN (zero-baseline).")
+    model.eval()
 
     # 2. Suy luận trên tập mẫu
     results = []

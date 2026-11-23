@@ -19,7 +19,8 @@
    * Môi trường Molab chạy Python 3.13 / PyTorch 2.9+ gặp lỗi vỡ ABI C++ của `torchaudio` (`undefined symbol`).
    * Tất cả các file chạy (`eval_benchmark.py`, `train_bridge.py`, `train_cfm.py`, `sanity_and_eda_suite.py`) đều bắt buộc phải có đoạn **In-Memory Mock Torchaudio Shim** (`apply_torchaudio_mock_if_needed`).
    * Shim này cung cấp: `torchaudio.load`, `torchaudio.save`, `torchaudio.info` (qua `soundfile`), `MockSpectrogram`, `MockMelScale`, `MockMelSpectrogram` (tính qua `torch.stft`), và `torchaudio.functional.resample` (tính qua `torch.nn.functional.interpolate`).
-4. **Decoder CFM dùng chung:** `FlowMatchingTargetDecoder` / `ResidualBlock1D` / `MaskedGroupNorm` chỉ được định nghĩa trong `train_utils.py` (Stage 1 và Stage 2 cùng import). Trước 23/11/2026 hai file định nghĩa lệch tên tham số nên Stage 2 không nạp được CFM — tuyệt đối không tách lại.
+4. **Decoder CFM dùng chung:** `FlowMatchingTargetDecoder` (hàm tạo theo preset `v1` | `v2` | `v2-small`) cùng `CFMDecoderV1/V2`, `MaskedGroupNorm` chỉ được định nghĩa trong `train_utils.py` (Stage 1, Stage 2, eval cùng import). Kiến trúc được lưu trong `stage1_meta.decoder_config` / `stage2_meta.decoder_config` và luôn dựng lại từ đó khi nạp (strict). Trước 23/11/2026 hai file định nghĩa lệch tên tham số nên Stage 2 không nạp được CFM — tuyệt đối không tách lại.
+   * Chọn kiến trúc bằng số liệu: `bash run.sh compare-decoder [bước] [biến_thể]` (cùng dữ liệu/seed → bảng val loss, Mel L1, WER tái tạo, s/bước + audio nghe thử ở `outputs/sanity/decoder_compare/`), rồi đặt `decoder_preset` / `t_sampling` trong `configs/stage1_cfm_en.yaml`.
 5. **Checkpoint có meta:** Stage 1 lưu `stage1_meta` + `full_system_state_dict` (gồm `cond_proj`, `spk_encoder`); Stage 2 lưu `stage2_meta`. Checkpoint không có meta (bản En→Vi cũ 13/11) bị từ chối.
 6. **Các thành phần đóng băng (Frozen Models):**
    * `vinai/PhoWhisper-small` Encoder: **Đóng băng 100% (`requires_grad = False`)**.

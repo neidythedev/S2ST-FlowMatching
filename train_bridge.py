@@ -471,7 +471,8 @@ class ViEnS2STSystem(nn.Module):
         self.n_mels = n_mels
         self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
-        self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim, hidden_dim=384)
+        # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
+        self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
         # cond_proj của Stage 1 (ĐÓNG BĂNG): biến đặc trưng Whisper của audio TIẾNG ANH đích thành điều kiện c*
         # mà CFM decoder đã quen -> làm NHÃN trực tiếp cho Bridge (loss chưng cất L_cond).
         self.teacher_cond_proj = nn.Linear(encoder_dim, bridge_dim)
@@ -578,6 +579,11 @@ def load_stage1_into(model, ckpt_path, device, allow_legacy=False):
     dec = ck.get("model_state_dict", ck) if isinstance(ck, dict) else ck
     if full:
         dec = {k[len("decoder."):]: v for k, v in full.items() if k.startswith("decoder.")} or dec
+    dec_cfg = (meta or {}).get("decoder_config")
+    if dec_cfg and dec_cfg != getattr(model.decoder, "config", None):
+        # Dựng lại decoder đúng kiến trúc Stage 1 đã train (v1 / v2 / v2-small ...)
+        dev_dtype = next(model.parameters())
+        model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=dev_dtype.device, dtype=dev_dtype.dtype)
     model.decoder.load_state_dict(dec, strict=True)
     has_teacher = False
     if full:
@@ -592,6 +598,20 @@ def load_stage1_into(model, ckpt_path, device, allow_legacy=False):
     print(f"✓ Nạp Stage 1 từ {ckpt_path}: decoder ✓ | cond_proj (teacher) {'✓' if has_teacher else '✗'} "
           f"| spk_encoder {'✓' if full and any(k.startswith('spk_encoder.') for k in full) else '✗'}")
     return has_teacher
+
+def load_stage2_into(model, ckpt_path, device):
+    """Nạp checkpoint Stage 2 (Bridge + decoder đóng băng + spk_encoder) — dựng decoder đúng kiến trúc đã lưu."""
+    ck = torch.load(ckpt_path, map_location=device)
+    meta = ck.get("stage2_meta") if isinstance(ck, dict) else None
+    if meta is None:
+        raise RuntimeError(f"{ckpt_path} không có stage2_meta (bản cũ En->Vi?) — train lại Stage 2.")
+    dec_cfg = meta.get("decoder_config")
+    if dec_cfg and dec_cfg != getattr(model.decoder, "config", None):
+        ref = next(model.parameters())
+        model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=ref.device, dtype=ref.dtype)
+    model.load_state_dict(ck["model_state_dict"], strict=True)
+    model.has_teacher = bool(meta.get("has_teacher"))
+    return meta
 
 # ==============================================================================
 # 3. PIPELINE DỮ LIỆU ÂM THANH THẬT STREAMING (GOOGLE FLEURS VI -> EN)
@@ -1173,6 +1193,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "history": history,
             "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
+                            "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,
         }
