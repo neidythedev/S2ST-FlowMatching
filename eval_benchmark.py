@@ -880,6 +880,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
     total_mel_l1 = 0.0
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
+    s2tt_hyps = []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -915,9 +916,9 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
                 pred_ids = asr_model.generate(in_feats, max_new_tokens=128)
             transcribed_vi = asr_tokenizer.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 
-        # 2. MT: Vietnamese Text -> English Text
-        mt_input = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        translated_en = translate_text_vi2en(mt_tok, mt_model, mt_flavor, mt_input, device)
+        # 2. MT: Vietnamese Text -> English Text (không dùng transcript chuẩn khi ASR rỗng)
+        translated_en = translate_text_vi2en(mt_tok, mt_model, mt_flavor, transcribed_vi, device) if transcribed_vi else ""
+        s2tt_hyps.append(translated_en)
 
         # 3. TTS: English Text -> Waveform (16kHz)
         tts_text = translated_en if translated_en else "hello"
@@ -1003,6 +1004,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         "avg_mel_l1_error": round(avg_mel_l1, 4),
         "avg_asr_bleu": round(avg_bleu, 2),
         "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
+        "corpus_s2tt_bleu": compute_corpus_bleu(s2tt_hyps, bleu_refs),
         "num_samples": args.num_samples,
         "samples": results
     }
@@ -1294,42 +1296,115 @@ def load_voice_clone_tts(tts_engine, device):
 
     return None
 
-def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small", mt_choice="auto"):
-    """Nạp trước các mô hình S2TT để dùng chung giữa các engine TTS, tránh nạp lại nhiều lần."""
-    modules = {}
-    if any(m in s2tt_modes_needed for m in ["2step", "both"]):
-        print(f"⏳ [2-Step Direct S2TT] Nạp Whisper ({whisper_id}, task='translate')...")
-        try:
-            from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
-            w_feat = WhisperFeatureExtractor.from_pretrained(whisper_id)
-            w_tok = WhisperTokenizer.from_pretrained(whisper_id, language="vi", task="translate")
-            w_mod = WhisperForConditionalGeneration.from_pretrained(whisper_id).to(device).eval()
-            modules["2step"] = (w_feat, w_tok, w_mod)
-            print("✓ Nạp Whisper S2TT thành công (Dịch trực tiếp Vi -> En trong 1 bước)!")
-        except Exception as e:
-            print(f"[Cảnh báo S2TT] Không nạp được Whisper direct translate ({e}).")
-            modules["2step"] = None
+DEFAULT_2STEP_MODELS = "openai/whisper-small,openai/whisper-large-v3,vinai/PhoWhisper-small,vinai/PhoWhisper-large"
+DEFAULT_VI_ASR_MODELS = "vinai/PhoWhisper-small,vinai/PhoWhisper-large"
 
-    if any(m in s2tt_modes_needed for m in ["3step", "both"]):
-        print("⏳ [3-Step Pipeline] Nạp PhoWhisper-small (ASR) + MT (VinAI-Translate / NLLB-200)...")
-        try:
-            from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
-            asr_feat = WhisperFeatureExtractor.from_pretrained("vinai/PhoWhisper-small")
-            asr_tok = WhisperTokenizer.from_pretrained("vinai/PhoWhisper-small", language="vi", task="transcribe")
-            asr_mod = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device).eval()
-            asr_mod.config.forced_decoder_ids = None
-            if hasattr(asr_mod, "generation_config") and asr_mod.generation_config is not None:
-                asr_mod.generation_config.forced_decoder_ids = None
-                asr_mod.generation_config.max_length = None
+def short_model_name(model_id):
+    """'openai/whisper-large-v3' -> 'whisper-large-v3' (dùng cho tên Case và thư mục)."""
+    return str(model_id).rstrip("/").split("/")[-1]
 
-            mt_tok, mt_mod, mt_flavor = load_mt_model(mt_choice, device)
-            modules["3step"] = (asr_feat, asr_tok, asr_mod, mt_tok, mt_mod, mt_flavor)
-            print(f"✓ Nạp PhoWhisper + MT ({mt_flavor.upper()}) thành công!")
-        except Exception as e:
-            print(f"[Cảnh báo S2TT] Không nạp được PhoWhisper+MT ({e}).")
-            modules["3step"] = None
+def parse_model_list(text):
+    return [m.strip() for m in str(text or "").split(",") if m.strip()]
 
-    return modules
+def build_s2tt_variants(s2tt_mode_arg, models_2step, models_vi_asr):
+    """Danh sách biến thể S2TT cần chạy: [{'mode': '2step'|'3step', 'model_id': ..., 'short': ...}]."""
+    variants = []
+    if s2tt_mode_arg in ["2step", "both"]:
+        for mid in models_2step:
+            variants.append({"mode": "2step", "model_id": mid, "short": short_model_name(mid)})
+    if s2tt_mode_arg in ["3step", "both"]:
+        for mid in models_vi_asr:
+            variants.append({"mode": "3step", "model_id": mid, "short": short_model_name(mid)})
+    return variants
+
+def _s2tt_dtype(device):
+    """fp16 trên GPU để model large (~1.5B) không tràn VRAM; áp dụng đồng nhất cho mọi biến thể."""
+    return torch.float16 if (device.type == "cuda") else torch.float32
+
+def _force_translate_generation_config(model, tok, model_id):
+    """PhoWhisper được fine-tune chỉ cho ASR tiếng Việt nên generation_config có thể thiếu
+    task_to_id / lang_to_id -> generate(task='translate') báo lỗi hoặc âm thầm transcribe.
+    Bổ sung các id này từ chính tokenizer để ÉP chạy task='translate' một cách trung thực
+    (kiểm chứng xem PhoWhisper còn khả năng dịch hay không)."""
+    gc_cfg = model.generation_config
+    if getattr(gc_cfg, "task_to_id", None) and getattr(gc_cfg, "lang_to_id", None):
+        return False
+    try:
+        from transformers import GenerationConfig
+        size = "small"
+        for cand in ["tiny", "base", "small", "medium", "large"]:
+            if cand in model_id.lower():
+                size = cand
+        base_id = "openai/whisper-large-v2" if size == "large" else f"openai/whisper-{size}"
+        new_gc = GenerationConfig.from_pretrained(base_id)
+    except Exception:
+        new_gc = gc_cfg
+    new_gc.task_to_id = {
+        "transcribe": tok.convert_tokens_to_ids("<|transcribe|>"),
+        "translate": tok.convert_tokens_to_ids("<|translate|>"),
+    }
+    new_gc.lang_to_id = {"<|vi|>": tok.convert_tokens_to_ids("<|vi|>"),
+                         "<|en|>": tok.convert_tokens_to_ids("<|en|>")}
+    new_gc.no_timestamps_token_id = tok.convert_tokens_to_ids("<|notimestamps|>")
+    new_gc.is_multilingual = True
+    new_gc.forced_decoder_ids = None
+    new_gc.max_length = None
+    model.generation_config = new_gc
+    return True
+
+_MT_CACHE = {}
+
+def get_mt_cached(mt_choice, device):
+    """Nạp MT một lần, dùng chung cho mọi biến thể 3-step."""
+    key = (mt_choice or "auto")
+    if key not in _MT_CACHE:
+        _MT_CACHE[key] = load_mt_model(mt_choice, device)
+    return _MT_CACHE[key]
+
+def load_s2tt_variant(variant, device, mt_choice="auto"):
+    """Nạp mô hình cho 1 biến thể S2TT. Trả về tuple module hoặc None nếu lỗi."""
+    from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
+    mid, mode = variant["model_id"], variant["mode"]
+    dtype = _s2tt_dtype(device)
+    try:
+        if mode == "2step":
+            print(f"⏳ [2-Step Direct S2TT] Nạp {mid} (task='translate', Vi -> En trực tiếp)...")
+            feat = WhisperFeatureExtractor.from_pretrained(mid)
+            tok = WhisperTokenizer.from_pretrained(mid, language="vi", task="translate")
+            mod = WhisperForConditionalGeneration.from_pretrained(mid, torch_dtype=dtype).to(device).eval()
+            mod.config.forced_decoder_ids = None
+            if _force_translate_generation_config(mod, tok, mid):
+                print(f"  ℹ️ {mid} thiếu cấu hình task translate -> đã bổ sung để ép task='translate'.")
+            print(f"✓ Nạp {mid} thành công!")
+            return (feat, tok, mod)
+        else:
+            print(f"⏳ [3-Step Pipeline] Nạp ASR {mid} + MT (VinAI-Translate / NLLB-200)...")
+            feat = WhisperFeatureExtractor.from_pretrained(mid)
+            tok = WhisperTokenizer.from_pretrained(mid, language="vi", task="transcribe")
+            mod = WhisperForConditionalGeneration.from_pretrained(mid, torch_dtype=dtype).to(device).eval()
+            mod.config.forced_decoder_ids = None
+            if getattr(mod, "generation_config", None) is not None:
+                mod.generation_config.forced_decoder_ids = None
+                mod.generation_config.max_length = None
+            mt_tok, mt_mod, mt_flavor = get_mt_cached(mt_choice, device)
+            print(f"✓ Nạp {mid} + MT ({mt_flavor.upper()}) thành công!")
+            return (feat, tok, mod, mt_tok, mt_mod, mt_flavor)
+    except Exception as e:
+        print(f"[Cảnh báo S2TT] Không nạp được {mid} ({e}).")
+        return None
+
+def release_cuda_memory():
+    """Thu gom rác + giải phóng cache CUDA (gọi sau khi đã xóa mọi tham chiếu tới model)."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+_VI_DIACRITICS = re.compile(r"[ăâđêôơưàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ]", re.IGNORECASE)
+
+def looks_vietnamese(text):
+    """Phát hiện đầu ra 'dịch' thực chất vẫn là tiếng Việt (model không dịch được)."""
+    return len(_VI_DIACRITICS.findall(str(text or ""))) >= 2
 
 def whisper_compression_ratio(text):
     """Tỉ lệ nén zlib của văn bản (tiêu chí phát hiện lặp/hallucination của Whisper gốc, ngưỡng 2.4)."""
@@ -1339,52 +1414,53 @@ def whisper_compression_ratio(text):
         return 0.0
     return len(b) / max(1, len(zlib.compress(b)))
 
-def translate_speech_vi2en(src_w, ref_vi_text, mode, s2tt_modules, device):
-    """Chuyển đổi âm thanh tiếng Việt thành văn bản tiếng Anh theo chế độ 2-step hoặc 3-step."""
+def translate_speech_vi2en(src_w, ref_vi_text, mode, module, device):
+    """Chuyển âm thanh tiếng Việt thành văn bản tiếng Anh theo chế độ 2-step hoặc 3-step.
+    Trả về (translated_en, transcribed_vi). Không bao giờ dùng transcript chuẩn (ground truth)
+    thay cho đầu ra ASR — tránh làm đẹp số liệu."""
     translated_en = ""
     transcribed_vi = ""
+    if module is None:
+        return translated_en, transcribed_vi
 
-    if mode == "2step" and s2tt_modules.get("2step") is not None:
-        w_feat, w_tok, w_mod = s2tt_modules["2step"]
+    if mode == "2step":
+        w_feat, w_tok, w_mod = module
         in_proc = w_feat(src_w.numpy(), sampling_rate=16000, return_tensors="pt")
-        in_feats = in_proc.input_features.to(device)
+        in_feats = in_proc.input_features.to(device=device, dtype=w_mod.dtype)
         with torch.no_grad():
             try:
                 pred_ids = w_mod.generate(in_feats, language="vi", task="translate", max_new_tokens=128)
-                translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
-            except Exception:
+            except Exception as e:
+                print(f"  ⚠️ generate(task='translate') lỗi ({e}) -> chạy generate mặc định")
                 pred_ids = w_mod.generate(in_feats, max_new_tokens=128)
-                translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+            translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 
             # Whisper hay rơi vào vòng lặp ("the following year, the following year, ...").
             # Áp dụng đúng tiêu chí fallback của Whisper gốc: tỉ lệ nén zlib > 2.4 -> giải mã lại
-            # bằng beam search + chặn lặp n-gram. Chỉ kích hoạt khi phát hiện lặp, nên không
-            # ảnh hưởng các câu bình thường.
+            # bằng beam search + chặn lặp n-gram. Chỉ kích hoạt khi phát hiện lặp.
             if whisper_compression_ratio(translated_en) > 2.4:
-                print(f"  ⚠️ Whisper lặp vô hạn (compression ratio > 2.4) -> giải mã lại với beam=5, no_repeat_ngram=3")
+                print("  ⚠️ Whisper lặp vô hạn (compression ratio > 2.4) -> giải mã lại với beam=5, no_repeat_ngram=3")
                 try:
                     pred_ids = w_mod.generate(in_feats, language="vi", task="translate", max_new_tokens=128,
                                               num_beams=5, no_repeat_ngram_size=3)
                     translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
                 except Exception:
                     pass
-        transcribed_vi = ref_vi_text
 
-    elif mode == "3step" and s2tt_modules.get("3step") is not None:
-        asr_feat, asr_tok, asr_mod, mt_tok, mt_mod, mt_flavor = s2tt_modules["3step"]
+    elif mode == "3step":
+        asr_feat, asr_tok, asr_mod, mt_tok, mt_mod, mt_flavor = module
         in_proc = asr_feat(src_w.numpy(), sampling_rate=16000, return_tensors="pt")
-        in_feats = in_proc.input_features.to(device)
+        in_feats = in_proc.input_features.to(device=device, dtype=asr_mod.dtype)
         with torch.no_grad():
             try:
                 pred_ids = asr_mod.generate(in_feats, max_new_tokens=128)
                 transcribed_vi = asr_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
-            except Exception:
-                transcribed_vi = ref_vi_text
-        mt_in = transcribed_vi if transcribed_vi else (ref_vi_text if ref_vi_text else "xin chào")
-        translated_en = translate_text_vi2en(mt_tok, mt_mod, mt_flavor, mt_in, device)
+            except Exception as e:
+                print(f"  ⚠️ ASR tiếng Việt lỗi ({e}) -> transcript rỗng")
+                transcribed_vi = ""
+        if transcribed_vi:
+            translated_en = translate_text_vi2en(mt_tok, mt_mod, mt_flavor, transcribed_vi, device)
 
-    if not translated_en:
-        translated_en = "hello world"
     return translated_en, transcribed_vi
 
 def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_text, wavs_dir, idx):
@@ -1430,17 +1506,21 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
 
     return torch.zeros(24000)
 
-def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, device, mel_fb, data_pipeline, en_asr_tools, s2tt_modules, tts_model):
+def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device, mel_fb, data_pipeline, en_asr_tools, s2tt_module, tts_model, write_canonical=False):
+    s2tt_mode = variant["mode"]
+    model_short = variant["short"]
     engine_title = "XTTS-v2" if tts_engine == "xtts" else "F5-TTS"
-    mode_title = "2-Step Direct S2TT" if s2tt_mode == "2step" else "3-Step Pipeline"
-    full_case_name = f"Case {case_num}: {engine_title} Voice Cloning ({mode_title})"
-    
+    mode_title = "2-Step" if s2tt_mode == "2step" else "3-Step"
+    if s2tt_mode == "3step":
+        mode_title += " + MT"
+    full_case_name = f"Case {case_num}: {engine_title} | {mode_title} | {model_short}"
+
     print("\n" + "=" * 75)
     print(f"📊 ĐANG CHẠY BENCHMARK: [{full_case_name}]")
-    print(f"   ⚙️ Chế độ dịch: {s2tt_mode.upper()} | Voice Engine: {engine_title.upper()}")
+    print(f"   ⚙️ Chế độ dịch: {s2tt_mode.upper()} | Model: {variant['model_id']} | Voice Engine: {engine_title.upper()}")
     print("=" * 75)
 
-    case_tag = f"case_{case_num}_{tts_engine}_{s2tt_mode}"
+    case_tag = f"case_{case_num}_{tts_engine}_{s2tt_mode}_{model_short}"
     out_case_dir = os.path.join(args.output_dir, case_tag)
     wavs_dir = os.path.join(out_case_dir, "wavs")
     os.makedirs(wavs_dir, exist_ok=True)
@@ -1461,6 +1541,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
     total_mel_l1 = 0.0
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
+    s2tt_hyps = []
+    n_not_translated = 0
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -1472,7 +1554,14 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         t_start = time.perf_counter()
 
         # 1. Dịch Vi audio -> En text
-        translated_en, transcribed_vi = translate_speech_vi2en(src_w, ref_vi_text, s2tt_mode, s2tt_modules, device)
+        translated_en, transcribed_vi = translate_speech_vi2en(src_w, ref_vi_text, s2tt_mode, s2tt_module, device)
+        not_translated = looks_vietnamese(translated_en)
+        if not_translated:
+            n_not_translated += 1
+        # S2TT-BLEU: văn bản dịch (trước TTS) so với Target Ref -> tách lỗi dịch khỏi lỗi TTS
+        s2tt_bleu = compute_sentence_bleu(translated_en, ref_en_text) if translated_en else 0.0
+        s2tt_hyps.append(translated_en)
+        # TTS không nhận chuỗi rỗng -> dùng câu đệm cố định (BLEU sẽ ~0, phản ánh trung thực lỗi dịch)
         tts_target_text = translated_en if translated_en else "Hello, welcome to speech translation."
 
         # 2. Sinh tiếng nói giữ giọng
@@ -1524,13 +1613,14 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         gen_file_case = os.path.join(wavs_dir, f"{sample_name}_{case_tag}_gen.wav")
         save_wav_file(gen_file_case, gen_wav_24k, 24000)
 
-        canonical_gen_file = os.path.join(canonical_wavs, f"{sample_name}_case{case_num}_gen.wav")
-        save_wav_file(canonical_gen_file, gen_wav_24k, 24000)
+        if write_canonical:
+            canonical_gen_file = os.path.join(canonical_wavs, f"{sample_name}_case{case_num}_gen.wav")
+            save_wav_file(canonical_gen_file, gen_wav_24k, 24000)
 
         if not os.path.exists(os.path.join(wavs_dir, f"{sample_name}_src.wav")):
             save_wav_file(os.path.join(wavs_dir, f"{sample_name}_src.wav"), src_w, 16000)
             save_wav_file(os.path.join(wavs_dir, f"{sample_name}_tgt.wav"), tgt_w, 16000)
-        if not os.path.exists(os.path.join(canonical_wavs, f"{sample_name}_src.wav")):
+        if write_canonical and not os.path.exists(os.path.join(canonical_wavs, f"{sample_name}_src.wav")):
             save_wav_file(os.path.join(canonical_wavs, f"{sample_name}_src.wav"), src_w, 16000)
             save_wav_file(os.path.join(canonical_wavs, f"{sample_name}_tgt.wav"), tgt_w, 16000)
 
@@ -1539,23 +1629,27 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
             "ref_vi_text": ref_vi_text,
             "asr_vi_text": transcribed_vi,
             "translated_en": translated_en,
+            "s2tt_not_translated": bool(not_translated),
             "ref_en_text": ref_en_text,
             "asr_transcribed_en": asr_transcribed_en,
             "rtf": round(rtf, 4),
             "secs_timbre": round(secs, 4),
             "mel_l1_error": round(mel_l1, 4),
+            "s2tt_bleu": round(s2tt_bleu, 2),
             "asr_bleu": round(bleu, 2),
             "gen_duration": round(gen_duration, 2)
         })
 
-        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] ({engine_title} + {s2tt_mode.upper()}) ---")
+        print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] ({engine_title} + {s2tt_mode.upper()} + {model_short}) ---")
         if ref_vi_text:
             print(f"  🇻🇳 Input Vi     : {ref_vi_text}")
-        print(f"  📖 S2TT English : {translated_en}")
+        if s2tt_mode == "3step":
+            print(f"  🗣️ ASR Vi       : {transcribed_vi}")
+        print(f"  📖 S2TT English : {translated_en}" + ("   ⚠️ [VẪN LÀ TIẾNG VIỆT — model không dịch]" if not_translated else ""))
         if asr_transcribed_en:
             print(f"  🎙️ Cloned ASR(En): {asr_transcribed_en}")
         print(f"  🎯 Target Ref   : {ref_en_text}")
-        print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
+        print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | S2TT-BLEU: {s2tt_bleu:.2f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = nanmean(secs_list)
@@ -1568,6 +1662,9 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         "case_name": full_case_name,
         "tts_engine": tts_engine,
         "s2tt_mode": s2tt_mode,
+        "s2tt_model": variant["model_id"],
+        "num_not_translated": n_not_translated,
+        "corpus_s2tt_bleu": compute_corpus_bleu(s2tt_hyps, bleu_refs),
         "avg_rtf": round(avg_rtf, 4),
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": round(avg_mel_l1, 4),
@@ -1577,51 +1674,59 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         "samples": results
     }
 
+    if n_not_translated:
+        print(f"⚠️ {n_not_translated}/{args.num_samples} câu S2TT vẫn là tiếng Việt -> {variant['model_id']} không dịch được sang tiếng Anh.")
+
     with open(os.path.join(out_case_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(canonical_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    if write_canonical:
+        with open(os.path.join(canonical_dir, "metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
     return summary
 
-def evaluate_cascaded_voice_clone_suite(case_num, tts_engine, s2tt_mode_arg, args, device, mel_fb, data_pipeline, en_asr_tools=None, s2tt_modules=None):
-    """Quản lý thực nghiệm Voice Cloning cho một engine TTS (XTTS-v2 hoặc F5-TTS) trên các chế độ S2TT."""
-    modes = ["2step", "3step"] if s2tt_mode_arg == "both" else [s2tt_mode_arg]
-    
-    if s2tt_modules is None:
-        s2tt_modules = get_s2tt_modules(modes, device, getattr(args, "whisper_s2tt_model", "openai/whisper-small"), getattr(args, "mt_model", "auto"))
-
+def evaluate_cascaded_voice_clone_suite(case_num, tts_engine, variants, args, device, mel_fb, data_pipeline, en_asr_tools=None):
+    """Voice Cloning cho một engine TTS (XTTS-v2 hoặc F5-TTS) trên mọi biến thể S2TT.
+    TTS nạp 1 lần; mỗi biến thể ASR/Whisper được nạp -> chạy -> giải phóng để tiết kiệm VRAM."""
     tts_model = load_voice_clone_tts(tts_engine, device)
     if tts_model is None:
         print(f"[Cảnh báo] Bỏ qua Case {case_num} ({tts_engine}) do không nạp được TTS model.")
         return []
 
+    # Biến thể đại diện cho gallery (thư mục case_N): 3-step đầu tiên, nếu không có thì biến thể đầu tiên
+    canonical_idx = next((i for i, v in enumerate(variants) if v["mode"] == "3step"), 0)
+
     summaries = []
-    for mode in modes:
+    for i, variant in enumerate(variants):
+        module = load_s2tt_variant(variant, device, getattr(args, "mt_model", "auto"))
+        if module is None:
+            print(f"[Cảnh báo] Bỏ qua biến thể {variant['mode']} / {variant['model_id']}.")
+            continue
         if hasattr(data_pipeline, "reset"):
             data_pipeline.reset()
-        summ = evaluate_single_voice_clone_run(
-            case_num=case_num,
-            tts_engine=tts_engine,
-            s2tt_mode=mode,
-            args=args,
-            device=device,
-            mel_fb=mel_fb,
-            data_pipeline=data_pipeline,
-            en_asr_tools=en_asr_tools,
-            s2tt_modules=s2tt_modules,
-            tts_model=tts_model
-        )
-        if summ:
-            summaries.append(summ)
+        try:
+            summ = evaluate_single_voice_clone_run(
+                case_num=case_num,
+                tts_engine=tts_engine,
+                variant=variant,
+                args=args,
+                device=device,
+                mel_fb=mel_fb,
+                data_pipeline=data_pipeline,
+                en_asr_tools=en_asr_tools,
+                s2tt_module=module,
+                tts_model=tts_model,
+                write_canonical=(i == canonical_idx),
+            )
+            if summ:
+                summaries.append(summ)
+        finally:
+            del module
+            release_cuda_memory()
 
     # Dọn dẹp TTS model khỏi VRAM
     del tts_model
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
+    release_cuda_memory()
     return summaries
 
 # ==============================================================================
@@ -1833,8 +1938,14 @@ def main():
                         help="Độ dài tối đa của file âm thanh (giây).")
     parser.add_argument("--s2tt-mode", type=str, default="both", choices=["2step", "3step", "both"],
                         help="Phương thức dịch thuật: '2step' (Whisper task=translate), '3step' (PhoWhisper + MT), hoặc 'both' (cả 2 chế độ)")
-    parser.add_argument("--whisper-s2tt-model", type=str, default="openai/whisper-small",
-                        help="Mô hình Whisper cho 2-step S2TT: openai/whisper-small hoặc openai/whisper-large-v3")
+    parser.add_argument("--s2tt-models", type=str, default=DEFAULT_2STEP_MODELS,
+                        help="Danh sách model 2-step (Whisper task=translate), cách nhau bởi dấu phẩy. "
+                             f"Mặc định: {DEFAULT_2STEP_MODELS}")
+    parser.add_argument("--vi-asr-models", type=str, default=DEFAULT_VI_ASR_MODELS,
+                        help="Danh sách model ASR tiếng Việt cho 3-step (ASR + MT), cách nhau bởi dấu phẩy. "
+                             f"Mặc định: {DEFAULT_VI_ASR_MODELS}")
+    parser.add_argument("--whisper-s2tt-model", type=str, default=None,
+                        help="(Cũ) Một model 2-step duy nhất — nếu đặt sẽ ghi đè --s2tt-models.")
     parser.add_argument("--mt-model", type=str, default="auto", choices=["auto", "vinai", "nllb", "opus"],
                         help="Mô hình dịch máy (MT) cho 3-step & Case 0: 'vinai' (vinai/vinai-translate-vi2en-v2 SOTA), 'nllb' (facebook/nllb-200-distilled-600M), 'opus', hoặc 'auto' (ưu tiên VinAI -> NLLB)")
     args = parser.parse_args()
@@ -1890,11 +2001,14 @@ def main():
         except Exception as e:
             print(f"[Whisper Info] Dùng dummy encoder: {e}")
 
-    # Nạp trước S2TT modules nếu chạy Case 6 hoặc 7
-    s2tt_modules = None
+    # Danh sách biến thể S2TT cho Case 6/7 (mỗi biến thể được nạp -> chạy -> giải phóng lần lượt)
+    models_2step = [args.whisper_s2tt_model] if args.whisper_s2tt_model else parse_model_list(args.s2tt_models)
+    models_vi_asr = parse_model_list(args.vi_asr_models)
+    s2tt_variants = build_s2tt_variants(args.s2tt_mode, models_2step, models_vi_asr)
     if any(c in [6, 7] for c in cases_to_run):
-        modes_needed = ["2step", "3step"] if args.s2tt_mode == "both" else [args.s2tt_mode]
-        s2tt_modules = get_s2tt_modules(modes_needed, device, args.whisper_s2tt_model, args.mt_model)
+        print("🧪 Các biến thể S2TT sẽ chạy cho mỗi engine TTS:")
+        for v in s2tt_variants:
+            print(f"   • {v['mode']:<5} | {v['model_id']}")
 
     all_summaries = []
 
@@ -1911,26 +2025,24 @@ def main():
             sums = evaluate_cascaded_voice_clone_suite(
                 case_num=6,
                 tts_engine="xtts",
-                s2tt_mode_arg=args.s2tt_mode,
+                variants=s2tt_variants,
                 args=args,
                 device=device,
                 mel_fb=mel_fb,
                 data_pipeline=data_pipeline,
                 en_asr_tools=en_asr_tools,
-                s2tt_modules=s2tt_modules
             )
             all_summaries.extend(sums)
         elif c == 7:
             sums = evaluate_cascaded_voice_clone_suite(
                 case_num=7,
                 tts_engine="f5tts",
-                s2tt_mode_arg=args.s2tt_mode,
+                variants=s2tt_variants,
                 args=args,
                 device=device,
                 mel_fb=mel_fb,
                 data_pipeline=data_pipeline,
                 en_asr_tools=en_asr_tools,
-                s2tt_modules=s2tt_modules
             )
             all_summaries.extend(sums)
         else:
@@ -1947,21 +2059,23 @@ def main():
     print("\n" + "=" * 90)
     print("📋 BẢNG TỔNG HỢP KẾT QUẢ BENCHMARK S2ST (TẬP TEST FLEURS VI-EN)")
     print("=" * 90)
-    print(f"{'Kịch bản (Benchmark Case)':<52} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8} | {'BLEU corpus ↑':<13} | {'BLEU câu TB':<11}")
+    print(f"{'Kịch bản (Benchmark Case)':<52} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8} | {'S2TT-BLEU ↑':<11} | {'ASR-BLEU ↑':<10} | {'BLEU câu TB':<11}")
     print("-" * 90)
     for s in all_summaries:
-        bleu_str = f"{s.get('corpus_asr_bleu', float('nan')):<13.2f} | {s.get('avg_asr_bleu', 0.0):<11.2f}"
+        bleu_str = (f"{s.get('corpus_s2tt_bleu', float('nan')):<11.2f} | {s.get('corpus_asr_bleu', float('nan')):<10.2f} | "
+                    f"{s.get('avg_asr_bleu', 0.0):<11.2f}")
         print(f"{s['case_name']:<52} | {s['avg_rtf']:<8.4f} | {s['avg_mel_l1_error']:<10.4f} | {s['avg_secs_timbre']:<8.4f} | {bleu_str}")
     print("=" * 90)
-    print("ℹ️ ASR-BLEU chính thức = BLEU corpus (SacreBLEU, chữ thường + bỏ dấu câu); cột sau là trung bình BLEU từng câu.")
+    print("ℹ️ S2TT-BLEU = văn bản dịch (trước TTS) vs Target Ref | ASR-BLEU = Whisper-En nghe lại audio sinh ra vs Target Ref.")
+    print("   Cả hai là corpus SacreBLEU (chữ thường + bỏ dấu câu). Chênh lệch S2TT-BLEU − ASR-BLEU ≈ điểm mất do TTS.")
 
     # Lưu bảng tổng hợp ra file Markdown
     os.makedirs(args.output_dir, exist_ok=True)
     summary_md_path = os.path.join(args.output_dir, "ablation_summary.md")
     with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write("# 📋 BẢNG SO SÁNH THỰC NGHIỆM S2ST (TẬP TEST FLEURS VI-EN)\n\n")
-        f.write("| Kịch bản thử nghiệm | RTF ↓ | Mel L1 Error ↓ | SECS (Giữ giọng) ↑ | ASR-BLEU corpus ↑ | BLEU câu TB | Đánh giá & Phân tích |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Kịch bản thử nghiệm | RTF ↓ | Mel L1 Error ↓ | SECS (Giữ giọng) ↑ | S2TT-BLEU ↑ | ASR-BLEU corpus ↑ | BLEU câu TB | Đánh giá & Phân tích |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for s in all_summaries:
             cid = s.get("case_id", 0)
             tag = s.get("case_tag", "")
@@ -1983,7 +2097,7 @@ def main():
                 note = "Cascaded SOTA Voice Cloning: F5-TTS Flow-Matching điều kiện in-context audio+text."
             else:
                 note = "Thử nghiệm S2ST"
-            f.write(f"| **{s['case_name']}** | {s['avg_rtf']:.4f} | {s['avg_mel_l1_error']:.4f} | {s['avg_secs_timbre']:.4f} | {s.get('corpus_asr_bleu', float('nan')):.2f} | {s.get('avg_asr_bleu', 0.0):.2f} | {note} |\n")
+            f.write(f"| **{s['case_name']}** | {s['avg_rtf']:.4f} | {s['avg_mel_l1_error']:.4f} | {s['avg_secs_timbre']:.4f} | {s.get('corpus_s2tt_bleu', float('nan')):.2f} | {s.get('corpus_asr_bleu', float('nan')):.2f} | {s.get('avg_asr_bleu', 0.0):.2f} | {note} |\n")
     print(f"📁 Báo cáo tổng hợp đã lưu tại: {summary_md_path}\n")
     generate_audio_gallery_html(args.output_dir)
 

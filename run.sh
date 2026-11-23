@@ -174,6 +174,8 @@ case "$ACTION" in
         S2TT_MODE="${3:-both}"
         NUM_SAMPLES="${4:-10}"
         MT_MODEL="${5:-auto}"
+        # Tham số thứ 6 trở đi được chuyển thẳng cho eval_benchmark.py, VD:
+        #   bash run.sh eval sota both 10 auto --s2tt-models openai/whisper-large-v3 --vi-asr-models vinai/PhoWhisper-large
         echo "📊 Đang chuẩn bị môi trường & chạy Benchmark thực nghiệm..."
         echo "   • Kịch bản: $CASE_CHOICE | Chế độ S2TT: $S2TT_MODE | Số mẫu: $NUM_SAMPLES | MT Model: $MT_MODEL"
 
@@ -225,7 +227,7 @@ sys.exit(1)
 
         echo "✓ Cài đặt dependencies hoàn tất! Bắt đầu chạy benchmark..."
         export COQUI_TOS_AGREED=1
-        python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" --mt-model "$MT_MODEL" 2>&1 | tee -a "$LOG_DIR/eval.log"
+        python -u eval_benchmark.py --case "$CASE_CHOICE" --s2tt-mode "$S2TT_MODE" --num-samples "$NUM_SAMPLES" --mt-model "$MT_MODEL" "${@:6}" 2>&1 | tee -a "$LOG_DIR/eval.log"
         ;;
 
     encoders)
