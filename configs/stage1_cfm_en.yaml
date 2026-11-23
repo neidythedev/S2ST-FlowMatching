@@ -14,15 +14,18 @@ model:
   num_res_blocks: 4
 
 training:
-  batch_size: 4
+  batch_size: 8
   learning_rate: 2.0e-4
-  min_lr: 1.0e-5
+  min_lr: 1.0e-5          # LR cosine giảm dần về min_lr
   weight_decay: 1.0e-4
-  epochs: 25
-  steps_per_epoch: 100
-  val_steps: 10
+  epochs: 60
+  steps_per_epoch: 300    # 300 x 8 = 2400 câu/epoch (~1 lượt FLEURS en_us train)
+  val_clips: 32           # tập validation CỐ ĐỊNH (cùng câu, cùng t/x0 mỗi epoch)
+  eval_wer_every: 5       # mỗi 5 epoch: CFM tái tạo -> Vocos -> Whisper-En -> WER
+  eval_wer_clips: 16
   max_grad_norm: 1.0
   bf16: true
+  sync_drive: true        # tự đẩy checkpoint lên gdrive:runs/<exp>/checkpoints/ sau mỗi epoch
 
 data:
   dataset_name: "google/fleurs"

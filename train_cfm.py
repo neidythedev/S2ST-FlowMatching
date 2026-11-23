@@ -99,6 +99,12 @@ if "torchaudio.transforms" in sys.modules:
 if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
     sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
 
+from train_utils import (
+    FlowMatchingTargetDecoder, ResidualBlock1D,
+    encode_whisper, latent_lengths, mel_lengths, length_mask, masked_mse,
+    EnglishASR, corpus_wer, resample_24k_to_16k_fft, sync_to_drive,
+)
+
 def load_vocos_safely(repo_id="charactr/vocos-mel-24khz", device="cpu"):
     """Nạp Vocos vocoder an toàn với strict=False và loại bỏ feature_extractor để chống lỗi shape mismatch."""
     from vocos import Vocos
@@ -177,8 +183,12 @@ def load_yaml_config(config_path):
             "epochs": 25,
             "steps_per_epoch": 100,
             "val_steps": 10,
+            "val_clips": 32,
+            "eval_wer_every": 5,
+            "eval_wer_clips": 16,
             "max_grad_norm": 1.0,
-            "bf16": True
+            "bf16": True,
+            "sync_drive": True
         },
         "data": {
             "dataset_name": "google/fleurs",
@@ -297,44 +307,7 @@ class TimestepEmbedding(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
-class ResidualBlock1D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
-        self.norm = nn.GroupNorm(8, channels)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
-    def forward(self, x):
-        res = x
-        x = self.conv1(x)
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.conv2(x)
-        return x + res
-
-class FlowMatchingTargetDecoder(nn.Module):
-    def __init__(self, n_mels=100, cond_dim=512, spk_dim=192, hidden_dim=384, num_res_blocks=4):
-        super().__init__()
-        self.n_mels = n_mels
-        self.cond_dim = cond_dim
-        self.spk_dim = spk_dim
-        self.hidden_dim = hidden_dim
-
-        total_in_channels = n_mels + 1 + cond_dim + spk_dim
-        self.in_proj = nn.Conv1d(total_in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.res_blocks = nn.ModuleList([ResidualBlock1D(hidden_dim) for _ in range(num_res_blocks)])
-        self.out_proj = nn.Conv1d(hidden_dim, n_mels, kernel_size=3, padding=1)
-
-    def forward(self, x_t, t, cond, spk_emb):
-        B, C, T = x_t.shape
-        t_embed = t.view(B, 1, 1).expand(B, 1, T)
-        spk_expand = spk_emb.unsqueeze(-1).expand(B, -1, T)
-        net_in = torch.cat([x_t, t_embed, cond, spk_expand], dim=1)
-        h = self.in_proj(net_in)
-        for block in self.res_blocks:
-            h = block(h)
-        v = self.out_proj(h)
-        return v
+# ResidualBlock1D / FlowMatchingTargetDecoder: định nghĩa DUY NHẤT trong train_utils.py (dùng chung với Stage 2)
 
 class AcousticSpeakerEncoder(nn.Module):
     def __init__(self, feat_dim=768, spk_dim=192):
@@ -361,22 +334,28 @@ class CFMStage1System(nn.Module):
             n_mels=n_mels, cond_dim=cond_dim, spk_dim=spk_dim, hidden_dim=hidden_dim
         )
 
-    def compute_loss(self, whisper_features, target_mel):
-        B, C, T_target = target_mel.shape
+    def condition(self, whisper_features, T_target):
+        """Điều kiện c [B, cond_dim, T_target] — Stage 2 dùng đúng hàm này làm NHÃN cho Bridge."""
         cond_512 = self.cond_proj(whisper_features)
-        cond_512 = F.interpolate(cond_512.transpose(1, 2), size=T_target, mode='linear', align_corners=False)
+        return F.interpolate(cond_512.transpose(1, 2), size=T_target, mode='linear', align_corners=False)
+
+    def compute_loss(self, whisper_features, target_mel, mel_mask=None, t=None, x_0=None):
+        """mel_mask [B, T]: bỏ qua phần đệm. t / x_0: truyền vào để val loss cố định (tái lập được)."""
+        B, C, T_target = target_mel.shape
+        cond_512 = self.condition(whisper_features, T_target)
         spk_emb = self.spk_encoder(whisper_features)
 
-        t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
-        x_0 = torch.randn_like(target_mel)
+        if t is None:
+            t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
+        if x_0 is None:
+            x_0 = torch.randn_like(target_mel)
         x_1 = target_mel
         t_expand = t.view(B, 1, 1)
         x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
         u_t = x_1 - x_0
 
-        v_pred = self.decoder(x_t, t, cond_512, spk_emb)
-        loss = F.mse_loss(v_pred, u_t)
-        return loss
+        v_pred = self.decoder(x_t, t, cond_512, spk_emb, mask=mel_mask)
+        return masked_mse(v_pred, u_t, mel_mask)
 
     @torch.no_grad()
     def inference(self, whisper_features, num_steps=32, target_len=None):
@@ -415,11 +394,15 @@ class CFMStage1System(nn.Module):
 # ==============================================================================
 
 class UniversalSpeechStreamingPipeline:
-    def __init__(self, split='train', max_sec=12.0, lang='en_us'):
+    def __init__(self, split='train', max_sec=12.0, lang='en_us', allow_synthetic=False, shuffle_seed=None):
         self.split = split
         self.max_sec = max_sec
         self.lang = lang
         self.is_online = False
+        self.allow_synthetic = allow_synthetic
+        self.shuffle_seed = shuffle_seed
+        self.pass_idx = 0          # số lần đã đọc hết dataset (dùng để đổi thứ tự shuffle)
+        self.last_lengths = []     # độ dài thật (mẫu 16kHz) của từng câu trong batch gần nhất
 
         try:
             from datasets import load_dataset, Audio
@@ -429,12 +412,25 @@ class UniversalSpeechStreamingPipeline:
                 self.ds = self.ds.cast_column('audio', Audio(decode=False))
             except Exception:
                 pass
+            if shuffle_seed is not None:
+                # Shuffle có buffer cho streaming; set_epoch() đổi thứ tự sau mỗi lượt đọc hết
+                self.ds = self.ds.shuffle(seed=shuffle_seed, buffer_size=500)
             self.iter_ds = iter(self.ds)
             self.is_online = True
             print(f"✓ Kết nối thành công FLEURS {lang} [{split}]!")
         except Exception as e:
-            print(f"[Cảnh báo Dữ liệu] Không thể stream ({e}). Kích hoạt bộ tạo tín hiệu mô phỏng.")
             self.is_online = False
+            if not allow_synthetic:
+                raise RuntimeError(f"Không stream được FLEURS {lang} [{split}] ({e}) — dừng để tránh train trên dữ liệu giả.")
+            print(f"[Cảnh báo Dữ liệu] Không thể stream ({e}). Dùng tín hiệu mô phỏng (chỉ cho smoke-test).")
+
+    def _restart(self):
+        """Đọc hết dataset -> bắt đầu lượt mới (đổi thứ tự shuffle nếu có)."""
+        self.pass_idx += 1
+        if self.shuffle_seed is not None and hasattr(self.ds, "set_epoch"):
+            self.ds.set_epoch(self.pass_idx)
+        self.iter_ds = iter(self.ds)
+        print(f"   🔁 [{self.lang}/{self.split}] Đã đọc hết dữ liệu -> bắt đầu lượt thứ {self.pass_idx + 1}")
 
     def _extract_audio_tensor(self, audio_data):
         import io
@@ -453,23 +449,33 @@ class UniversalSpeechStreamingPipeline:
                 arr, sr = sf.read(audio_data["path"])
                 if arr.ndim > 1: arr = arr.mean(axis=-1)
                 return torch.from_numpy(arr).float()[:limit]
-        return torch.randn(int(16000 * 4.0))
+        raise ValueError("Không tìm thấy audio hợp lệ trong mục dữ liệu")
 
     def fetch_batch(self, batch_size=4):
         audio_list = []
         transcripts = []
 
         if self.is_online:
-            for _ in range(batch_size):
+            n_errors = 0
+            while len(audio_list) < batch_size:
                 try:
                     item = next(self.iter_ds)
+                except StopIteration:
+                    self._restart()
+                    continue
+                try:
                     w = self._extract_audio_tensor(item['audio'])
+                    if w.numel() < 1600:   # < 0.1s -> bỏ
+                        continue
                     audio_list.append(w)
-                    transcripts.append(item.get('transcription', 'speech sample'))
-                except Exception:
-                    self.iter_ds = iter(self.ds)
-                    break
+                    transcripts.append(item.get('transcription', ''))
+                except Exception as ex:
+                    n_errors += 1       # câu lỗi giải mã -> bỏ qua, lấy câu kế tiếp (KHÔNG bịa dữ liệu)
+                    if n_errors > 50:
+                        raise RuntimeError(f"Quá nhiều câu lỗi giải mã liên tiếp ({ex})")
 
+        if len(audio_list) < batch_size and not self.allow_synthetic:
+            raise RuntimeError("Thiếu dữ liệu thật và không cho phép dữ liệu mô phỏng.")
         while len(audio_list) < batch_size:
             t_sec = torch.linspace(0, self.max_sec, int(16000 * self.max_sec))
             f0 = 130.0 + 30.0 * torch.sin(2 * math.pi * 1.5 * t_sec)
@@ -477,7 +483,8 @@ class UniversalSpeechStreamingPipeline:
             audio_list.append(w)
             transcripts.append('synthetic speech sample')
 
-        max_len = max(w.shape[0] for w in audio_list)
+        self.last_lengths = [int(w.shape[0]) for w in audio_list]
+        max_len = max(self.last_lengths)
         padded_audio_16k = torch.stack([F.pad(w, (0, max_len - w.shape[0])) for w in audio_list], dim=0)
         return padded_audio_16k, transcripts
 
@@ -543,7 +550,8 @@ def main():
         print("🧪 BẮT ĐẦU SANITY CHECK #3: OVERFIT 500 BƯỚC TRÊN 16 CÂU TIẾNG ANH")
         print("Mục tiêu: Đảm bảo CFM học thuộc lòng âm học tiếng Anh và sinh ra file .wav rõ chữ!")
         print("=" * 75)
-        pipeline = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang)
+        pipeline = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
+                                                    allow_synthetic=args.smoke_test)
         fix_audio, fix_txt = pipeline.fetch_batch(batch_size=16)
 
         if feat_extractor and whisper_enc:
@@ -562,6 +570,7 @@ def main():
 
         fix_24k = resample_16k_to_24k(fix_audio.to(device=device, dtype=torch.float32))
         fix_mel = extract_100_mel(fix_24k, mel_fb).to(dtype=dtype)
+        fix_mask = length_mask(mel_lengths(pipeline.last_lengths), fix_mel.shape[-1], device)
 
         num_overfit_steps = 800
         overfit_opt = torch.optim.AdamW(model.parameters(), lr=4.0e-4, weight_decay=1.0e-4)
@@ -573,7 +582,7 @@ def main():
 
         for step in range(1, num_overfit_steps + 1):
             overfit_opt.zero_grad()
-            l = model.compute_loss(fix_latents, fix_mel)
+            l = model.compute_loss(fix_latents, fix_mel, mel_mask=fix_mask)
             l.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             overfit_opt.step()
@@ -625,6 +634,9 @@ def main():
         return
 
     # Huấn luyện thông thường
+    if not (feat_extractor and whisper_enc) and not args.smoke_test:
+        raise RuntimeError("Không nạp được Whisper encoder — dừng để tránh train trên latent ngẫu nhiên.")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg["learning_rate"]),
@@ -632,19 +644,106 @@ def main():
         betas=(0.9, 0.999)
     )
 
-    epochs = 1 if args.smoke_test else train_cfg["epochs"]
-    steps_per_epoch = 2 if args.smoke_test else train_cfg["steps_per_epoch"]
-    val_steps = 1 if args.smoke_test else train_cfg["val_steps"]
-    batch_size = train_cfg["batch_size"]
+    epochs = 1 if args.smoke_test else int(train_cfg["epochs"])
+    steps_per_epoch = 2 if args.smoke_test else int(train_cfg["steps_per_epoch"])
+    batch_size = int(train_cfg["batch_size"])
+    total_steps = max(1, epochs * steps_per_epoch)
+    min_lr_ratio = float(train_cfg.get("min_lr", 1e-5)) / float(train_cfg["learning_rate"])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda st: max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, st / total_steps)))))
 
-    train_pipeline = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang)
-    val_pipeline = UniversalSpeechStreamingPipeline(split='validation', max_sec=12.0, lang=data_lang)
+    def featurize(audio_16k, lengths):
+        """audio đệm -> (latent Whisper, mel đích, mask frame thật)."""
+        if feat_extractor and whisper_enc:
+            lat = encode_whisper(audio_16k, feat_extractor, whisper_enc, device, dtype)
+        else:
+            lat = torch.randn(audio_16k.shape[0], 100, 768, device=device, dtype=dtype)
+        a24 = resample_16k_to_24k(audio_16k.to(device=device, dtype=torch.float32))
+        mel = extract_100_mel(a24, mel_fb).to(dtype=dtype)
+        mask = length_mask(mel_lengths(lengths), mel.shape[-1], device)
+        return lat, mel, mask
 
-    best_val_loss = float("inf")
-    ckpt_path = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
+    # ---- Tập validation CỐ ĐỊNH (cùng câu, cùng t / x0 mỗi epoch) -> val loss so sánh được ----
+    val_clips = 4 if args.smoke_test else int(train_cfg.get("val_clips", 32))
+    val_pipeline = UniversalSpeechStreamingPipeline(split='validation', max_sec=12.0, lang=data_lang,
+                                                    allow_synthetic=args.smoke_test)
+    val_set = []
+    for _ in range((val_clips + batch_size - 1) // batch_size):
+        v_audio, v_txt = val_pipeline.fetch_batch(batch_size=batch_size)
+        val_set.append((v_audio, list(val_pipeline.last_lengths), v_txt))
+    gen = torch.Generator(device="cpu").manual_seed(1234)
+    val_noise = []
+    for v_audio, v_lens, _ in val_set:
+        T = mel_lengths([v_audio.shape[-1]])[0]
+        val_noise.append((torch.rand(v_audio.shape[0], generator=gen),
+                          torch.randn(v_audio.shape[0], cfg["model"]["n_mels"], T, generator=gen)))
+    print(f"✓ Tập validation cố định: {sum(v[0].shape[0] for v in val_set)} câu (seed 1234)")
+
+    # ---- Đo WER tái tạo: CFM sinh Mel từ latent -> Vocos -> Whisper-En -> WER ----
+    eval_wer_every = int(train_cfg.get("eval_wer_every", 5))
+    eval_wer_clips = int(train_cfg.get("eval_wer_clips", 16))
+    vocos = None
+    en_asr = EnglishASR(device)
+    gt_wer = None
+
+    def eval_resynthesis_wer():
+        nonlocal vocos, gt_wer
+        if vocos is None:
+            vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
+            vocos.eval()
+        hyps, refs, gt_hyps = [], [], []
+        done = 0
+        for v_audio, v_lens, v_txt in val_set:
+            lat, mel, _ = featurize(v_audio, v_lens)
+            gen_mel = model.inference(lat, num_steps=32, target_len=mel.shape[-1])
+            for i in range(v_audio.shape[0]):
+                if done >= eval_wer_clips:
+                    break
+                n_frames = mel_lengths([v_lens[i]])[0]
+                with torch.no_grad():
+                    wav24 = vocos.decode(gen_mel[i:i + 1, :, :n_frames].float()).squeeze().cpu()
+                hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(wav24)))
+                refs.append(v_txt[i])
+                if gt_wer is None:
+                    gt_hyps.append(en_asr.transcribe(v_audio[i, :v_lens[i]]))
+                done += 1
+        if gt_wer is None:
+            gt_wer = corpus_wer(gt_hyps, refs)
+        return corpus_wer(hyps, refs), hyps[:2], refs[:2]
+
+    # ---- Resume ----
     os.makedirs(paths["checkpoint_dir"], exist_ok=True)
+    ckpt_path = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
+    best_ckpt = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
+    start_epoch, global_step, best_val_loss, history = 0, 0, float("inf"), []
+    if args.resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        if ck.get("stage1_meta", {}).get("lang") not in (None, data_lang):
+            raise RuntimeError(f"{ckpt_path} là checkpoint ngôn ngữ {ck['stage1_meta']['lang']} — không resume.")
+        model.load_state_dict(ck.get("full_system_state_dict", {}), strict=False)
+        if "optimizer_state_dict" in ck:
+            try:
+                optimizer.load_state_dict(ck["optimizer_state_dict"])
+            except Exception as e:
+                print(f"[Resume] Khởi tạo lại optimizer ({e})")
+        if "scheduler_state_dict" in ck:
+            scheduler.load_state_dict(ck["scheduler_state_dict"])
+        start_epoch = int(ck.get("epoch", -1)) + 1
+        global_step = int(ck.get("step", 0))
+        best_val_loss = float(ck.get("best_loss", float("inf")))
+        history = ck.get("history", [])
+        print(f"⚡ [Resume] Tiếp tục từ epoch {start_epoch} (step {global_step}, best val {best_val_loss:.4f})")
+    elif args.resume:
+        print(f"[Resume] Không thấy {ckpt_path} -> train từ đầu.")
 
-    for epoch in range(epochs):
+    train_pipeline = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
+                                                      allow_synthetic=args.smoke_test,
+                                                      shuffle_seed=None if args.smoke_test else 42)
+    sync_enabled = bool(train_cfg.get("sync_drive", True)) and not args.smoke_test
+    print(f"[Training Config] {epochs} epochs × {steps_per_epoch} steps × batch {batch_size} "
+          f"| LR cosine {train_cfg['learning_rate']} → {train_cfg.get('min_lr', 1e-5)} | WER mỗi {eval_wer_every} epoch")
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
         t0 = time.time()
@@ -652,69 +751,68 @@ def main():
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
             audio_16k, _ = train_pipeline.fetch_batch(batch_size=batch_size)
+            latents, tgt_mel, mel_mask = featurize(audio_16k, train_pipeline.last_lengths)
 
-            if feat_extractor and whisper_enc:
-                in_p = feat_extractor(audio_16k.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
-                f = in_p.input_features.to(device=device, dtype=dtype)
-                if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
-                elif f.shape[-1] > 3000: f = f[:, :, :3000]
-                with torch.no_grad():
-                    fl = whisper_enc(f).last_hidden_state
-                real_len = max(10, int(audio_16k.shape[-1] / 320))
-                latents = fl[:, :real_len, :]
-            else:
-                latents = torch.randn(batch_size, 100, 768, device=device, dtype=dtype)
-
-            audio_24k = resample_16k_to_24k(audio_16k.to(device=device, dtype=torch.float32))
-            tgt_mel = extract_100_mel(audio_24k, mel_fb).to(dtype=dtype)
-
-            cfm_l = model.compute_loss(latents, tgt_mel)
+            cfm_l = model.compute_loss(latents, tgt_mel, mel_mask=mel_mask)
             cfm_l.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(train_cfg["max_grad_norm"]))
             optimizer.step()
+            scheduler.step()
+            global_step += 1
 
             train_loss += cfm_l.item()
             if (step + 1) % 10 == 0:
-                print(f"   [E{epoch:02d}|Step {step+1:03d}/{steps_per_epoch}] Train Loss: {cfm_l.item():.4f}")
+                print(f"   [E{epoch:02d}|Step {step+1:03d}/{steps_per_epoch}] Train Loss: {cfm_l.item():.4f} "
+                      f"| LR: {scheduler.get_last_lr()[0]:.2e}")
 
         avg_train = train_loss / steps_per_epoch
         print(f"==> Hoàn tất Epoch {epoch:02d} trong {time.time()-t0:.1f}s | Avg Train Loss: {avg_train:.4f}")
 
-        # Validation
+        # Validation cố định
         model.eval()
-        val_loss = 0.0
+        val_loss, n_val = 0.0, 0
         with torch.no_grad():
-            for _ in range(val_steps):
-                v_audio, _ = val_pipeline.fetch_batch(batch_size=batch_size)
-                if feat_extractor and whisper_enc:
-                    in_p = feat_extractor(v_audio.numpy(), sampling_rate=16000, return_tensors='pt', padding="max_length")
-                    f = in_p.input_features.to(device=device, dtype=dtype)
-                    if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
-                    elif f.shape[-1] > 3000: f = f[:, :, :3000]
-                    v_fl = whisper_enc(f).last_hidden_state
-                    v_lat = v_fl[:, :max(10, int(v_audio.shape[-1] / 320)), :]
-                else:
-                    v_lat = torch.randn(batch_size, 100, 768, device=device, dtype=dtype)
+            for (v_audio, v_lens, _), (vt, vx0) in zip(val_set, val_noise):
+                v_lat, v_mel, v_mask = featurize(v_audio, v_lens)
+                vx0 = vx0[:, :, :v_mel.shape[-1]].to(device=device, dtype=dtype)
+                val_loss += model.compute_loss(v_lat, v_mel, mel_mask=v_mask,
+                                               t=vt.to(device=device, dtype=dtype), x_0=vx0).item()
+                n_val += 1
+        avg_val = val_loss / max(1, n_val)
+        print(f"   Val Loss (cố định): {avg_val:.4f} | Best: {min(best_val_loss, avg_val):.4f}")
 
-                v_24k = resample_16k_to_24k(v_audio.to(device=device, dtype=torch.float32))
-                v_mel = extract_100_mel(v_24k, mel_fb).to(dtype=dtype)
-                val_loss += model.compute_loss(v_lat, v_mel).item()
-
-        avg_val = val_loss / max(1, val_steps)
-        print(f"   Val Loss: {avg_val:.4f} | Best Val Loss: {min(best_val_loss, avg_val):.4f}")
+        wer = None
+        if not args.smoke_test and eval_wer_every > 0 and ((epoch + 1) % eval_wer_every == 0 or epoch == epochs - 1):
+            try:
+                wer, ex_h, ex_r = eval_resynthesis_wer()
+                print(f"   🎧 WER tái tạo: {wer:.1f}% (audio gốc qua cùng ASR: {gt_wer:.1f}%) — càng gần càng tốt")
+                for h, r in zip(ex_h, ex_r):
+                    print(f"      • ref: {r[:70]}\n        cfm: {h[:70]}")
+            except Exception as e:
+                print(f"   [WER] Không đo được: {e}")
+        history.append({"epoch": epoch, "train": avg_train, "val": avg_val, "wer": wer, "gt_wer": gt_wer})
 
         ckpt_data = {
             "epoch": epoch,
+            "step": global_step,
             "best_loss": min(best_val_loss, avg_val),
             "model_state_dict": model.decoder.state_dict(),
-            "full_system_state_dict": model.state_dict(),
+            "full_system_state_dict": model.state_dict(),   # gồm cond_proj + spk_encoder cho Stage 2
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "history": history,
+            "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "version": 2,
+                            "cond_dim": cfg["model"]["cond_dim"], "spk_dim": cfg["model"]["spk_dim"]},
+            "config": cfg,
         }
         torch.save(ckpt_data, ckpt_path)
+        synced = [ckpt_path]
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            best_ckpt = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
             torch.save(ckpt_data, best_ckpt)
+            synced.append(best_ckpt)
             print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best: {best_val_loss:.4f}")
+        sync_to_drive(synced, args.exp_name, enabled=sync_enabled)
 
     print("\n🎉 HUẤN LUYỆN STAGE 1 OT-CFM TIẾNG ANH HOÀN TẤT THÀNH CÔNG!")
 

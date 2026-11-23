@@ -98,6 +98,12 @@ def apply_torchaudio_mock_if_needed():
 
 _ = apply_torchaudio_mock_if_needed()
 
+from train_utils import (
+    FlowMatchingTargetDecoder, ResidualBlock1D,
+    encode_whisper, latent_lengths, mel_lengths, length_mask, masked_mse, masked_l1,
+    EnglishASR, corpus_wer, resample_24k_to_16k_fft, sync_to_drive,
+)
+
 # Tee output để vừa hiển thị terminal vừa ghi log file
 class TeeLogger(object):
     def __init__(self, filepath):
@@ -141,6 +147,7 @@ def load_yaml_config(config_path):
         "loss_weights": {
             "cfm_weight": 1.0,
             "dur_weight": 0.1,
+            "cond_weight": 1.0,
         },
         "training": {
             "batch_size": 4,
@@ -154,6 +161,9 @@ def load_yaml_config(config_path):
             "bf16": True,
             "save_interval_steps": 250,
             "log_interval_steps": 20,
+            "val_pairs": 16,
+            "max_train_pairs": 4000,
+            "sync_drive": True,
         },
         "data": {
             "dataset_name": "google/fleurs",
@@ -451,32 +461,8 @@ class AcousticSpeakerEncoder(nn.Module):
         spk_emb = self.proj(stat)
         return F.normalize(spk_emb, p=2, dim=-1)
 
-class FlowMatchingTargetDecoder(nn.Module):
-    """Bộ giải mã âm học Optimal Transport CFM: Sinh 100-Mels sắc nét có điều kiện."""
-    def __init__(self, n_mels=100, cond_dim=512, spk_dim=192, hidden_dim=384):
-        super().__init__()
-        total_in = n_mels + 1 + cond_dim + spk_dim
-        self.input_proj = nn.Conv1d(total_in, hidden_dim, kernel_size=3, padding=1)
-        self.res_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.GELU(),
-                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-                nn.GroupNorm(8, hidden_dim),
-                nn.GELU(),
-                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-            ) for _ in range(4)
-        ])
-        self.out_proj = nn.Conv1d(hidden_dim, n_mels, kernel_size=3, padding=1)
-
-    def forward(self, x_t, t, cond, spk_emb):
-        B, _, T = x_t.shape
-        t_embed = t.view(B, 1, 1).expand(B, 1, T)
-        spk_expand = spk_emb.unsqueeze(-1).expand(B, -1, T)
-        net_in = torch.cat([x_t, t_embed, cond, spk_expand], dim=1)
-        h = self.input_proj(net_in)
-        for block in self.res_blocks:
-            h = h + block(h)
-        return self.out_proj(h)
+# ResidualBlock1D / FlowMatchingTargetDecoder: định nghĩa DUY NHẤT trong train_utils.py (dùng chung với Stage 1).
+# Trước đây hai file định nghĩa lệch tên tham số -> Stage 2 không nạp được CFM Stage 1.
 
 class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
@@ -486,9 +472,24 @@ class ViEnS2STSystem(nn.Module):
         self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim, hidden_dim=384)
+        # cond_proj của Stage 1 (ĐÓNG BĂNG): biến đặc trưng Whisper của audio TIẾNG ANH đích thành điều kiện c*
+        # mà CFM decoder đã quen -> làm NHÃN trực tiếp cho Bridge (loss chưng cất L_cond).
+        self.teacher_cond_proj = nn.Linear(encoder_dim, bridge_dim)
+        self.has_teacher = False
 
-    def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None, **kwargs):
-        weights = loss_weights or {"cfm_weight": 1.0, "dur_weight": 0.1}
+    def teacher_condition(self, tgt_whisper, T_tgt):
+        """c* [B, bridge_dim, T_tgt] = interp(cond_proj_stage1(Whisper(audio En đích)))."""
+        c = self.teacher_cond_proj(tgt_whisper)
+        return F.interpolate(c.transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
+
+    def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None,
+                     mel_mask=None, cond_target=None, t=None, x_0=None, **kwargs):
+        """Trả về (total, cfm, dur, cond).
+        speaker_emb: lúc TRAIN nên là embedding của audio ĐÍCH (người đọc tiếng Anh) để decoder tái tạo đúng Mel đích.
+        cond_target: c* từ teacher_condition() -> loss chưng cất L1 (None = tắt).
+        mel_mask: [B, T_tgt] bỏ qua phần đệm. t / x_0: truyền vào để val loss cố định."""
+        weights = {"cfm_weight": 1.0, "dur_weight": 0.1, "cond_weight": 0.0}
+        weights.update(loss_weights or {})
         B, _, T_tgt = target_mel.shape
 
         # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích
@@ -499,25 +500,34 @@ class ViEnS2STSystem(nn.Module):
 
         cond = translated_latents.transpose(1, 2)  # [B, bridge_dim, T_tgt]
 
-        # 1. CFM Optimal Transport Loss
-        t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
-        x_0 = torch.randn_like(target_mel)
+        # 1. CFM Optimal Transport Loss (gradient đi xuyên CFM decoder đóng băng)
+        if t is None:
+            t = torch.rand(B, device=target_mel.device, dtype=target_mel.dtype)
+        if x_0 is None:
+            x_0 = torch.randn_like(target_mel)
         x_1 = target_mel
         t_exp = t.view(B, 1, 1)
         x_t = (1.0 - t_exp) * x_0 + t_exp * x_1
         u_t = x_1 - x_0
 
-        v_pred = self.decoder(x_t, t, cond, speaker_emb)
-        cfm_loss = F.mse_loss(v_pred, u_t)
+        v_pred = self.decoder(x_t, t, cond, speaker_emb, mask=mel_mask)
+        cfm_loss = masked_mse(v_pred, u_t, mel_mask)
 
         # 2. Duration Loss
         if target_dur_ratio is not None:
-            dur_loss = F.smooth_l1_loss(dur_scale.view(-1), target_dur_ratio.view(-1))
+            dur_loss = F.smooth_l1_loss(dur_scale.view(-1), target_dur_ratio.view(-1).to(dur_scale.dtype))
         else:
             dur_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
 
-        total_loss = weights["cfm_weight"] * cfm_loss + weights["dur_weight"] * dur_loss
-        return total_loss, cfm_loss, dur_loss
+        # 3. Loss chưng cất điều kiện: Bridge phải sinh ra đúng c* của audio tiếng Anh
+        if cond_target is not None and weights["cond_weight"] > 0:
+            cond_loss = masked_l1(cond, cond_target.to(cond.dtype), mel_mask)
+        else:
+            cond_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
+
+        total_loss = (weights["cfm_weight"] * cfm_loss + weights["dur_weight"] * dur_loss
+                      + weights["cond_weight"] * cond_loss)
+        return total_loss, cfm_loss, dur_loss, cond_loss
 
     @torch.no_grad()
     def inference(self, src_whisper, speaker_emb=None, target_len=None, num_steps=32):
@@ -552,20 +562,56 @@ class ViEnS2STSystem(nn.Module):
 # Alias tương thích ngược
 EnViS2STSystem = ViEnS2STSystem
 
+def load_stage1_into(model, ckpt_path, device, allow_legacy=False):
+    """Nạp checkpoint Stage 1 (train_cfm.py) vào ViEnS2STSystem:
+       decoder <- decoder, teacher_cond_proj <- cond_proj, spk_encoder <- spk_encoder.
+    Trả về True nếu có đủ teacher (cond_proj) để bật loss chưng cất."""
+    ck = torch.load(ckpt_path, map_location=device)
+    meta = ck.get("stage1_meta") if isinstance(ck, dict) else None
+    if meta is None and not allow_legacy:
+        raise RuntimeError(
+            f"{ckpt_path} không có 'stage1_meta' -> có thể là checkpoint CŨ (hướng En->Vi). "
+            "Hãy train lại Stage 1 bằng 'bash run.sh start cfm_en' hoặc thêm --allow-legacy-cfm nếu chắc chắn.")
+    if meta is not None and meta.get("lang") != "en_us":
+        raise RuntimeError(f"{ckpt_path} là CFM ngôn ngữ '{meta.get('lang')}', cần 'en_us'.")
+    full = ck.get("full_system_state_dict") if isinstance(ck, dict) else None
+    dec = ck.get("model_state_dict", ck) if isinstance(ck, dict) else ck
+    if full:
+        dec = {k[len("decoder."):]: v for k, v in full.items() if k.startswith("decoder.")} or dec
+    model.decoder.load_state_dict(dec, strict=True)
+    has_teacher = False
+    if full:
+        cp = {k[len("cond_proj."):]: v for k, v in full.items() if k.startswith("cond_proj.")}
+        sp = {k[len("spk_encoder."):]: v for k, v in full.items() if k.startswith("spk_encoder.")}
+        if cp:
+            model.teacher_cond_proj.load_state_dict(cp, strict=True)
+            has_teacher = True
+        if sp:
+            model.spk_encoder.load_state_dict(sp, strict=True)
+    model.has_teacher = has_teacher
+    print(f"✓ Nạp Stage 1 từ {ckpt_path}: decoder ✓ | cond_proj (teacher) {'✓' if has_teacher else '✗'} "
+          f"| spk_encoder {'✓' if full and any(k.startswith('spk_encoder.') for k in full) else '✗'}")
+    return has_teacher
+
 # ==============================================================================
 # 3. PIPELINE DỮ LIỆU ÂM THANH THẬT STREAMING (GOOGLE FLEURS VI -> EN)
 # ==============================================================================
 
 class RealStreamingSpeechPipeline:
     """Nạp dữ liệu âm thanh thật trực tuyến Vi-En với căn chỉnh song song bằng trường 'id' (FLoRes)."""
-    def __init__(self, split='train', max_sec=12.0, src_lang='vi_vn', tgt_lang='en_us'):
+    def __init__(self, split='train', max_sec=12.0, src_lang='vi_vn', tgt_lang='en_us',
+                 allow_synthetic=False, max_pairs=None):
         self.split = split
         self.max_sec = max_sec
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
         self.is_online = False
+        self.allow_synthetic = allow_synthetic
+        self.max_pairs = max_pairs
         self._parallel_pairs = []
         self._pair_index = 0
+        self.last_src_lengths = []   # độ dài thật (mẫu 16kHz) từng câu nguồn trong batch gần nhất
+        self.last_tgt_lengths = []   # độ dài thật (mẫu 16kHz) từng câu đích trong batch gần nhất
 
         try:
             import soundfile
@@ -592,8 +638,10 @@ class RealStreamingSpeechPipeline:
             print("✓ Kết nối dữ liệu thật thành công qua Streaming!")
             self._build_parallel_pairs()
         except Exception as e:
-            print(f"[Data Warning] Không thể stream online ({e}). Kích hoạt bộ tạo tín hiệu mô phỏng chuẩn xác.")
             self.is_online = False
+            if not self.allow_synthetic:
+                raise RuntimeError(f"Không stream được FLEURS ({e}) — dừng để tránh chạy trên dữ liệu giả lập.")
+            print(f"[Data Warning] Không thể stream online ({e}). Dùng tín hiệu mô phỏng (chỉ cho smoke-test).")
 
     def _build_parallel_pairs(self):
         """Buffer các mục của ngôn ngữ đích theo 'id', rồi match từng mục của ngôn ngữ nguồn."""
@@ -602,6 +650,10 @@ class RealStreamingSpeechPipeline:
         count_tgt = 0
         limit_tgt = 800 if self.split == 'train' else 600
         limit_pairs = 600 if self.split == 'train' else 400
+        if self.max_pairs:
+            # Cho phép dùng nhiều dữ liệu train hơn (FLEURS train có vài nghìn cặp)
+            limit_pairs = int(self.max_pairs)
+            limit_tgt = max(limit_tgt, int(self.max_pairs))
 
         for item in self.ds_tgt:
             fid = item.get('id')
@@ -635,8 +687,10 @@ class RealStreamingSpeechPipeline:
                 print(f"      🇬🇧 En (Đích) : \"{tgt_txt}\"")
             print("-" * 65 + "\n")
         else:
-            print("[Cảnh báo] Không tìm được cặp song song nào! Kiểm tra trường 'id' trong dataset.")
             self.is_online = False
+            if not self.allow_synthetic:
+                raise RuntimeError("Không tìm được cặp song song nào trong FLEURS (trường 'id').")
+            print("[Cảnh báo] Không tìm được cặp song song nào! Kiểm tra trường 'id' trong dataset.")
 
     def reset(self):
         self._pair_index = 0
@@ -676,22 +730,28 @@ class RealStreamingSpeechPipeline:
         src_transcripts = []  # Source transcripts (Vietnamese)
 
         if self.is_online and self._parallel_pairs:
-            for _ in range(batch_size):
+            n_errors = 0
+            while len(src_waves) < batch_size:
+                if self._pair_index >= len(self._parallel_pairs):
+                    self._pair_index = 0
+                item_src, item_tgt = self._parallel_pairs[self._pair_index]
+                self._pair_index += 1
                 try:
-                    if self._pair_index >= len(self._parallel_pairs):
-                        self._pair_index = 0
-                    item_src, item_tgt = self._parallel_pairs[self._pair_index]
-                    self._pair_index += 1
                     w_src = self._extract_audio_tensor(item_src['audio'])
                     w_tgt = self._extract_audio_tensor(item_tgt['audio'])
-                    src_waves.append(w_src)
-                    tgt_waves.append(w_tgt)
-                    transcripts.append(item_tgt.get('transcription', 'hello world'))
-                    src_transcripts.append(item_src.get('transcription', 'xin chào'))
                 except Exception as ex:
-                    self._pair_index += 1
+                    # Cặp lỗi giải mã -> bỏ qua, lấy cặp kế tiếp (KHÔNG bịa dữ liệu giả)
+                    n_errors += 1
+                    if n_errors > 50:
+                        raise RuntimeError(f"Quá nhiều cặp lỗi giải mã liên tiếp ({ex})")
                     continue
+                src_waves.append(w_src)
+                tgt_waves.append(w_tgt)
+                transcripts.append(item_tgt.get('transcription', ''))
+                src_transcripts.append(item_src.get('transcription', ''))
 
+        if len(src_waves) < batch_size and not self.allow_synthetic:
+            raise RuntimeError("Thiếu dữ liệu thật và không cho phép dữ liệu mô phỏng.")
         while len(src_waves) < batch_size:
             t_sec = torch.linspace(0, self.max_sec, int(16000 * self.max_sec))
             f0_vi = 160.0 + 40.0 * torch.sin(2 * math.pi * 2.0 * t_sec)
@@ -701,6 +761,8 @@ class RealStreamingSpeechPipeline:
             transcripts.append("synthetic english translation")
             src_transcripts.append("âm thanh mô phỏng tiếng việt")
 
+        self.last_src_lengths = [int(w.shape[-1]) for w in src_waves]
+        self.last_tgt_lengths = [int(w.shape[-1]) for w in tgt_waves]
         max_src_len = max(w.shape[-1] for w in src_waves)
         max_tgt_len = max(w.shape[-1] for w in tgt_waves)
         pad_src = torch.stack([F.pad(w, (0, max_src_len - w.shape[-1])) for w in src_waves])
@@ -724,8 +786,10 @@ def main():
     parser.add_argument("--overfit-16", action="store_true",
                         help="Sanity Check #3: Huấn luyện overfit 500 bước trên 16 cặp câu Vi-En và xuất audio")
     parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth")
+    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm_en-best.pth")
     parser.add_argument("--no-freeze-cfm", action="store_true")
+    parser.add_argument("--allow-legacy-cfm", action="store_true",
+                        help="Cho phép nạp CFM không có stage1_meta (KHÔNG khuyến nghị: dễ nạp nhầm bản En->Vi cũ)")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
@@ -771,39 +835,27 @@ def main():
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
-    # Nạp Pretrained CFM nếu có
+    # Nạp Stage 1 (CFM decoder + cond_proj teacher + spk_encoder)
     found_cfm = None
-    cfm_candidates = [
-        args.cfm_ckpt,
-        "checkpoints/cfm_en-best.pth",
-        "checkpoints/cfm_en-last.pth",
-        "checkpoints/cfm-best.pth",
-        "checkpoints/cfm-last.pth",
-        "checkpoints/stage1_cfm_en-best.pth",
-        "checkpoints/stage1_cfm_en-last.pth",
-    ]
-    for cp in cfm_candidates:
+    for cp in [args.cfm_ckpt, "checkpoints/cfm_en-best.pth", "checkpoints/cfm_en-last.pth"]:
         if cp and os.path.exists(cp):
             found_cfm = cp
             break
-
+    has_teacher = False
     if found_cfm:
-        print(f"⏳ Đang nạp weights Pretrained CFM từ: {found_cfm}...")
-        ckpt_cfm = torch.load(found_cfm, map_location=device)
-        st = ckpt_cfm["model_state_dict"] if "model_state_dict" in ckpt_cfm else ckpt_cfm
-        dec_st = {}
-        for k, v in st.items():
-            if k.startswith("decoder."):
-                dec_st[k[len("decoder."):]] = v
-            elif not any(k.startswith(p) for p in ["bridge.", "spk_encoder.", "cond_proj."]):
-                dec_st[k] = v
-        model.decoder.load_state_dict(dec_st if dec_st else st, strict=False)
-        print("✓ Nạp weights Pretrained CFM thành công!")
+        has_teacher = load_stage1_into(model, found_cfm, device, allow_legacy=args.allow_legacy_cfm)
+        model.to(device=device, dtype=dtype)
     else:
-        print(f"[Cảnh báo] Không tìm thấy CFM checkpoint! CFM sẽ dùng weights ngẫu nhiên.")
+        print("[Cảnh báo] Không tìm thấy CFM Stage 1 (checkpoints/cfm_en-best.pth)! CFM sẽ dùng weights ngẫu nhiên.")
+        if not (args.overfit_16 or args.sanity_check or args.smoke_test):
+            raise RuntimeError("Train Stage 2 cần CFM Stage 1 đã train. Chạy: bash run.sh restore cfm_en  (hoặc start cfm_en).")
+
+    if not has_teacher and float(loss_weights.get("cond_weight", 0)) > 0:
+        print("⚠️ Không có cond_proj Stage 1 -> TẮT loss chưng cất L_cond (cond_weight = 0).")
+        loss_weights = dict(loss_weights, cond_weight=0.0)
 
     should_freeze_cfm = not args.no_freeze_cfm
-    if args.overfit_16 and not found_cfm:
+    if (args.overfit_16 or args.sanity_check) and not found_cfm:
         should_freeze_cfm = False
         print("💡 [Overfit Mode] Chưa có CFM pre-trained -> Mở toàn bộ trọng số (không freeze CFM) để End-to-End Bridge+CFM cùng overfit 16 câu!")
 
@@ -811,6 +863,15 @@ def main():
         for p in model.decoder.parameters():
             p.requires_grad = False
         print("🔒 Đã ĐÓNG BĂNG (FREEZE) CFM Decoder. Toàn bộ áp lực học tập trung 100% vào CrossAttentionBridge!")
+    # Teacher cond_proj luôn đóng băng; spk_encoder đóng băng khi đã có từ Stage 1
+    for p in model.teacher_cond_proj.parameters():
+        p.requires_grad = False
+    if has_teacher:
+        for p in model.spk_encoder.parameters():
+            p.requires_grad = False
+        print("🔒 Đóng băng spk_encoder Stage 1 | Train: speaker = audio ĐÍCH (En) | Suy luận: speaker = giọng NGUỒN (Vi)")
+    print(f"ℹ️ Loss: {loss_weights.get('cfm_weight', 1.0)}·CFM + {loss_weights.get('dur_weight', 0.1)}·Dur "
+          f"+ {loss_weights.get('cond_weight', 0.0)}·L1(Bridge, c*)")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_trainable = sum(p.numel() for p in trainable_params)
@@ -824,17 +885,38 @@ def main():
         betas=(0.9, 0.98)
     )
 
+    def featurize(src_16k, tgt_16k, src_lens, tgt_lens):
+        """-> (latent Vi, Mel En đích, mask, dur_ratio từng câu, c* hoặc None, speaker của audio ĐÍCH hoặc None)."""
+        if feat_extractor is not None and whisper_enc is not None:
+            s_lat = encode_whisper(src_16k, feat_extractor, whisper_enc, device, dtype)
+        else:
+            s_lat = torch.randn(src_16k.shape[0], 100, 768, device=device, dtype=dtype)
+        t24 = resample_16k_to_24k(tgt_16k.to(device=device, dtype=torch.float32))
+        t_mel = extract_100_mel(t24, mel_fb).to(dtype=dtype)
+        m_lens = mel_lengths(tgt_lens)
+        mask = length_mask(m_lens, t_mel.shape[-1], device)
+        # Tỉ lệ thời lượng THẬT của từng câu: frame Mel đích / frame latent nguồn
+        l_lens = latent_lengths(src_lens)
+        d_ratio = torch.tensor([m / max(1, l) for m, l in zip(m_lens, l_lens)], device=device, dtype=dtype)
+        c_star, spk_tgt = None, None
+        if has_teacher and feat_extractor is not None and whisper_enc is not None:
+            t_lat = encode_whisper(tgt_16k, feat_extractor, whisper_enc, device, dtype)
+            with torch.no_grad():
+                c_star = model.teacher_condition(t_lat, t_mel.shape[-1])
+                spk_tgt = model.spk_encoder(t_lat)
+        return s_lat, t_mel, mask, d_ratio, c_star, spk_tgt
+
     start_epoch = 0
     global_step = 0
     best_loss = float("inf")
+    history = []
 
     ckpt_path = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(paths["checkpoint_dir"], "model-last.pth")
-
     if args.resume and os.path.exists(ckpt_path):
         print(f"[Resume] Đang khôi phục checkpoint từ: {ckpt_path}...")
         ckpt = torch.load(ckpt_path, map_location=device)
+        if "stage2_meta" not in ckpt:
+            raise RuntimeError(f"{ckpt_path} không có stage2_meta (bản cũ?) — không resume. Dùng 'bash run.sh start {args.exp_name} --fresh'.")
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         if "optimizer_state_dict" in ckpt:
             try:
@@ -844,13 +926,17 @@ def main():
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
+        history = ckpt.get("history", [])
         print(f"✓ [Resume] Đã nạp thành công từ Epoch {start_epoch - 1}, Step {global_step}!")
 
     # 3. Pipeline Dữ liệu
     max_sec = cfg["data"].get("max_audio_sec", 12.0)
     src_l = cfg["data"].get("src_lang", "vi_vn")
     tgt_l = cfg["data"].get("tgt_lang", "en_us")
-    data_pipeline = RealStreamingSpeechPipeline(split='train', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l)
+    data_pipeline = RealStreamingSpeechPipeline(
+        split='train', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l,
+        allow_synthetic=args.smoke_test,
+        max_pairs=None if (args.overfit_16 or args.sanity_check or args.smoke_test) else train_cfg.get("max_train_pairs", 4000))
 
     # 4. Chế độ Sanity Check & Overfit 16 mẫu
     if args.sanity_check or args.overfit_16:
@@ -863,43 +949,29 @@ def main():
         print("=" * 75)
         model.train()
         fix_src, fix_tgt, fix_en_texts, fix_vi_texts = data_pipeline.fetch_batch(batch_size=num_samples)
-
-        if feat_extractor is not None and whisper_enc is not None:
-            in_proc = feat_extractor(list(fix_src.numpy()), sampling_rate=16000, return_tensors='pt', padding="max_length")
-            f = in_proc.input_features.to(device=device, dtype=dtype)
-            if f.shape[-1] < 3000: f = F.pad(f, (0, 3000 - f.shape[-1]))
-            elif f.shape[-1] > 3000: f = f[:, :, :3000]
-            with torch.no_grad():
-                fl = whisper_enc(f).last_hidden_state
-            real_l = max(10, min(1500, int(fix_src.shape[-1] / 320)))
-            s_lat = fl[:, :real_l, :]
-            print(f"✓ Đã trích xuất đặc trưng tiếng Việt từ PhoWhisper ({whisper_id}) [Shape: {list(s_lat.shape)}]")
-        else:
-            print("⚠️ CẢNH BÁO: PhoWhisper Encoder không tải được, đang dùng latents ngẫu nhiên!")
-            s_lat = torch.randn(num_samples, 100, 768, device=device, dtype=dtype)
-
-        tgt_24 = resample_16k_to_24k(fix_tgt.to(device=device, dtype=torch.float32))
-        tgt_m = extract_100_mel(tgt_24, mel_fb).to(dtype=dtype)
-        d_ratio = torch.tensor([float(tgt_m.shape[-1]) / float(s_lat.shape[1])] * num_samples, device=device, dtype=dtype)
+        s_lat, tgt_m, fix_mask, d_ratio, c_star, spk_tgt = featurize(
+            fix_src, fix_tgt, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths)
+        print(f"✓ Latent tiếng Việt [Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps, eta_min=1e-5)
         initial_loss = None
         final_loss = None
         t_start = time.time()
-        for s in range(num_steps):
+        for st in range(num_steps):
             optimizer.zero_grad()
-            l_tot, cfm_l, d_l = model.compute_loss(
-                s_lat, tgt_m, target_dur_ratio=d_ratio, loss_weights=loss_weights
-            )
+            l_tot, cfm_l, d_l, c_l = model.compute_loss(
+                s_lat, tgt_m, speaker_emb=spk_tgt, target_dur_ratio=d_ratio, loss_weights=loss_weights,
+                mel_mask=fix_mask, cond_target=c_star)
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
-            if s == 0: initial_loss = l_tot.item()
+            if st == 0: initial_loss = l_tot.item()
             log_interval = 50 if is_deep else 10
-            if (s + 1) % log_interval == 0 or s == 0:
-                print(f"   [Overfit Step {s+1:03d}/{num_steps}] Total Loss: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} | Dur: {d_l.item():.4f}")
+            if (st + 1) % log_interval == 0 or st == 0:
+                print(f"   [Overfit Step {st+1:03d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
+                      f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f}")
             final_loss = l_tot.item()
 
         print("-" * 75)
@@ -907,6 +979,22 @@ def main():
             print(f"✅ OVERFIT PASS! Loss giảm từ {initial_loss:.4f} xuống {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%) trong {time.time()-t_start:.1f}s.")
         else:
             print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
+
+        # Kiểm tra CFM có THẬT SỰ dùng điều kiện c không: thay c bằng 0 -> loss CFM phải tăng rõ
+        with torch.no_grad():
+            g = torch.Generator(device="cpu").manual_seed(0)
+            tt = torch.rand(num_samples, generator=g).to(device=device, dtype=dtype)
+            x0 = torch.randn(tgt_m.shape, generator=g).to(device=device, dtype=dtype)
+            lat, _ = model.bridge(s_lat, target_len=tgt_m.shape[-1])
+            spk = spk_tgt if spk_tgt is not None else model.spk_encoder(s_lat)
+            xt = (1 - tt.view(-1, 1, 1)) * x0 + tt.view(-1, 1, 1) * tgt_m
+            ut = tgt_m - x0
+            l_with = masked_mse(model.decoder(xt, tt, lat.transpose(1, 2), spk, mask=fix_mask), ut, fix_mask).item()
+            l_zero = masked_mse(model.decoder(xt, tt, torch.zeros_like(lat.transpose(1, 2)), spk, mask=fix_mask), ut, fix_mask).item()
+        ratio = l_zero / max(1e-8, l_with)
+        print(f"🔎 Kiểm tra dùng điều kiện: CFM loss với c của Bridge = {l_with:.4f} | với c = 0: {l_zero:.4f} (gấp {ratio:.2f} lần)")
+        print("   " + ("✓ CFM phụ thuộc rõ vào c -> Bridge học là thật." if ratio > 1.5 else
+                      "⚠️ CFM gần như KHÔNG dùng c -> loss giảm có thể do CFM tự thuộc lòng, Bridge chưa chắc học được."))
 
         # Nếu là Overfit sâu 800 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
         if is_deep:
@@ -916,6 +1004,7 @@ def main():
             os.makedirs(legacy_dir, exist_ok=True)
             try:
                 vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
+                # Suy luận đúng như lúc dùng thật: speaker = giọng NGUỒN, độ dài = DurationPredictor
                 gen_mels = model.inference(s_lat, num_steps=32)
                 gen_mels_oracle = model.inference(s_lat, target_len=tgt_m.shape[-1], num_steps=32)
                 with torch.no_grad():
@@ -924,20 +1013,14 @@ def main():
                         pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
                         pred_oracle_wav = vocos.decode(gen_mels_oracle[idx:idx+1].float()).squeeze().cpu()
                         vocos_upper_wav = vocos.decode(tgt_m[idx:idx+1].float()).squeeze().cpu()
-                        gt_wav = tgt_24[idx].cpu()
+                        gt_wav = resample_16k_to_24k(fix_tgt[idx:idx+1].float()).squeeze().cpu()
                         src_wav_16k = fix_src[idx].cpu()
 
-                        out_src = os.path.join(out_dir, f"sample_{idx:02d}_vi_input.wav")
-                        out_pred = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred.wav")
-                        out_oracle = os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred_oracle.wav")
-                        out_mel = os.path.join(out_dir, f"sample_{idx:02d}_en_mel_vocos.wav")
-                        out_gt = os.path.join(out_dir, f"sample_{idx:02d}_en_groundtruth.wav")
-
-                        save_wav_file(out_src, src_wav_16k, 16000)
-                        save_wav_file(out_pred, pred_wav, 24000)
-                        save_wav_file(out_oracle, pred_oracle_wav, 24000)
-                        save_wav_file(out_mel, vocos_upper_wav, 24000)
-                        save_wav_file(out_gt, gt_wav, 24000)
+                        save_wav_file(os.path.join(out_dir, f"sample_{idx:02d}_vi_input.wav"), src_wav_16k, 16000)
+                        save_wav_file(os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred.wav"), pred_wav, 24000)
+                        save_wav_file(os.path.join(out_dir, f"sample_{idx:02d}_vi_to_en_pred_oracle.wav"), pred_oracle_wav, 24000)
+                        save_wav_file(os.path.join(out_dir, f"sample_{idx:02d}_en_mel_vocos.wav"), vocos_upper_wav, 24000)
+                        save_wav_file(os.path.join(out_dir, f"sample_{idx:02d}_en_groundtruth.wav"), gt_wav, 24000)
 
                         if idx == 0:
                             save_wav_file(os.path.join(legacy_dir, "bridge_vi_en_overfit16_sample0.wav"), pred_wav, 24000)
@@ -946,13 +1029,17 @@ def main():
                         en_p = fix_en_texts[idx][:35] + "..." if len(fix_en_texts[idx]) > 35 else fix_en_texts[idx]
                         print(f"   [Cặp #{idx:02d}/16] Vi: \"{vi_p}\" -> En: \"{en_p}\"")
                 print("-" * 75)
-                print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH DỊCH VI -> EN (INPUT, PRED, MEL_VOCOS & GT) TẠI:")
+                print(f"✓ ĐÃ XUẤT TRỌN BỘ 16 MẪU ÂM THANH DỊCH VI -> EN (INPUT, PRED, PRED_ORACLE, MEL_VOCOS & GT) TẠI:")
                 print(f"  👉 Thư mục: {out_dir}/")
             except Exception as e:
                 print(f"[Vocos Info] Chưa xuất được audio: {e}")
 
         print("=" * 75 + "\n")
         return
+
+    if feat_extractor is None or whisper_enc is None:
+        if not args.smoke_test:
+            raise RuntimeError("Không nạp được Whisper encoder — dừng để tránh train trên latent ngẫu nhiên.")
 
     epochs = 1 if args.smoke_test else train_cfg["epochs"]
     batch_size = train_cfg["batch_size"]
@@ -970,6 +1057,27 @@ def main():
         return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    for _ in range(global_step):     # resume: đưa LR về đúng vị trí
+        scheduler.step()
+
+    # ---- Tập validation CỐ ĐỊNH (FLEURS validation, cùng t / x0 mỗi epoch) -> chọn best khách quan ----
+    val_pairs = 4 if args.smoke_test else int(train_cfg.get("val_pairs", 16))
+    val_pipeline = RealStreamingSpeechPipeline(split='validation', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l,
+                                               allow_synthetic=args.smoke_test)
+    val_set = []
+    g = torch.Generator(device="cpu").manual_seed(1234)
+    for _ in range((val_pairs + batch_size - 1) // batch_size):
+        v_src, v_tgt, v_en, _ = val_pipeline.fetch_batch(batch_size=batch_size)
+        feats = featurize(v_src, v_tgt, val_pipeline.last_src_lengths, val_pipeline.last_tgt_lengths)
+        tt = torch.rand(v_src.shape[0], generator=g)
+        x0 = torch.randn(feats[1].shape, generator=g)
+        val_set.append((v_src, list(val_pipeline.last_src_lengths), v_en, feats, tt, x0))
+    print(f"✓ Tập validation cố định: {sum(v[0].shape[0] for v in val_set)} cặp (FLEURS validation, seed 1234)")
+
+    eval_bleu_every = int(train_cfg.get("eval_asr_every", 5))
+    en_asr = EnglishASR(device)
+    vocos_eval = None
+    sync_enabled = bool(train_cfg.get("sync_drive", True)) and not args.smoke_test
 
     print(f"\n[Training Config] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch (~{num_pairs} câu) | Batch: {batch_size}")
     print(f"   → Tổng cộng: {total_train_steps} Steps | Warmup: {warmup_steps} Steps | LR Scheduler: Cosine Warmup")
@@ -982,40 +1090,13 @@ def main():
 
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
-
             src_audio_16k, tgt_audio_16k, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=batch_size)
+            src_latents, tgt_mel, mel_mask, dur_ratio, c_star, spk_tgt = featurize(
+                src_audio_16k, tgt_audio_16k, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths)
 
-            # Trích xuất Whisper Latents từ audio tiếng Việt nguồn
-            if feat_extractor is not None and whisper_enc is not None:
-                in_proc = feat_extractor(
-                    src_audio_16k.numpy(),
-                    sampling_rate=16000,
-                    return_tensors='pt',
-                    padding="max_length"
-                )
-                feats = in_proc.input_features.to(device=device, dtype=dtype)
-                if feats.shape[-1] < 3000:
-                    feats = F.pad(feats, (0, 3000 - feats.shape[-1]))
-                elif feats.shape[-1] > 3000:
-                    feats = feats[:, :, :3000]
-
-                with torch.no_grad():
-                    full_latents = whisper_enc(feats).last_hidden_state
-
-                real_len = max(10, int(src_audio_16k.shape[-1] / 320))
-                src_latents = full_latents[:, :real_len, :]
-            else:
-                src_latents = torch.randn(batch_size, 100, 768, device=device, dtype=dtype)
-
-            # Chuyển đổi audio tiếng Anh sang 24kHz và trích xuất 100-Mel đích
-            tgt_24k = resample_16k_to_24k(tgt_audio_16k.to(device=device, dtype=torch.float32))
-            tgt_mel = extract_100_mel(tgt_24k, mel_fb).to(dtype=dtype)
-
-            dur_ratio = torch.tensor([float(tgt_mel.shape[-1]) / float(src_latents.shape[1])] * batch_size,
-                                     device=device, dtype=dtype)
-
-            total_loss, cfm_l, dur_l = model.compute_loss(
-                src_latents, tgt_mel, target_dur_ratio=dur_ratio, loss_weights=loss_weights
+            total_loss, cfm_l, dur_l, cond_l = model.compute_loss(
+                src_latents, tgt_mel, speaker_emb=spk_tgt, target_dur_ratio=dur_ratio,
+                loss_weights=loss_weights, mel_mask=mel_mask, cond_target=c_star
             )
 
             total_loss.backward()
@@ -1028,30 +1109,83 @@ def main():
 
             if global_step % 10 == 0 or args.smoke_test:
                 cur_lr = scheduler.get_last_lr()[0]
-                print(f"   [E{epoch:02d}|Step {global_step:04d}] Total Loss: {total_loss.item():.4f} | "
-                      f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | LR: {cur_lr:.2e}")
+                print(f"   [E{epoch:02d}|Step {global_step:04d}] Total: {total_loss.item():.4f} | "
+                      f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | Cond: {cond_l.item():.4f} | LR: {cur_lr:.2e}")
 
         avg_loss = epoch_loss / max(1, steps_per_epoch)
         elapsed = time.time() - t0
-        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Loss: {avg_loss:.4f} | Best Loss: {min(best_loss, avg_loss):.4f}")
+        print(f"==> Hoàn tất Epoch {epoch:02d} trong {elapsed:.1f}s | Avg Train Loss: {avg_loss:.4f}")
 
         data_pipeline.shuffle()
 
-        # Lưu Checkpoint Last & Best
+        # Validation cố định
+        model.eval()
+        v_tot = v_cfm = v_dur = v_cond = 0.0
+        with torch.no_grad():
+            for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk), tt, x0 in val_set:
+                lt, lc, ld, lco = model.compute_loss(
+                    s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
+                    mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype))
+                v_tot += lt.item(); v_cfm += lc.item(); v_dur += ld.item(); v_cond += lco.item()
+        nv = max(1, len(val_set))
+        val_loss = v_tot / nv
+        print(f"   Val (cố định): Total {val_loss:.4f} | CFM {v_cfm/nv:.4f} | Dur {v_dur/nv:.4f} | Cond {v_cond/nv:.4f} "
+              f"| Best: {min(best_loss, val_loss):.4f}")
+
+        # ASR-BLEU nhanh trên tập val (suy luận như thật: độ dài dự đoán + giọng nguồn)
+        val_bleu = None
+        if not args.smoke_test and eval_bleu_every > 0 and ((epoch + 1) % eval_bleu_every == 0 or epoch == epochs - 1):
+            try:
+                if vocos_eval is None:
+                    vocos_eval = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
+                    vocos_eval.eval()
+                hyps, refs = [], []
+                for v_src, v_lens, v_en, (s_lat, *_), _, _ in val_set:
+                    for i in range(v_src.shape[0]):
+                        li = latent_lengths([v_lens[i]])[0]
+                        mel = model.inference(s_lat[i:i + 1, :max(10, li)], num_steps=32)
+                        with torch.no_grad():
+                            w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
+                        hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
+                        refs.append(v_en[i])
+                try:
+                    import sacrebleu
+                    from train_utils import normalize_en
+                    val_bleu = sacrebleu.corpus_bleu([normalize_en(h) for h in hyps], [[normalize_en(r) for r in refs]]).score
+                except Exception:
+                    val_bleu = None
+                wer = corpus_wer(hyps, refs)
+                print(f"   🎧 Val ASR-BLEU: {val_bleu if val_bleu is not None else float('nan'):.2f} | WER: {wer:.1f}%")
+                for h, r in list(zip(hyps, refs))[:2]:
+                    print(f"      • ref : {r[:70]}\n        pred: {h[:70]}")
+            except Exception as e:
+                print(f"   [Val ASR] Không đo được: {e}")
+        history.append({"epoch": epoch, "train": avg_loss, "val": val_loss, "val_cond": v_cond / nv,
+                        "val_cfm": v_cfm / nv, "val_bleu": val_bleu})
+
+        # Lưu Checkpoint Last & Best (best theo VAL cố định, không theo train loss)
         os.makedirs(paths["checkpoint_dir"], exist_ok=True)
         ckpt_data = {
             "epoch": epoch,
             "step": global_step,
-            "best_loss": min(best_loss, avg_loss),
+            "best_loss": min(best_loss, val_loss),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+            "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
+                            "loss_weights": loss_weights, "version": 2},
             "config": cfg,
         }
-        torch.save(ckpt_data, os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth"))
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(ckpt_data, os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth"))
-            print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best Loss: {best_loss:.4f}")
+        last_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
+        torch.save(ckpt_data, last_p)
+        synced = [last_p]
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
+            torch.save(ckpt_data, best_p)
+            synced.append(best_p)
+            print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best (val): {best_loss:.4f}")
+        sync_to_drive(synced, args.exp_name, enabled=sync_enabled)
 
     print("\n🎉 HUẤN LUYỆN CROSS-ATTENTION BRIDGE (VI -> EN) HOÀN TẤT THÀNH CÔNG!")
 

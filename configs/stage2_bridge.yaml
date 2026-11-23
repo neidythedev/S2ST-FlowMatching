@@ -18,9 +18,10 @@ model:
 loss_weights:
   cfm_weight: 1.0
   dur_weight: 0.1
+  cond_weight: 1.0        # L1(Bridge, c*) — c* = cond_proj Stage 1 trên audio TIẾNG ANH đích (chưng cất)
 
 training:
-  batch_size: 4
+  batch_size: 8
   gradient_accumulation_steps: 2
   learning_rate: 2.0e-4
   min_lr: 1.0e-5
@@ -31,6 +32,10 @@ training:
   bf16: true
   save_interval_steps: 250
   log_interval_steps: 20
+  val_pairs: 16           # tập validation CỐ ĐỊNH (FLEURS validation) để chọn best
+  eval_asr_every: 5       # mỗi 5 epoch: ASR-BLEU nhanh trên tập val
+  max_train_pairs: 4000   # dùng toàn bộ cặp FLEURS train (trước chỉ 600)
+  sync_drive: true
 
 data:
   dataset_name: "google/fleurs"

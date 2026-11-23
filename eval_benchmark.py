@@ -307,7 +307,7 @@ except ImportError as e:
 
 # Import module hệ thống từ train_bridge.py
 from train_bridge import (
-    ViEnS2STSystem, EnViS2STSystem, CrossAttentionBridge, ToneAwareBridge,
+    ViEnS2STSystem, EnViS2STSystem, CrossAttentionBridge, ToneAwareBridge, load_stage1_into,
     RealStreamingSpeechPipeline, build_mel_filterbank, extract_100_mel,
     resample_16k_to_24k, resample_24k_to_16k
 )
@@ -708,8 +708,12 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         if os.path.exists(args.bridge_ckpt):
             print(f"⏳ Đang nạp weights cho Bridge từ: {args.bridge_ckpt}...")
             ckpt = torch.load(args.bridge_ckpt, map_location=device)
-            state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-            model.load_state_dict(state_dict, strict=False)
+            if "stage2_meta" not in ckpt:
+                raise RuntimeError(f"{args.bridge_ckpt} không có stage2_meta (bản cũ En->Vi?) — train lại Stage 2.")
+            state_dict = ckpt["model_state_dict"]
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print(f"  ⚠️ Khóa thiếu: {len(missing)} | khóa thừa: {len(unexpected)}")
             print("✓ Nạp weights Bridge thành công!")
         else:
             print(f"[Cảnh báo] Không tìm thấy {args.bridge_ckpt}! Sử dụng weights ngẫu nhiên.")
@@ -718,11 +722,12 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
     if case_num in [2, 4]:
         if args.cfm_ckpt and os.path.exists(args.cfm_ckpt):
-            print(f"⏳ Đang nạp weights cho CFM từ: {args.cfm_ckpt}...")
-            ckpt = torch.load(args.cfm_ckpt, map_location=device)
-            state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-            model.decoder.load_state_dict(state_dict, strict=False)
-            print("✓ Nạp weights CFM thành công!")
+            print(f"⏳ Đang nạp CFM Stage 1 từ: {args.cfm_ckpt}...")
+            # strict=True + kiểm tra stage1_meta: không còn nạp "im lặng" sai kiến trúc / nhầm bản En->Vi
+            load_stage1_into(model, args.cfm_ckpt, device)
+            model.to(device=device, dtype=dtype)
+        else:
+            print(f"[Cảnh báo] Không tìm thấy {args.cfm_ckpt} -> CFM ngẫu nhiên.")
     else:
         print("ℹ️ Case yêu cầu CFM CHƯA TRAIN -> Khởi tạo trọng số ngẫu nhiên.")
 
@@ -2073,9 +2078,9 @@ def main():
                         help="Kịch bản thử nghiệm: '0' (MMS-TTS), '6'/'xtts' (XTTS-v2), '7'/'f5'/'f5tts' (F5-TTS), 'sota'/'both_tts' (Cả XTTS & F5-TTS), '5' (SeamlessM4T), '4' (Đề xuất), '1'-'3' (Ablation), hoặc 'all'")
     parser.add_argument("--split", type=str, default="test",
                         help="Tập dữ liệu kiểm thử Google FLEURS: 'test', 'validation', hoặc 'train'")
-    parser.add_argument("--bridge-ckpt", type=str, default="checkpoints/bridge-best.pth",
+    parser.add_argument("--bridge-ckpt", type=str, default="checkpoints/bridge_vien-best.pth",
                         help="Đường dẫn checkpoint của Bridge")
-    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm-best.pth",
+    parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm_en-best.pth",
                         help="Đường dẫn checkpoint của CFM")
     parser.add_argument("--num-samples", type=int, default=10,
                         help="Số lượng mẫu test để đánh giá")
@@ -2099,12 +2104,6 @@ def main():
                         help="Mô hình dịch máy (MT) cho 3-step & Case 0: 'vinai' (vinai/vinai-translate-vi2en-v2 SOTA), 'nllb' (facebook/nllb-200-distilled-600M), 'opus', hoặc 'auto' (ưu tiên VinAI -> NLLB)")
     args = parser.parse_args()
 
-    # Fallback checkpoint: run.sh lưu tên theo experiment (cfm_en-best.pth, bridge_vien-best.pth)
-    for attr, alt in [("cfm_ckpt", "checkpoints/cfm_en-best.pth"), ("bridge_ckpt", "checkpoints/bridge_vien-best.pth")]:
-        cur = getattr(args, attr)
-        if cur and not os.path.exists(cur) and os.path.exists(alt):
-            print(f"ℹ️ Không thấy {cur} -> dùng checkpoint {alt}")
-            setattr(args, attr, alt)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32

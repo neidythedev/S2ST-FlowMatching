@@ -19,7 +19,9 @@
    * Môi trường Molab chạy Python 3.13 / PyTorch 2.9+ gặp lỗi vỡ ABI C++ của `torchaudio` (`undefined symbol`).
    * Tất cả các file chạy (`eval_benchmark.py`, `train_bridge.py`, `train_cfm.py`, `sanity_and_eda_suite.py`) đều bắt buộc phải có đoạn **In-Memory Mock Torchaudio Shim** (`apply_torchaudio_mock_if_needed`).
    * Shim này cung cấp: `torchaudio.load`, `torchaudio.save`, `torchaudio.info` (qua `soundfile`), `MockSpectrogram`, `MockMelScale`, `MockMelSpectrogram` (tính qua `torch.stft`), và `torchaudio.functional.resample` (tính qua `torch.nn.functional.interpolate`).
-4. **Các thành phần đóng băng (Frozen Models):**
+4. **Decoder CFM dùng chung:** `FlowMatchingTargetDecoder` / `ResidualBlock1D` / `MaskedGroupNorm` chỉ được định nghĩa trong `train_utils.py` (Stage 1 và Stage 2 cùng import). Trước 23/11/2026 hai file định nghĩa lệch tên tham số nên Stage 2 không nạp được CFM — tuyệt đối không tách lại.
+5. **Checkpoint có meta:** Stage 1 lưu `stage1_meta` + `full_system_state_dict` (gồm `cond_proj`, `spk_encoder`); Stage 2 lưu `stage2_meta`. Checkpoint không có meta (bản En→Vi cũ 13/11) bị từ chối.
+6. **Các thành phần đóng băng (Frozen Models):**
    * `vinai/PhoWhisper-small` Encoder: **Đóng băng 100% (`requires_grad = False`)**.
    * `charactr/vocos-mel-24khz` Vocoder: **Đóng băng 100% (`eval()`)**.
    * `FlowMatchingTargetDecoder`: Được train ở Stage 1, sang Stage 2 **đóng băng 100%** làm Giám khảo âm học (Acoustic Critic).
@@ -55,8 +57,11 @@ $$\text{Vi Audio (16kHz)} \xrightarrow{\text{PhoWhisper Encoder}} H_{src} \xrigh
 * **Mục tiêu:** Dạy Bridge học cách dịch ngữ nghĩa sóng âm tiếng Việt sang biểu diễn điều kiện mà CFM tiếng Anh có thể phát âm được.
 * **Cơ chế gradient:** Đóng băng PhoWhisper và CFM Decoder. Gradient từ sai số âm thanh tiếng Anh $\mathcal{L}_{\text{CFM}}$ chạy xuyên qua CFM Decoder đóng băng (đóng vai trò **Differentiable Acoustic Critic**) truyền thẳng về cập nhật trọng số của Bridge!
 * **Hàm loss tổng:** 
-  $$\mathcal{L}_{\text{total}} = 1.0 \times \mathcal{L}_{\text{CFM}} + 0.1 \times \mathcal{L}_{\text{dur}}$$
-  * $\mathcal{L}_{\text{dur}} = \text{SmoothL1}(\text{dur\_scale}, \; \text{target\_dur\_ratio})$: Dự đoán độ dài câu đích.
+  $$\mathcal{L}_{\text{total}} = 1.0 \times \mathcal{L}_{\text{CFM}} + 0.1 \times \mathcal{L}_{\text{dur}} + 1.0 \times \mathcal{L}_{\text{cond}}$$
+  * $\mathcal{L}_{\text{dur}} = \text{SmoothL1}(\text{dur\_scale}, \; \text{target\_dur\_ratio})$: Dự đoán độ dài câu đích (tỉ lệ tính **theo từng câu**, không theo batch đệm).
+  * $\mathcal{L}_{\text{cond}} = \text{L1}(\text{Bridge}(H_{vi}), \; c^*)$ — **chưng cất**: $c^*$ = `cond_proj` của Stage 1 áp lên PhoWhisper(audio **tiếng Anh đích**), tức đúng điều kiện CFM Stage 1 đã quen. FLEURS có audio En song song nên Bridge có nhãn trực tiếp.
+  * **Speaker:** lúc train dùng embedding của audio **đích** (`spk_encoder` Stage 1, đóng băng); lúc suy luận dùng giọng **nguồn** → giữ giọng.
+  * Mọi loss có **mask phần đệm**; decoder dùng `MaskedGroupNorm` nên train (batch có đệm) và suy luận (1 câu) nhất quán.
 * **Lệnh:** `bash run.sh start bridge_vien` $\rightarrow$ Checkpoint lưu tại `checkpoints/bridge_vien-best.pth`.
 
 ---
@@ -132,7 +137,7 @@ Khi tiếp tục phiên làm việc, hãy ưu tiên các nhiệm vụ theo thứ
    * Chạy: `bash run.sh upload` để đẩy audio sinh ra lên GitHub kiểm tra chất lượng nghe thực tế của XTTS-v2 và F5-TTS.
 2. **Tiến hành Huấn luyện Stage 1 OT-CFM Tiếng Anh:**
    * Chạy: `bash run.sh start cfm_en`.
-   * Đợi model hội tụ (Validation loss $< 1.0$), copy checkpoint tốt nhất về `checkpoints/cfm-best.pth`.
+   * Theo dõi **WER tái tạo** (in mỗi 5 epoch, so với WER của audio gốc) thay vì ngưỡng val loss. Checkpoint `checkpoints/cfm_en-best.pth` — Stage 2 và eval tự tìm đúng tên này, KHÔNG cần copy.
 3. **Tiến hành Huấn luyện Stage 2 Cross-Attention Bridge:**
    * Chạy: `bash run.sh start bridge_vien`.
    * Mô hình sẽ tự nạp CFM checkpoint từ Stage 1, đóng băng CFM và chỉ train Bridge trên cặp câu FLEURS Vi $\rightarrow$ En.
