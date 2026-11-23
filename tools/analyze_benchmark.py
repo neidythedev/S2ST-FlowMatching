@@ -224,6 +224,7 @@ def analyze(runs, n_boot):
         dur_m, _ = mean_std([s.get("gen_duration") for s in samples])
         n_vi = sum(1 for s in samples if s.get("s2tt_not_translated"))
         n_fail = sum(1 for s in samples if s.get("tts_failed"))
+        n_mixed = sum(1 for s in samples if 0 < (s.get("s2tt_vi_word_ratio") or 0) < 0.5)
 
         row = {
             "tag": tag, "engine": engine, "mode": mode, "model": short, "n": n,
@@ -232,7 +233,7 @@ def analyze(runs, n_boot):
             "tts_loss": (s2tt_bleu - asr_bleu) if has_s2tt else float("nan"),
             "secs_mean": secs_m, "secs_std": secs_sd,
             "rtf_mean": rtf_m, "rtf_std": rtf_sd,
-            "dur_mean": dur_m, "not_translated": n_vi, "tts_failed": n_fail,
+            "dur_mean": dur_m, "not_translated": n_vi, "mixed_vi": n_mixed, "tts_failed": n_fail,
         }
         rows.append(row)
         cache[tag] = {
@@ -334,15 +335,15 @@ def write_report(rows, comparisons, mismatches, backend, out_dir, n_boot):
                  "Kết luận trong khóa luận nên dùng ≥ 100 mẫu.\n")
 
     L.append("\n## 1. Bảng tổng hợp\n")
-    L.append("| Engine | Chế độ | Model S2TT/ASR | n | S2TT-BLEU ↑ [CI 95%] | ASR-BLEU ↑ [CI 95%] | Mất do TTS | SECS ↑ (mean±sd) | RTF ↓ (mean±sd) | Câu không dịch | Lỗi TTS |")
-    L.append("| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    L.append("| Engine | Chế độ | Model S2TT/ASR | n | S2TT-BLEU ↑ [CI 95%] | ASR-BLEU ↑ [CI 95%] | Mất do TTS | SECS ↑ (mean±sd) | RTF ↓ (mean±sd) | Không dịch | Lẫn tiếng Việt | Lỗi TTS |")
+    L.append("| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     order = {"2step": 0, "3step": 1, "direct": 2}
     for r in sorted(rows, key=lambda r: (r["engine"], order.get(r["mode"], 9), r["model"])):
         L.append(f"| {r['engine']} | {r['mode']} | {r['model']} | {r['n']} | "
                  f"{fmt(r['s2tt_bleu'])} [{fmt(r['s2tt_lo'])}, {fmt(r['s2tt_hi'])}] | "
                  f"**{fmt(r['asr_bleu'])}** [{fmt(r['asr_lo'])}, {fmt(r['asr_hi'])}] | {fmt(r['tts_loss'])} | "
                  f"{fmt(r['secs_mean'], 3)} ± {fmt(r['secs_std'], 3)} | {fmt(r['rtf_mean'], 3)} ± {fmt(r['rtf_std'], 3)} | "
-                 f"{r['not_translated']}/{r['n']} | {r['tts_failed']}/{r['n']} |")
+                 f"{r['not_translated']}/{r['n']} | {r['mixed_vi']}/{r['n']} | {r['tts_failed']}/{r['n']} |")
 
     L.append("\n## 2. So sánh ghép cặp (B − A trên cùng các câu)\n")
     L.append("Δ > 0 nghĩa là B tốt hơn A (riêng RTF: Δ < 0 là B nhanh hơn). **Có ý nghĩa** khi CI 95% không chứa 0.\n")
@@ -395,7 +396,7 @@ def write_report(rows, comparisons, mismatches, backend, out_dir, n_boot):
     with open(os.path.join(out_dir, "analysis_report.md"), "w", encoding="utf-8") as f:
         f.write(report)
     keys = ["tag", "engine", "mode", "model", "n", "s2tt_bleu", "s2tt_lo", "s2tt_hi", "asr_bleu", "asr_lo", "asr_hi",
-            "tts_loss", "secs_mean", "secs_std", "rtf_mean", "rtf_std", "dur_mean", "not_translated", "tts_failed"]
+            "tts_loss", "secs_mean", "secs_std", "rtf_mean", "rtf_std", "dur_mean", "not_translated", "mixed_vi", "tts_failed"]
     with open(os.path.join(out_dir, "analysis_summary.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()

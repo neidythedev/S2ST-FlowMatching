@@ -730,7 +730,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
     results = []
     total_rtf = 0.0
     secs_list = []
-    total_mel_l1 = 0.0
+    mel_l1_list = []
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
 
@@ -782,7 +782,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         tgt_mel = extract_100_mel(tgt_24k, mel_fb).to(dtype=dtype)
         min_t = min(gen_mel.shape[-1], tgt_mel.shape[-1])
         mel_l1 = F.l1_loss(gen_mel[:, :, :min_t], tgt_mel[:, :, :min_t]).item()
-        total_mel_l1 += mel_l1
+        mel_l1_list.append(mel_l1)
 
         # Đo ASR-BLEU
         bleu = 0.0
@@ -826,7 +826,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = nanmean(secs_list)
-    avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
+    avg_mel_l1 = nanmean(mel_l1_list)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
     summary = {
@@ -894,7 +894,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
     results = []
     total_rtf = 0.0
     secs_list = []
-    total_mel_l1 = 0.0
+    mel_l1_list = []
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
     s2tt_hyps = []
@@ -967,7 +967,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         gen_mel = extract_100_mel(gen_wav_24k.unsqueeze(0).to(device=device, dtype=torch.float32), mel_fb).to(device)
         min_t = min(gen_mel.shape[-1], tgt_mel.shape[-1])
         mel_l1 = F.l1_loss(gen_mel[:, :, :min_t], tgt_mel[:, :, :min_t]).item()
-        total_mel_l1 += mel_l1
+        mel_l1_list.append(mel_l1)
 
         # Đo ASR-BLEU
         bleu = 0.0
@@ -1010,7 +1010,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = nanmean(secs_list)
-    avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
+    avg_mel_l1 = nanmean(mel_l1_list)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
     summary = {
@@ -1469,9 +1469,16 @@ def release_cuda_memory():
 
 _VI_DIACRITICS = re.compile(r"[ăâđêôơưàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ]", re.IGNORECASE)
 
+def vietnamese_word_ratio(text):
+    """Tỉ lệ từ có dấu tiếng Việt trong câu 'đã dịch' (0 = tiếng Anh thuần, 1 = toàn tiếng Việt)."""
+    words = re.findall(r"\w+", str(text or ""))
+    if not words:
+        return 0.0
+    return sum(1 for w in words if _VI_DIACRITICS.search(w)) / len(words)
+
 def looks_vietnamese(text):
-    """Phát hiện đầu ra 'dịch' thực chất vẫn là tiếng Việt (model không dịch được)."""
-    return len(_VI_DIACRITICS.findall(str(text or ""))) >= 2
+    """Đầu ra 'dịch' phần lớn vẫn là tiếng Việt (model không dịch được)."""
+    return vietnamese_word_ratio(text) >= 0.5
 
 def whisper_compression_ratio(text):
     """Tỉ lệ nén zlib của văn bản (tiêu chí phát hiện lặp/hallucination của Whisper gốc, ngưỡng 2.4)."""
@@ -1545,6 +1552,9 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
             gen_wav_np, _ = sf.read(temp_out_path)
             gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
             if gen_wav_24k.ndim > 1: gen_wav_24k = gen_wav_24k[0]
+            if not is_valid_audio(gen_wav_24k):
+                print(f"  ❌ XTTS-v2 sinh audio NaN/câm ở mẫu {idx+1} -> đánh dấu lỗi TTS")
+                return None
             return gen_wav_24k
         except Exception as e:
             print(f"  ⚠️ XTTS-v2 lỗi tại mẫu {idx+1}: {e}")
@@ -1576,6 +1586,14 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
                 ref_text=f5_ref_text,
                 gen_text=text,
             )
+            if not is_valid_audio(gen_wav_np):
+                # F5-TTS chạy fp16 trên GPU -> đôi khi tràn số sinh NaN (Whisper nghe ra "!!!!!").
+                # Chạy lại riêng mẫu này bằng fp32 rồi trả model về dtype cũ.
+                print(f"  ⚠️ F5-TTS sinh audio NaN/câm ở mẫu {idx+1} -> chạy lại bằng fp32")
+                gen_wav_np, sr = _f5_infer_fp32(tts_model, f5_ref_path, f5_ref_text, text)
+                if not is_valid_audio(gen_wav_np):
+                    print(f"  ❌ F5-TTS vẫn sinh audio hỏng ở mẫu {idx+1} (kể cả fp32) -> đánh dấu lỗi TTS")
+                    return None
             gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
             if gen_wav_24k.ndim > 1: gen_wav_24k = gen_wav_24k[0]
             if sr != 24000:
@@ -1591,6 +1609,32 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
                 except Exception: pass
 
     return torch.zeros(24000)
+
+def is_valid_audio(wav):
+    """Audio hợp lệ: không NaN/Inf, không câm, dài ≥ 0.3 giây (ở 24kHz)."""
+    if wav is None:
+        return False
+    w = torch.as_tensor(wav, dtype=torch.float32).reshape(-1)
+    if w.numel() < 7200 or not torch.isfinite(w).all():
+        return False
+    return float(w.abs().max()) > 1e-4
+
+def _f5_infer_fp32(tts_model, ref_path, ref_text, gen_text):
+    """Chạy F5-TTS 1 lần ở fp32 (chống NaN do fp16), sau đó trả model về dtype ban đầu."""
+    model = getattr(tts_model, "ema_model", None)
+    orig_dtype = None
+    try:
+        if model is not None:
+            orig_dtype = next(model.parameters()).dtype
+            model.float()
+        wav, sr, _ = tts_model.infer(ref_file=ref_path, ref_text=ref_text, gen_text=gen_text)
+        return wav, sr
+    except Exception as e:
+        print(f"  ⚠️ F5-TTS fp32 cũng lỗi: {e}")
+        return None, 24000
+    finally:
+        if model is not None and orig_dtype is not None:
+            model.to(orig_dtype)
 
 def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device, mel_fb, data_pipeline, en_asr_tools, s2tt_module, tts_model, write_canonical=False):
     s2tt_mode = variant["mode"]
@@ -1624,11 +1668,12 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
     results = []
     total_rtf = 0.0
     secs_list = []
-    total_mel_l1 = 0.0
+    mel_l1_list = []
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
     s2tt_hyps = []
     n_not_translated = 0
+    n_mixed_vi = 0
     n_tts_failed = 0
 
     for idx in range(args.num_samples):
@@ -1642,9 +1687,13 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
 
         # 1. Dịch Vi audio -> En text
         translated_en, transcribed_vi = translate_speech_vi2en(src_w, ref_vi_text, s2tt_mode, s2tt_module, device)
-        not_translated = looks_vietnamese(translated_en)
+        vi_ratio = vietnamese_word_ratio(translated_en)
+        not_translated = vi_ratio >= 0.5           # phần lớn vẫn là tiếng Việt -> không dịch
+        mixed_vi = 0.0 < vi_ratio < 0.5            # dịch được nhưng còn sót từ tiếng Việt
         if not_translated:
             n_not_translated += 1
+        if mixed_vi:
+            n_mixed_vi += 1
         # S2TT-BLEU: văn bản dịch (trước TTS) so với Target Ref -> tách lỗi dịch khỏi lỗi TTS
         s2tt_bleu = compute_sentence_bleu(translated_en, ref_en_text) if translated_en else 0.0
         s2tt_hyps.append(translated_en)
@@ -1684,8 +1733,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
         tgt_mel = extract_100_mel(tgt_24k, mel_fb).to(device)
         gen_mel = extract_100_mel(gen_wav_24k.unsqueeze(0).to(device=device, dtype=torch.float32), mel_fb).to(device)
         min_t = min(gen_mel.shape[-1], tgt_mel.shape[-1])
-        mel_l1 = F.l1_loss(gen_mel[:, :, :min_t], tgt_mel[:, :, :min_t]).item()
-        total_mel_l1 += mel_l1
+        mel_l1 = float("nan") if tts_failed else F.l1_loss(gen_mel[:, :, :min_t], tgt_mel[:, :, :min_t]).item()
+        mel_l1_list.append(mel_l1)
 
         # Đo ASR-BLEU
         bleu = 0.0
@@ -1719,6 +1768,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
             "asr_vi_text": transcribed_vi,
             "translated_en": translated_en,
             "s2tt_not_translated": bool(not_translated),
+            "s2tt_vi_word_ratio": round(vi_ratio, 3),
             "tts_failed": bool(tts_failed),
             "ref_en_text": ref_en_text,
             "asr_transcribed_en": asr_transcribed_en,
@@ -1735,7 +1785,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
             print(f"  🇻🇳 Input Vi     : {ref_vi_text}")
         if s2tt_mode == "3step":
             print(f"  🗣️ ASR Vi       : {transcribed_vi}")
-        print(f"  📖 S2TT English : {translated_en}" + ("   ⚠️ [VẪN LÀ TIẾNG VIỆT — model không dịch]" if not_translated else ""))
+        print(f"  📖 S2TT English : {translated_en}" + ("   ⚠️ [VẪN LÀ TIẾNG VIỆT — model không dịch]" if not_translated
+                                                       else ("   ⚠️ [lẫn từ tiếng Việt]" if mixed_vi else "")))
         if asr_transcribed_en:
             print(f"  🎙️ Cloned ASR(En): {asr_transcribed_en}")
         print(f"  🎯 Target Ref   : {ref_en_text}")
@@ -1743,7 +1794,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
 
     avg_rtf = total_rtf / max(1, args.num_samples)
     avg_secs = nanmean(secs_list)
-    avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
+    avg_mel_l1 = nanmean(mel_l1_list)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
     summary = {
@@ -1754,6 +1805,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
         "s2tt_mode": s2tt_mode,
         "s2tt_model": variant["model_id"],
         "num_not_translated": n_not_translated,
+        "num_mixed_vietnamese": n_mixed_vi,
         "num_tts_failed": n_tts_failed,
         "corpus_s2tt_bleu": compute_corpus_bleu(s2tt_hyps, bleu_refs),
         "avg_rtf": round(avg_rtf, 4),
