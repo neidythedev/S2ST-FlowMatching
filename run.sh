@@ -243,6 +243,17 @@ sys.exit(1)
         python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
+    prepare-phost)
+        # Cắt câu PhoST (MuST-C) -> 16kHz + manifest. Cần: hf auth login + đã chấp nhận điều khoản vinai/PhoST
+        # Cú pháp: bash run.sh prepare-phost [train|dev|test] [số_giờ]
+        P_SPLIT="${2:-train}"
+        P_HOURS="${3:-50}"
+        pip install soundfile huggingface_hub -q 2>/dev/null || true
+        echo "📦 Chuẩn bị PhoST split=$P_SPLIT, mục tiêu $P_HOURS giờ -> data/phost (đẩy lên gdrive:datasets/phost/)"
+        echo "⚠️ PhoST cấm phân phối lại: dữ liệu chỉ lưu local + Drive riêng, KHÔNG 'bash run.sh upload'."
+        python -u tools/prepare_phost.py --split "$P_SPLIT" --hours "$P_HOURS" --out-dir data/phost             --drive gdrive:datasets/phost/ 2>&1 | tee "$LOG_DIR/prepare_phost_${P_SPLIT}.log"
+        ;;
+
     compare-decoder)
         # So sánh kiến trúc decoder Stage 1 một cách công bằng (cùng dữ liệu, thứ tự, seed, số bước)
         # Cú pháp: bash run.sh compare-decoder [số_bước] [danh_sách_biến_thể]
@@ -420,6 +431,7 @@ PYEOF
         echo "  bash run.sh sanity               -> Chạy trọn bộ EDA & Sanity Check (Vocos + Whisper)"
         echo "  bash run.sh overfit [cfm|bridge] -> Overfit 500 bước trên 16 câu & xuất audio nghe thử"
         echo "  bash run.sh compare-decoder [bước] [biến_thể] -> So sánh kiến trúc decoder (mặc định 3000 bước, v1,v2-small,v2,v2+ln)"
+        echo "  bash run.sh prepare-phost [split] [giờ] -> Cắt câu PhoST + manifest (mặc định train, 50 giờ)"
         echo "  bash run.sh start cfm_en         -> Huấn luyện Stage 1 OT-CFM Tiếng Anh"
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"

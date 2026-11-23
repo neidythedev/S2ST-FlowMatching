@@ -36,3 +36,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+
+# Ghi chú tiến độ cá nhân (chỉ giữ local)
+CHECKPOINT.md
+
+# Dữ liệu PhoST (điều khoản cấm phân phối lại) + dữ liệu tổng hợp — KHÔNG đưa lên GitHub
+data/
+phost_probe/
