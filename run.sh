@@ -18,8 +18,13 @@ for target_dir in "/marimo" "/home/marimo" "/workspace"; do
         ln -sfn "$PWD" "$target_dir/S2ST-FlowMatching" 2>/dev/null || true
     fi
 done
-NOTEBOOK_DIR=$(dirname "$(find /marimo /home/marimo /root /workspace -maxdepth 2 -name "notebook.py" 2>/dev/null | head -n 1)" 2>/dev/null || true)
-if [ -n "$NOTEBOOK_DIR" ] && [ -d "$NOTEBOOK_DIR" ] && [ "$PWD" != "$NOTEBOOK_DIR" ]; then
+NOTEBOOK_PY=$(find /marimo /home/marimo /root /workspace -maxdepth 2 -name "notebook.py" 2>/dev/null | head -n 1 || true)
+# Chỉ tạo link khi thật sự tìm thấy notebook.py (nếu không, dirname "" = "." sẽ tạo bản sao repo lồng trong repo)
+NOTEBOOK_DIR=""
+if [ -n "$NOTEBOOK_PY" ]; then
+    NOTEBOOK_DIR=$(dirname "$NOTEBOOK_PY")
+fi
+if [ -n "$NOTEBOOK_DIR" ] && [ -d "$NOTEBOOK_DIR" ] && [ "$NOTEBOOK_DIR" != "." ] && [ "$PWD" != "$NOTEBOOK_DIR" ]; then
     ln -sfn "$PWD" "$NOTEBOOK_DIR/S2ST-FlowMatching" 2>/dev/null || true
 fi
 
@@ -238,6 +243,80 @@ sys.exit(1)
         python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
+    bench)
+        # ------------------------------------------------------------------
+        # Chạy ĐÚNG 1 biến thể benchmark (để chạy song song trên nhiều notebook)
+        # Cú pháp: bash run.sh bench <xtts|f5> <2step|3step> <model_hf_id> [số_mẫu]
+        # Kết quả tự đẩy lên gdrive:runs/benchmark/<tag>/ để gom lại bằng 'bash run.sh analyze'
+        # ------------------------------------------------------------------
+        ENGINE="${2:-}"
+        MODE="${3:-}"
+        MODEL_ID="${4:-}"
+        NUM_SAMPLES="${5:-10}"
+        if [[ -z "$ENGINE" || -z "$MODE" || -z "$MODEL_ID" ]]; then
+            echo "❌ Thiếu tham số. Cú pháp: bash run.sh bench <xtts|f5> <2step|3step> <model_hf_id> [số_mẫu]"
+            echo "   VD: bash run.sh bench xtts 3step vinai/PhoWhisper-large 10"
+            exit 1
+        fi
+        case "$ENGINE" in
+            xtts) CASE_NUM=6; TTS_TAG="xtts" ;;
+            f5|f5tts) CASE_NUM=7; TTS_TAG="f5tts" ;;
+            *) echo "❌ ENGINE phải là xtts hoặc f5"; exit 1 ;;
+        esac
+        case "$MODE" in
+            2step) MODEL_FLAG="--s2tt-models" ;;
+            3step) MODEL_FLAG="--vi-asr-models" ;;
+            *) echo "❌ MODE phải là 2step hoặc 3step"; exit 1 ;;
+        esac
+        SHORT_NAME="${MODEL_ID##*/}"
+        TAG="case_${CASE_NUM}_${TTS_TAG}_${MODE}_${SHORT_NAME}"
+        echo "🧪 Benchmark 1 biến thể: $TAG ($NUM_SAMPLES mẫu)"
+        # Xóa metrics cũ để nếu lần chạy này lỗi thì không đẩy nhầm kết quả cũ lên Drive
+        rm -f "outputs/benchmark/${TAG}/metrics.json"
+
+        # Chạy qua nhánh eval (cài deps + gọi eval_benchmark.py); log riêng cho từng biến thể
+        bash "$0" eval "$ENGINE" "$MODE" "$NUM_SAMPLES" auto "$MODEL_FLAG" "$MODEL_ID" 2>&1 | tee "$LOG_DIR/bench_${TAG}.log" || true
+
+        RESULT_DIR="outputs/benchmark/${TAG}"
+        if [ ! -f "$RESULT_DIR/metrics.json" ]; then
+            echo "❌ Không thấy $RESULT_DIR/metrics.json — benchmark lỗi, KHÔNG đẩy lên Drive. Xem log: $LOG_DIR/bench_${TAG}.log"
+            exit 1
+        fi
+        cp "$LOG_DIR/bench_${TAG}.log" "$RESULT_DIR/bench.log"
+        echo "☁️ Đang đẩy kết quả lên gdrive:runs/benchmark/${TAG}/ ..."
+        if rclone copy "$RESULT_DIR" "gdrive:runs/benchmark/${TAG}/" -P; then
+            echo "✓ Đã đẩy $TAG lên Drive. Khi đủ các biến thể, chạy: bash run.sh analyze"
+        else
+            echo "❌ rclone lỗi — kết quả vẫn nằm ở $RESULT_DIR (kiểm tra 'rclone lsd gdrive:')"
+            exit 1
+        fi
+        ;;
+
+    bench-list)
+        # In ra toàn bộ lệnh của bộ benchmark đầy đủ (12 biến thể) để copy sang từng notebook
+        N="${2:-10}"
+        echo "📋 12 lệnh benchmark độc lập ($N mẫu mỗi lệnh) — mỗi lệnh chạy trên 1 notebook:"
+        for ENG in xtts f5; do
+            for M in openai/whisper-small openai/whisper-large-v3 vinai/PhoWhisper-small vinai/PhoWhisper-large; do
+                echo "  bash run.sh bench $ENG 2step $M $N"
+            done
+            for M in vinai/PhoWhisper-small vinai/PhoWhisper-large; do
+                echo "  bash run.sh bench $ENG 3step $M $N"
+            done
+        done
+        echo "👉 Xong hết thì chạy: bash run.sh analyze"
+        ;;
+
+    analyze)
+        # Gom metrics.json của mọi biến thể từ Drive về và phân tích
+        ANALYSIS_DIR="outputs/benchmark_all"
+        mkdir -p "$ANALYSIS_DIR"
+        echo "📥 Đang tải metrics.json + bench.log từ gdrive:runs/benchmark/ ..."
+        rclone copy "gdrive:runs/benchmark/" "$ANALYSIS_DIR/" --include "*/metrics.json" --include "*/bench.log" -P \
+            || echo "⚠️ Không tải được từ Drive — phân tích các kết quả đang có sẵn trong $ANALYSIS_DIR và outputs/benchmark"
+        python tools/analyze_benchmark.py "$ANALYSIS_DIR" outputs/benchmark --out "$ANALYSIS_DIR"
+        ;;
+
     plot)
         echo "📊 Đang vẽ đồ thị tiến trình loss cho thử nghiệm '$EXP_NAME'..."
         python tools/plot_loss.py "$EXP_NAME"
@@ -256,6 +335,9 @@ sys.exit(1)
         echo "  bash run.sh eval xtts [both|2step|3step] -> Benchmark riêng XTTS-v2 Voice Cloning"
         echo "  bash run.sh eval f5 [both|2step|3step]   -> Benchmark riêng F5-TTS Flow-Matching"
         echo "  bash run.sh eval all             -> Benchmark toàn bộ hệ sinh thái (Case 0, 6, 7, 1, 2, 3, 4)"
+        echo "  bash run.sh bench-list [N]       -> In 12 lệnh benchmark độc lập (mỗi notebook chạy 1 lệnh)"
+        echo "  bash run.sh bench <xtts|f5> <2step|3step> <model> [N] -> Chạy 1 biến thể + tự đẩy lên Drive"
+        echo "  bash run.sh analyze              -> Gom kết quả mọi biến thể từ Drive + xuất báo cáo phân tích"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"

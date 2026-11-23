@@ -1693,8 +1693,12 @@ def evaluate_cascaded_voice_clone_suite(case_num, tts_engine, variants, args, de
         print(f"[Cảnh báo] Bỏ qua Case {case_num} ({tts_engine}) do không nạp được TTS model.")
         return []
 
-    # Biến thể đại diện cho gallery (thư mục case_N): 3-step đầu tiên, nếu không có thì biến thể đầu tiên
-    canonical_idx = next((i for i, v in enumerate(variants) if v["mode"] == "3step"), 0)
+    # Biến thể đại diện cho gallery (thư mục case_N) CỐ ĐỊNH = 3-step + model ASR mặc định đầu tiên
+    # (PhoWhisper-small). Cố định để khi chạy tách trên nhiều notebook, thư mục case_N không bị
+    # các biến thể khác ghi đè lẫn nhau.
+    canonical_model = parse_model_list(DEFAULT_VI_ASR_MODELS)[0]
+    canonical_idx = next((i for i, v in enumerate(variants)
+                          if v["mode"] == "3step" and v["model_id"] == canonical_model), -1)
 
     summaries = []
     for i, variant in enumerate(variants):
