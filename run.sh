@@ -243,6 +243,67 @@ sys.exit(1)
         python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
+    rclone-token)
+        # ------------------------------------------------------------------
+        # Ghi token Google Drive MỚI vào rclone.conf (không cần trả lời y/n, không bị lỗi dán nhiều dòng)
+        # Cú pháp: bash run.sh rclone-token 'eyJ0b2tlbi...'   (chuỗi in ra bởi 'rclone authorize' trên Windows)
+        # ------------------------------------------------------------------
+        TOKEN_B64="${2:-}"
+        if [[ -z "$TOKEN_B64" ]]; then
+            echo "❌ Thiếu token. Cú pháp: bash run.sh rclone-token 'eyJ0b2tlbi...'"
+            exit 1
+        fi
+        CONF="$(rclone config file 2>/dev/null | tail -n 1)"
+        [ -f "$CONF" ] || CONF="/home/marimo/.config/rclone/rclone.conf"
+        if [ ! -f "$CONF" ] || ! grep -q '^\[gdrive\]' "$CONF"; then
+            echo "❌ Chưa có cấu hình [gdrive] tại $CONF -> hãy dán khối lệnh trong MOLAB_1CLICK_SETUP.md trước."
+            exit 1
+        fi
+        python3 - "$TOKEN_B64" "$CONF" <<'PYEOF'
+import base64, json, re, sys
+raw, conf = sys.argv[1].strip(), sys.argv[2]
+if raw.startswith("eyJjbGllbnRf"):
+    sys.exit("❌ Đây là chuỗi ĐẦU VÀO (client_id). Hãy dán chuỗi KẾT QUẢ bắt đầu bằng eyJ0b2tlbi...")
+s = raw.replace("-", "+").replace("_", "/")
+s += "=" * (-len(s) % 4)
+try:
+    tok = json.loads(base64.b64decode(s))["token"]
+    json.loads(tok)
+except Exception as e:
+    sys.exit(f"❌ Chuỗi token không hợp lệ ({e}). Copy đủ phần giữa '--->' và '<---End paste'.")
+c = open(conf).read()
+c, n = re.subn(r"(?m)^token = .*$", lambda m: "token = " + tok, c)
+if n == 0:
+    c = c.replace("[gdrive]\n", "[gdrive]\ntoken = " + tok + "\n", 1)
+open(conf, "w").write(c)
+print("✓ Đã ghi token mới vào", conf)
+PYEOF
+        for other in /home/marimo/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf; do
+            if [ "$other" != "$CONF" ]; then
+                mkdir -p "$(dirname "$other")" && cp "$CONF" "$other"
+            fi
+        done
+        echo "📡 Kiểm tra kết nối..."
+        if rclone lsd gdrive:runs; then
+            echo "✓ Kết nối Google Drive THÀNH CÔNG!"
+            echo ""
+            bash "$0" rclone-export
+        else
+            echo "❌ Vẫn lỗi -> token đã bị thu hồi, chạy lại 'rclone authorize' trên Windows để lấy token mới."
+            exit 1
+        fi
+        ;;
+
+    rclone-export)
+        # In dòng RCLONE_B64 mới để dán đè vào MOLAB_1CLICK_SETUP.md (máy Windows) cho lần reset sau
+        CONF="$(rclone config file 2>/dev/null | tail -n 1)"
+        [ -f "$CONF" ] || CONF="/home/marimo/.config/rclone/rclone.conf"
+        echo "📋 Copy NGUYÊN dòng dưới, dán ĐÈ dòng RCLONE_B64=... trong MOLAB_1CLICK_SETUP.md (máy Windows):"
+        echo ""
+        echo "RCLONE_B64=\"$(base64 -w0 "$CONF")\""
+        echo ""
+        ;;
+
     bench)
         # ------------------------------------------------------------------
         # Chạy ĐÚNG 1 biến thể benchmark (để chạy song song trên nhiều notebook)
@@ -360,6 +421,8 @@ sys.exit(1)
         echo "  bash run.sh sync [tên_exp]       -> Đẩy checkpoint lên Drive"
         echo "  bash run.sh restore [tên_exp]    -> Tải checkpoint từ Drive về"
         echo "  bash run.sh upload               -> Đẩy outputs (audio, HTML) lên GitHub để tải về"
+        echo "  bash run.sh rclone-token 'eyJ0b2tlbi...' -> Ghi token Drive mới (sau khi 'rclone authorize' trên Windows)"
+        echo "  bash run.sh rclone-export        -> In dòng RCLONE_B64 mới để cập nhật MOLAB_1CLICK_SETUP.md"
         echo "=========================================================="
         exit 1
         ;;
