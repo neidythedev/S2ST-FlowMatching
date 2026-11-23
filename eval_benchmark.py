@@ -457,10 +457,31 @@ def nanmean(values):
     valid = [v for v in values if v == v]
     return sum(valid) / len(valid) if valid else float("nan")
 
+def normalize_en_text(text):
+    """Chuẩn hóa văn bản tiếng Anh trước khi tính BLEU: chữ thường, bỏ dấu câu, gộp khoảng trắng.
+    Lý do: transcript tham chiếu của FLEURS đã được chuẩn hóa (không dấu câu), còn Whisper ASR
+    sinh ra có dấu câu -> nếu không chuẩn hóa, dấu câu bị tính là token sai và kéo BLEU xuống."""
+    t = str(text or "").lower()
+    t = t.replace("’", "'")
+    t = re.sub(r"[^\w\s']", " ", t)       # bỏ dấu câu (giữ dấu nháy đơn: peter's, don't)
+    t = re.sub(r"(?<!\w)'|'(?!\w)", " ", t)  # bỏ nháy đơn đứng lẻ
+    return re.sub(r"\s+", " ", t).strip()
+
+def compute_corpus_bleu(hyps, refs):
+    """Corpus-level SacreBLEU (chuẩn báo cáo ASR-BLEU trong các paper S2ST)."""
+    pairs = [(normalize_en_text(h), normalize_en_text(r)) for h, r in zip(hyps, refs) if normalize_en_text(r)]
+    if not pairs:
+        return 0.0
+    try:
+        import sacrebleu
+        return round(float(sacrebleu.corpus_bleu([h for h, _ in pairs], [[r for _, r in pairs]]).score), 2)
+    except Exception:
+        return float("nan")
+
 def compute_sentence_bleu(hyp_str, ref_str):
     """Tính điểm BLEU (0 -> 100) chuẩn SacreBLEU giữa câu tiếng Anh sinh ra và câu tham chiếu."""
-    hyp_clean = str(hyp_str).lower().strip()
-    ref_clean = str(ref_str).lower().strip()
+    hyp_clean = normalize_en_text(hyp_str)
+    ref_clean = normalize_en_text(ref_str)
     if not hyp_clean or not ref_clean:
         return 0.0
     try:
@@ -694,6 +715,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
     secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
+    bleu_hyps, bleu_refs = [], []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -755,6 +777,8 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
             if asr_transcribed_en:
                 bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
         total_bleu += bleu
+        bleu_hyps.append(asr_transcribed_en)
+        bleu_refs.append(ref_en_text)
 
         sample_name = f"sample_{idx+1:03d}"
         if gen_wav is not None:
@@ -795,6 +819,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": round(avg_mel_l1, 4),
         "avg_asr_bleu": round(avg_bleu, 2),
+        "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
         "num_samples": args.num_samples,
         "samples": results
     }
@@ -854,6 +879,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
     secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
+    bleu_hyps, bleu_refs = [], []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -933,6 +959,8 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
             if asr_transcribed_en:
                 bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
         total_bleu += bleu
+        bleu_hyps.append(asr_transcribed_en)
+        bleu_refs.append(ref_en_text)
 
         sample_name = f"sample_{idx+1:03d}"
         save_wav_file(os.path.join(wavs_dir, f"{sample_name}_case0_gen.wav"), gen_wav_24k, 24000)
@@ -974,6 +1002,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": round(avg_mel_l1, 4),
         "avg_asr_bleu": round(avg_bleu, 2),
+        "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
         "num_samples": args.num_samples,
         "samples": results
     }
@@ -1019,6 +1048,7 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
     total_rtf = 0.0
     secs_list = []
     total_bleu = 0.0
+    bleu_hyps, bleu_refs = [], []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -1048,6 +1078,8 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
             if asr_transcribed_en:
                 bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
         total_bleu += bleu
+        bleu_hyps.append(asr_transcribed_en)
+        bleu_refs.append(ref_en_text)
 
         sample_name = f"sample_{idx+1:03d}"
         save_wav_file(os.path.join(wavs_dir, f"{sample_name}_case5_gen.wav"), speech_out, 16000)
@@ -1080,6 +1112,7 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": 0.0,
         "avg_asr_bleu": round(avg_bleu, 2),
+        "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
         "num_samples": args.num_samples,
         "samples": results
     }
@@ -1100,6 +1133,44 @@ def sanitize_text_for_f5(text):
     clean = re.sub(r'[^a-zA-Z0-9\s.,?!]', ' ', latin)
     clean = re.sub(r'\s+', ' ', clean).strip()
     return clean if clean else "xin chao"
+
+def disable_broken_flash_attn():
+    """Vô hiệu hóa flash-attn bị hỏng để F5-TTS / transformers tự chuyển sang torch SDPA.
+
+    Vấn đề: sau `pip uninstall flash-attn`, thư mục `site-packages/flash_attn/` thường còn sót
+    (không có __init__.py) -> Python coi là namespace package, `importlib.util.find_spec`
+    vẫn trả về spec nên F5-TTS tưởng flash-attn có sẵn rồi crash khi
+    `from flash_attn import flash_attn_func` ("unknown location").
+    """
+    import shutil
+    import subprocess
+    import site
+    print("⚠️ flash-attn bị lỗi hoặc chưa cài. Vô hiệu hóa để F5-TTS dùng torch SDPA fallback...")
+    subprocess.call([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y", "-q"])
+
+    # Xóa thư mục flash_attn sót lại (chỉ khi KHÔNG còn __init__.py, tức là mảnh vỡ của gói đã gỡ)
+    site_dirs = list(getattr(site, "getsitepackages", lambda: [])())
+    try:
+        site_dirs.append(site.getusersitepackages())
+    except Exception:
+        pass
+    for sp in site_dirs:
+        leftover = os.path.join(sp, "flash_attn")
+        if os.path.isdir(leftover) and not os.path.exists(os.path.join(leftover, "__init__.py")):
+            shutil.rmtree(leftover, ignore_errors=True)
+            print(f"  ✓ Đã xóa thư mục flash_attn sót lại: {leftover}")
+
+    # Chặn import trong tiến trình hiện tại: sys.modules[name] = None khiến
+    # `import flash_attn` ném ImportError và find_spec("flash_attn") trả về None.
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "flash_attn" or mod_name.startswith("flash_attn."):
+            del sys.modules[mod_name]
+    sys.modules["flash_attn"] = None
+    try:
+        import importlib
+        importlib.invalidate_caches()
+    except Exception:
+        pass
 
 def load_voice_clone_tts(tts_engine, device):
     """Nạp engine TTS phục vụ Voice Cloning (XTTS-v2 hoặc F5-TTS).
@@ -1173,18 +1244,6 @@ def load_voice_clone_tts(tts_engine, device):
     elif tts_engine == "f5tts":
         print("⏳ Đang nạp SWivid/F5-TTS (Flow-Matching In-Context Voice Cloning)...")
 
-        # Kiểm tra flash-attn: nếu cài rồi nhưng bị lỗi (broken), gỡ bỏ để F5-TTS
-        # dùng torch SDPA fallback thay vì crash
-        try:
-            from flash_attn import flash_attn_func
-        except (ImportError, AttributeError, ModuleNotFoundError):
-            print("⚠️ flash-attn bị lỗi hoặc chưa cài. Gỡ bỏ để F5-TTS dùng torch SDPA fallback...")
-            subprocess.call([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y", "-q"])
-            # Xóa module cache để Python không nhớ import cũ
-            for mod_name in list(sys.modules.keys()):
-                if "flash_attn" in mod_name:
-                    del sys.modules[mod_name]
-
         # Đảm bảo google-cloud-storage có sẵn (dependency ngầm của F5-TTS)
         try:
             import google.cloud.storage
@@ -1192,10 +1251,12 @@ def load_voice_clone_tts(tts_engine, device):
             print("📦 Đang cài google-cloud-storage (dependency của F5-TTS)...")
             subprocess.call([sys.executable, "-m", "pip", "install", "google-cloud-storage", "-q"])
 
-        # Thử nạp f5-tts, cài nếu chưa có
+        # Cài f5-tts nếu thật sự CHƯA có (kiểm tra qua metadata, không qua import —
+        # vì import có thể lỗi do flash_attn chứ không phải do thiếu f5-tts)
         try:
-            from f5_tts.api import F5TTS
-        except ImportError:
+            from importlib.metadata import version as _pkg_version
+            _pkg_version("f5-tts")
+        except Exception:
             print("📦 f5-tts chưa cài đặt. Đang tự động cài đặt...")
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "f5-tts", "-q"])
@@ -1204,17 +1265,14 @@ def load_voice_clone_tts(tts_engine, device):
                 print("👉 Bạn hãy chạy thủ công: pip install google-cloud-storage f5-tts")
                 return None
 
-        # Gỡ flash-attn bị lỗi SAU khi install f5-tts (vì f5-tts re-install nó)
+        # Kiểm tra flash-attn SAU khi cài f5-tts (f5-tts có thể kéo flash-attn về lại).
+        # Nếu flash-attn hỏng -> vô hiệu hóa hoàn toàn để F5-TTS dùng torch SDPA.
         try:
-            from flash_attn import flash_attn_func
+            from flash_attn import flash_attn_func  # noqa: F401
         except Exception:
-            print("⚠️ flash-attn broken → gỡ bỏ, F5-TTS sẽ dùng torch SDPA...")
-            subprocess.call([sys.executable, "-m", "pip", "uninstall", "flash-attn", "-y", "-q"])
-            for mod_name in list(sys.modules.keys()):
-                if "flash_attn" in mod_name:
-                    del sys.modules[mod_name]
+            disable_broken_flash_attn()
 
-        # Reload f5_tts sau khi gỡ flash-attn
+        # Reload f5_tts sau khi xử lý flash-attn
         for mod_name in list(sys.modules.keys()):
             if "f5_tts" in mod_name:
                 del sys.modules[mod_name]
@@ -1273,6 +1331,14 @@ def get_s2tt_modules(s2tt_modes_needed, device, whisper_id="openai/whisper-small
 
     return modules
 
+def whisper_compression_ratio(text):
+    """Tỉ lệ nén zlib của văn bản (tiêu chí phát hiện lặp/hallucination của Whisper gốc, ngưỡng 2.4)."""
+    import zlib
+    b = str(text or "").encode("utf-8")
+    if len(b) < 40:
+        return 0.0
+    return len(b) / max(1, len(zlib.compress(b)))
+
 def translate_speech_vi2en(src_w, ref_vi_text, mode, s2tt_modules, device):
     """Chuyển đổi âm thanh tiếng Việt thành văn bản tiếng Anh theo chế độ 2-step hoặc 3-step."""
     translated_en = ""
@@ -1289,6 +1355,19 @@ def translate_speech_vi2en(src_w, ref_vi_text, mode, s2tt_modules, device):
             except Exception:
                 pred_ids = w_mod.generate(in_feats, max_new_tokens=128)
                 translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+
+            # Whisper hay rơi vào vòng lặp ("the following year, the following year, ...").
+            # Áp dụng đúng tiêu chí fallback của Whisper gốc: tỉ lệ nén zlib > 2.4 -> giải mã lại
+            # bằng beam search + chặn lặp n-gram. Chỉ kích hoạt khi phát hiện lặp, nên không
+            # ảnh hưởng các câu bình thường.
+            if whisper_compression_ratio(translated_en) > 2.4:
+                print(f"  ⚠️ Whisper lặp vô hạn (compression ratio > 2.4) -> giải mã lại với beam=5, no_repeat_ngram=3")
+                try:
+                    pred_ids = w_mod.generate(in_feats, language="vi", task="translate", max_new_tokens=128,
+                                              num_beams=5, no_repeat_ngram_size=3)
+                    translated_en = w_tok.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+                except Exception:
+                    pass
         transcribed_vi = ref_vi_text
 
     elif mode == "3step" and s2tt_modules.get("3step") is not None:
@@ -1381,6 +1460,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
     secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
+    bleu_hyps, bleu_refs = [], []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -1437,6 +1517,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
             if asr_transcribed_en:
                 bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
         total_bleu += bleu
+        bleu_hyps.append(asr_transcribed_en)
+        bleu_refs.append(ref_en_text)
 
         sample_name = f"sample_{idx+1:03d}"
         gen_file_case = os.path.join(wavs_dir, f"{sample_name}_{case_tag}_gen.wav")
@@ -1490,6 +1572,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         "avg_secs_timbre": round(avg_secs, 4),
         "avg_mel_l1_error": round(avg_mel_l1, 4),
         "avg_asr_bleu": round(avg_bleu, 2),
+        "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
         "num_samples": args.num_samples,
         "samples": results
     }
@@ -1864,20 +1947,21 @@ def main():
     print("\n" + "=" * 90)
     print("📋 BẢNG TỔNG HỢP KẾT QUẢ BENCHMARK S2ST (TẬP TEST FLEURS VI-EN)")
     print("=" * 90)
-    print(f"{'Kịch bản (Benchmark Case)':<52} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8} | {'ASR-BLEU ↑':<10}")
+    print(f"{'Kịch bản (Benchmark Case)':<52} | {'RTF ↓':<8} | {'Mel L1 ↓':<10} | {'SECS ↑':<8} | {'BLEU corpus ↑':<13} | {'BLEU câu TB':<11}")
     print("-" * 90)
     for s in all_summaries:
-        bleu_str = f"{s.get('avg_asr_bleu', 0.0):.2f}"
-        print(f"{s['case_name']:<52} | {s['avg_rtf']:<8.4f} | {s['avg_mel_l1_error']:<10.4f} | {s['avg_secs_timbre']:<8.4f} | {bleu_str:<10}")
+        bleu_str = f"{s.get('corpus_asr_bleu', float('nan')):<13.2f} | {s.get('avg_asr_bleu', 0.0):<11.2f}"
+        print(f"{s['case_name']:<52} | {s['avg_rtf']:<8.4f} | {s['avg_mel_l1_error']:<10.4f} | {s['avg_secs_timbre']:<8.4f} | {bleu_str}")
     print("=" * 90)
+    print("ℹ️ ASR-BLEU chính thức = BLEU corpus (SacreBLEU, chữ thường + bỏ dấu câu); cột sau là trung bình BLEU từng câu.")
 
     # Lưu bảng tổng hợp ra file Markdown
     os.makedirs(args.output_dir, exist_ok=True)
     summary_md_path = os.path.join(args.output_dir, "ablation_summary.md")
     with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write("# 📋 BẢNG SO SÁNH THỰC NGHIỆM S2ST (TẬP TEST FLEURS VI-EN)\n\n")
-        f.write("| Kịch bản thử nghiệm | RTF ↓ | Mel L1 Error ↓ | SECS (Giữ giọng) ↑ | ASR-BLEU ↑ | Đánh giá & Phân tích |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :--- |\n")
+        f.write("| Kịch bản thử nghiệm | RTF ↓ | Mel L1 Error ↓ | SECS (Giữ giọng) ↑ | ASR-BLEU corpus ↑ | BLEU câu TB | Đánh giá & Phân tích |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |\n")
         for s in all_summaries:
             cid = s.get("case_id", 0)
             tag = s.get("case_tag", "")
@@ -1899,7 +1983,7 @@ def main():
                 note = "Cascaded SOTA Voice Cloning: F5-TTS Flow-Matching điều kiện in-context audio+text."
             else:
                 note = "Thử nghiệm S2ST"
-            f.write(f"| **{s['case_name']}** | {s['avg_rtf']:.4f} | {s['avg_mel_l1_error']:.4f} | {s['avg_secs_timbre']:.4f} | {s.get('avg_asr_bleu', 0.0):.2f} | {note} |\n")
+            f.write(f"| **{s['case_name']}** | {s['avg_rtf']:.4f} | {s['avg_mel_l1_error']:.4f} | {s['avg_secs_timbre']:.4f} | {s.get('corpus_asr_bleu', float('nan')):.2f} | {s.get('avg_asr_bleu', 0.0):.2f} | {note} |\n")
     print(f"📁 Báo cáo tổng hợp đã lưu tại: {summary_md_path}\n")
     generate_audio_gallery_html(args.output_dir)
 
