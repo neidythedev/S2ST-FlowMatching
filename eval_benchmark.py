@@ -143,7 +143,7 @@ def apply_torchaudio_mock_if_needed():
         sys.modules["torchaudio._extension"] = ta_ext
         return "mock"
 
-_ = apply_torchaudio_mock_if_needed()
+_TA_STATUS = apply_torchaudio_mock_if_needed()
 
 # Import PyTorch an toàn
 try:
@@ -151,52 +151,139 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
 
+    def _mock_melscale_fbanks(n_freqs, f_min, f_max, n_mels, sample_rate, norm=None, mel_scale="htk"):
+        """Tái hiện torchaudio.functional.melscale_fbanks (HTK hoặc Slaney) bằng PyTorch thuần.
+        Trả về ma trận (n_freqs × n_mels) giống hệt torchaudio."""
+        def hz_to_mel(f):
+            if mel_scale == "htk":
+                return 2595.0 * math.log10(1.0 + f / 700.0)
+            f_sp, min_log_hz = 200.0 / 3, 1000.0
+            min_log_mel, logstep = min_log_hz / f_sp, math.log(6.4) / 27.0
+            return f / f_sp if f < min_log_hz else min_log_mel + math.log(f / min_log_hz) / logstep
+
+        def mel_to_hz(m):
+            if mel_scale == "htk":
+                return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+            f_sp, min_log_hz = 200.0 / 3, 1000.0
+            min_log_mel, logstep = min_log_hz / f_sp, math.log(6.4) / 27.0
+            mels = f_sp * m
+            return torch.where(m >= min_log_mel, min_log_hz * torch.exp(logstep * (m - min_log_mel)), mels)
+
+        all_freqs = torch.linspace(0, sample_rate // 2, n_freqs)
+        m_pts = torch.linspace(hz_to_mel(f_min), hz_to_mel(f_max), n_mels + 2)
+        f_pts = mel_to_hz(m_pts)
+        f_diff = f_pts[1:] - f_pts[:-1]
+        slopes = f_pts.unsqueeze(0) - all_freqs.unsqueeze(1)
+        down_slopes = (-1.0 * slopes[:, :-2]) / f_diff[:-1]
+        up_slopes = slopes[:, 2:] / f_diff[1:]
+        fb = torch.max(torch.zeros(1), torch.min(down_slopes, up_slopes))
+        if norm == "slaney":
+            enorm = 2.0 / (f_pts[2:n_mels + 2] - f_pts[:n_mels])
+            fb = fb * enorm.unsqueeze(0)
+        return fb
+
     class MockSpectrogram(nn.Module):
-        """Mock torchaudio.transforms.Spectrogram — tạo buffer 'window' đúng kích thước
-        dựa trên tham số constructor (n_fft, win_length) để tương thích với state_dict
-        của các model như XTTS-v2 (cần window=[400], fb=[257,64])."""
-        def __init__(self, n_fft=1024, win_length=None, hop_length=None, power=None,
-                     normalized=False, wkwargs=None, center=True, pad_mode="reflect",
-                     onesided=True, **kwargs):
+        """Mock torchaudio.transforms.Spectrogram — tính STFT thật bằng torch.stft.
+        Buffer 'window' có kích thước theo win_length để khớp state_dict (VD XTTS-v2: [400])."""
+        def __init__(self, n_fft=400, win_length=None, hop_length=None, pad=0,
+                     window_fn=None, power=2.0, normalized=False, wkwargs=None,
+                     center=True, pad_mode="reflect", onesided=True, **kwargs):
             super().__init__()
-            wl = win_length if win_length is not None else n_fft
-            self.register_buffer("window", torch.empty(wl))
-        def forward(self, x): return x
+            self.n_fft = n_fft
+            self.win_length = win_length if win_length is not None else n_fft
+            self.hop_length = hop_length if hop_length is not None else (self.win_length // 2)
+            self.pad = pad
+            self.power = power
+            self.normalized = normalized
+            self.center = center
+            self.pad_mode = pad_mode
+            self.onesided = onesided
+            win_fn = window_fn if window_fn is not None else torch.hann_window
+            window = win_fn(self.win_length, **(wkwargs or {}))
+            self.register_buffer("window", window)
+
+        def forward(self, x):
+            # torch.stft chỉ nhận đầu vào 1D/2D -> gộp các chiều batch phía trước
+            lead_shape = x.shape[:-1]
+            x = x.reshape(-1, x.shape[-1])
+            if self.pad > 0:
+                x = F.pad(x, (self.pad, self.pad), mode="constant")
+            # torch.stft tự pad n_fft//2 khi center=True (không pad thủ công để tránh pad 2 lần)
+            stft_out = torch.stft(x, self.n_fft, hop_length=self.hop_length,
+                                  win_length=self.win_length,
+                                  window=self.window.to(device=x.device, dtype=x.dtype),
+                                  center=self.center, pad_mode=self.pad_mode,
+                                  normalized=False, onesided=self.onesided,
+                                  return_complex=True)
+            if self.normalized:
+                stft_out = stft_out / self.window.pow(2.0).sum().sqrt()
+            stft_out = stft_out.reshape(lead_shape + stft_out.shape[-2:])
+            if self.power is None:
+                return stft_out
+            if self.power == 1.0:
+                return stft_out.abs()
+            return stft_out.abs().pow(self.power)
 
     class MockMelScale(nn.Module):
-        """Mock torchaudio.transforms.MelScale — tạo buffer 'fb' đúng kích thước
-        (n_stft × n_mels) thay vì giá trị cứng."""
-        def __init__(self, n_mels=100, sample_rate=24000, f_min=0., f_max=None,
-                     n_stft=None, norm=None, mel_scale="htk", **kwargs):
+        """Mock torchaudio.transforms.MelScale — filterbank 'fb' (n_stft × n_mels) được TÍNH THẬT.
+        Quan trọng: F5-TTS và Vocos xóa key fb khỏi state_dict khi load, nên nếu để zeros
+        thì toàn bộ mel đầu ra = 0 (giọng tham chiếu bị câm)."""
+        def __init__(self, n_mels=128, sample_rate=16000, f_min=0., f_max=None,
+                     n_stft=201, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
-            n_stft_val = n_stft if n_stft is not None else 513
-            self.register_buffer("fb", torch.empty(n_stft_val, n_mels))
-        def forward(self, x): return x
+            f_max_val = f_max if f_max is not None else float(sample_rate // 2)
+            fb = _mock_melscale_fbanks(n_stft, f_min, f_max_val, n_mels, sample_rate, norm, mel_scale)
+            self.register_buffer("fb", fb)
+
+        def forward(self, x):
+            fb = self.fb.to(device=x.device, dtype=x.dtype)
+            return torch.matmul(x.transpose(-1, -2), fb).transpose(-1, -2)
 
     class MockMelSpectrogram(nn.Module):
-        """Mock torchaudio.transforms.MelSpectrogram — tính toán kích thước buffer
-        tự động từ tham số (n_fft, win_length, n_mels) để khớp với checkpoint
-        của bất kỳ model nào (Vocos 1024/100, XTTS 512/64, v.v.)."""
-        def __init__(self, sample_rate=24000, n_fft=1024, win_length=None, hop_length=None,
-                     f_min=0., f_max=None, pad=0, n_mels=100, window_fn=None,
-                     power=None, normalized=False, wkwargs=None, center=True,
-                     pad_mode="reflect", onesided=True, norm=None, mel_scale="htk", **kwargs):
+        """Mock torchaudio.transforms.MelSpectrogram — tính mel spectrogram thật
+        bằng torch.stft + mel filterbank, kích thước buffer khớp checkpoint."""
+        def __init__(self, sample_rate=16000, n_fft=400, win_length=None, hop_length=None,
+                     f_min=0., f_max=None, pad=0, n_mels=128, window_fn=None,
+                     power=2.0, normalized=False, wkwargs=None, center=True,
+                     pad_mode="reflect", onesided=None, norm=None, mel_scale="htk", **kwargs):
             super().__init__()
             wl = win_length if win_length is not None else n_fft
             n_stft = n_fft // 2 + 1
-            self.spectrogram = MockSpectrogram(n_fft=n_fft, win_length=wl)
-            self.mel_scale = MockMelScale(n_mels=n_mels, n_stft=n_stft, sample_rate=sample_rate)
-        def forward(self, x):
-            return x
+            self.spectrogram = MockSpectrogram(n_fft=n_fft, win_length=wl, hop_length=hop_length,
+                                               pad=pad, window_fn=window_fn, power=power,
+                                               normalized=normalized, wkwargs=wkwargs,
+                                               center=center, pad_mode=pad_mode)
+            self.mel_scale = MockMelScale(n_mels=n_mels, sample_rate=sample_rate, f_min=f_min,
+                                          f_max=f_max, n_stft=n_stft, norm=norm, mel_scale=mel_scale)
 
-    if "torchaudio.transforms" in sys.modules:
-        sys.modules["torchaudio.transforms"].MelSpectrogram = MockMelSpectrogram
-        sys.modules["torchaudio.transforms"].Spectrogram = MockSpectrogram
-        sys.modules["torchaudio.transforms"].MelScale = MockMelScale
-    if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transforms"):
-        sys.modules["torchaudio"].transforms.MelSpectrogram = MockMelSpectrogram
-        sys.modules["torchaudio"].transforms.Spectrogram = MockSpectrogram
-        sys.modules["torchaudio"].transforms.MelScale = MockMelScale
+        def forward(self, x):
+            return self.mel_scale(self.spectrogram(x))
+
+    def _install_mel_mocks():
+        """Gắn các lớp Mock (tính toán thật) vào module torchaudio giả lập.
+        Chỉ chạy ở chế độ mock — nếu torchaudio native hoạt động thì giữ nguyên bản gốc."""
+        if _TA_STATUS != "mock":
+            return
+        ta_trans = sys.modules.get("torchaudio.transforms")
+        if ta_trans is not None:
+            ta_trans.MelSpectrogram = MockMelSpectrogram
+            ta_trans.Spectrogram = MockSpectrogram
+            ta_trans.MelScale = MockMelScale
+        ta_mod = sys.modules.get("torchaudio")
+        if ta_mod is not None and hasattr(ta_mod, "transforms"):
+            ta_mod.transforms.MelSpectrogram = MockMelSpectrogram
+            ta_mod.transforms.Spectrogram = MockSpectrogram
+            ta_mod.transforms.MelScale = MockMelScale
+        ta_func = sys.modules.get("torchaudio.functional")
+        if ta_func is not None:
+            ta_func.melscale_fbanks = _mock_melscale_fbanks
+
+    # Lưu lại các lớp torchaudio native (nếu có) vì train_bridge.py ghi đè chúng khi import
+    _NATIVE_TA_TRANSFORMS = {}
+    if _TA_STATUS == "native":
+        import torchaudio as _ta_native
+        for _name in ("MelSpectrogram", "Spectrogram", "MelScale"):
+            _NATIVE_TA_TRANSFORMS[_name] = getattr(_ta_native.transforms, _name)
 except ImportError as e:
     print(f"[Fatal Error] PyTorch chưa được cài đặt: {e}")
     sys.exit(1)
@@ -207,6 +294,15 @@ from train_bridge import (
     RealStreamingSpeechPipeline, build_mel_filterbank, extract_100_mel,
     resample_16k_to_24k, resample_24k_to_16k
 )
+
+# LƯU Ý: train_bridge.py khi import sẽ gắn các Mock no-op (forward trả về x) vào torchaudio.transforms.
+# Phải gắn lại bản Mock tính toán thật SAU khi import, nếu không XTTS-v2 / F5-TTS nhận mel sai.
+if _TA_STATUS == "mock":
+    _install_mel_mocks()
+else:
+    import torchaudio as _ta_native
+    for _name, _cls in _NATIVE_TA_TRANSFORMS.items():
+        setattr(_ta_native.transforms, _name, _cls)
 
 # Tự động cài đặt các thư viện cần thiết nếu còn thiếu
 def auto_install_packages():
@@ -298,6 +394,68 @@ def compute_cosine_similarity(emb1, emb2):
     a = F.normalize(emb1.float(), p=2, dim=-1)
     b = F.normalize(emb2.float(), p=2, dim=-1)
     return (a * b).sum(dim=-1).mean().item()
+
+# ------------------------------------------------------------------------------
+# SECS THẬT: Dùng mô hình Speaker Verification độc lập (WavLM-Base-Plus-SV, x-vector)
+# để so sánh giọng nguồn tiếng Việt với giọng tiếng Anh sinh ra. Mô hình này không
+# phụ thuộc vào hệ thống được đánh giá nên công bằng cho mọi Case.
+# ------------------------------------------------------------------------------
+SV_MODEL_ID = "microsoft/wavlm-base-plus-sv"
+_SPEAKER_VERIFIER = {"loaded": False, "feat": None, "model": None}
+
+def get_speaker_verifier(device):
+    """Nạp (lazy, 1 lần) mô hình WavLM x-vector để đo SECS."""
+    if _SPEAKER_VERIFIER["loaded"]:
+        return _SPEAKER_VERIFIER["feat"], _SPEAKER_VERIFIER["model"]
+    _SPEAKER_VERIFIER["loaded"] = True
+    try:
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+        print(f"⏳ Đang nạp mô hình Speaker Verification ({SV_MODEL_ID}) để đo SECS...")
+        feat = AutoFeatureExtractor.from_pretrained(SV_MODEL_ID)
+        model = WavLMForXVector.from_pretrained(SV_MODEL_ID).to(device).eval()
+        _SPEAKER_VERIFIER["feat"], _SPEAKER_VERIFIER["model"] = feat, model
+        print("✓ Nạp WavLM-SV thành công!")
+    except Exception as e:
+        print(f"[SECS Cảnh báo] Không nạp được {SV_MODEL_ID} ({e}). SECS sẽ ghi là NaN (không đo được).")
+    return _SPEAKER_VERIFIER["feat"], _SPEAKER_VERIFIER["model"]
+
+def _to_mono_16k(wav, sample_rate):
+    """Chuẩn hóa waveform về 1D float32 16kHz trên CPU."""
+    w = torch.as_tensor(wav).detach().float().squeeze().cpu()
+    if w.ndim > 1:
+        w = w[0]
+    if sample_rate == 24000:
+        w = resample_24k_to_16k(w.unsqueeze(0)).squeeze(0)
+    elif sample_rate != 16000:
+        w = torch.nn.functional.interpolate(
+            w.view(1, 1, -1), scale_factor=16000.0 / sample_rate, mode="linear", align_corners=False
+        ).view(-1)
+    return w
+
+def compute_secs(src_wav, src_sr, gen_wav, gen_sr, device):
+    """Đo SECS = cosine(x-vector giọng nguồn, x-vector giọng sinh ra). Trả về NaN nếu không đo được."""
+    feat, model = get_speaker_verifier(device)
+    if feat is None or model is None or src_wav is None or gen_wav is None:
+        return float("nan")
+    try:
+        a = _to_mono_16k(src_wav, src_sr)
+        b = _to_mono_16k(gen_wav, gen_sr)
+        if a.numel() < 1600 or b.numel() < 1600 or float(b.abs().max()) < 1e-6:
+            return 0.0  # Audio sinh ra quá ngắn hoặc câm -> không giữ được giọng
+        inputs = feat([a.numpy(), b.numpy()], sampling_rate=16000, padding=True, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            emb = model(**inputs).embeddings
+        emb = F.normalize(emb.float(), p=2, dim=-1)
+        return float((emb[0] * emb[1]).sum().item())
+    except Exception as e:
+        print(f"  ⚠️ Lỗi khi đo SECS: {e}")
+        return float("nan")
+
+def nanmean(values):
+    """Trung bình bỏ qua NaN (mẫu không đo được). Trả NaN nếu không có mẫu hợp lệ."""
+    valid = [v for v in values if v == v]
+    return sum(valid) / len(valid) if valid else float("nan")
 
 def compute_sentence_bleu(hyp_str, ref_str):
     """Tính điểm BLEU (0 -> 100) chuẩn SacreBLEU giữa câu tiếng Anh sinh ra và câu tham chiếu."""
@@ -533,7 +691,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
     # 2. Suy luận trên tập mẫu
     results = []
     total_rtf = 0.0
-    total_secs = 0.0
+    secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
 
@@ -576,12 +734,9 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        # Đo SECS
-        with torch.no_grad():
-            spk_src = model.spk_encoder(src_latents)
-            sim_dummy = torch.randn_like(spk_src) if case_num == 1 else spk_src + torch.randn_like(spk_src)*0.08
-            secs = compute_cosine_similarity(spk_src, sim_dummy)
-        total_secs += secs
+        # Đo SECS thật giữa audio nguồn (16k) và audio sinh ra (24k)
+        secs = compute_secs(src_w, 16000, gen_wav, 24000, device) if gen_wav is not None else float("nan")
+        secs_list.append(secs)
 
         # Đo sai số phổ Mel L1
         tgt_24k = resample_16k_to_24k(tgt_w.unsqueeze(0).to(device=device, dtype=torch.float32))
@@ -595,12 +750,10 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         asr_transcribed_en = ""
         if gen_wav is not None and en_asr_tools is not None:
             en_feat, en_tok, en_mod = en_asr_tools
-            if case_num in [1, 2, 3]:
-                bleu = 0.0
-            else:
-                asr_transcribed_en = transcribe_en_audio(gen_wav, 24000, en_feat, en_tok, en_mod, device)
-                if asr_transcribed_en:
-                    bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
+            # Đo thật cho mọi Case (kể cả Ablation 1-3) thay vì gán cứng 0
+            asr_transcribed_en = transcribe_en_audio(gen_wav, 24000, en_feat, en_tok, en_mod, device)
+            if asr_transcribed_en:
+                bleu = compute_sentence_bleu(asr_transcribed_en, ref_en_text)
         total_bleu += bleu
 
         sample_name = f"sample_{idx+1:03d}"
@@ -631,7 +784,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
-    avg_secs = total_secs / max(1, args.num_samples)
+    avg_secs = nanmean(secs_list)
     avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
@@ -698,7 +851,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
 
     results = []
     total_rtf = 0.0
-    total_secs = 0.0
+    secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
 
@@ -760,9 +913,9 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        # Đo SECS
-        secs = 0.2215
-        total_secs += secs
+        # Đo SECS thật (WavLM-SV) giữa giọng nguồn và giọng MMS-TTS sinh ra
+        secs = compute_secs(src_w, 16000, gen_wav_24k, 24000, device)
+        secs_list.append(secs)
 
         # Đo sai số phổ Mel L1
         tgt_24k = resample_16k_to_24k(tgt_w.unsqueeze(0).to(device=device, dtype=torch.float32))
@@ -810,7 +963,7 @@ def evaluate_cascaded_case(args, device, mel_fb, data_pipeline, en_asr_tools=Non
         print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
-    avg_secs = total_secs / max(1, args.num_samples)
+    avg_secs = nanmean(secs_list)
     avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
@@ -864,7 +1017,7 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
 
     results = []
     total_rtf = 0.0
-    total_secs = 0.0
+    secs_list = []
     total_bleu = 0.0
 
     for idx in range(args.num_samples):
@@ -884,8 +1037,9 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        secs = 0.4500  # Seamless có voice conversion trung bình
-        total_secs += secs
+        # Đo SECS thật (Seamless xuất audio 16kHz)
+        secs = compute_secs(src_w, 16000, speech_out, 16000, device)
+        secs_list.append(secs)
 
         asr_transcribed_en = ""
         bleu = 0.0
@@ -916,7 +1070,7 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
         print(f"  📊 RTF: {rtf:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
-    avg_secs = total_secs / max(1, args.num_samples)
+    avg_secs = nanmean(secs_list)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
     summary = {
@@ -1224,7 +1378,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
 
     results = []
     total_rtf = 0.0
-    total_secs = 0.0
+    secs_list = []
     total_mel_l1 = 0.0
     total_bleu = 0.0
 
@@ -1263,9 +1417,9 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        # Đo SECS
-        secs = 0.7250 if tts_engine == "xtts" else 0.6850
-        total_secs += secs
+        # Đo SECS thật (WavLM-SV) giữa giọng nguồn và giọng clone sinh ra
+        secs = compute_secs(src_w, 16000, gen_wav_24k, 24000, device)
+        secs_list.append(secs)
 
         # Đo sai số phổ Mel L1
         tgt_24k = resample_16k_to_24k(tgt_w.unsqueeze(0).to(device=device, dtype=torch.float32))
@@ -1322,7 +1476,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, s2tt_mode, args, devic
         print(f"  📊 RTF: {rtf:.4f} | Mel L1: {mel_l1:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
 
     avg_rtf = total_rtf / max(1, args.num_samples)
-    avg_secs = total_secs / max(1, args.num_samples)
+    avg_secs = nanmean(secs_list)
     avg_mel_l1 = total_mel_l1 / max(1, args.num_samples)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
@@ -1602,6 +1756,13 @@ def main():
                         help="Mô hình dịch máy (MT) cho 3-step & Case 0: 'vinai' (vinai/vinai-translate-vi2en-v2 SOTA), 'nllb' (facebook/nllb-200-distilled-600M), 'opus', hoặc 'auto' (ưu tiên VinAI -> NLLB)")
     args = parser.parse_args()
 
+    # Fallback checkpoint: run.sh lưu tên theo experiment (cfm_en-best.pth, bridge_vien-best.pth)
+    for attr, alt in [("cfm_ckpt", "checkpoints/cfm_en-best.pth"), ("bridge_ckpt", "checkpoints/bridge_vien-best.pth")]:
+        cur = getattr(args, attr)
+        if cur and not os.path.exists(cur) and os.path.exists(alt):
+            print(f"ℹ️ Không thấy {cur} -> dùng checkpoint {alt}")
+            setattr(args, attr, alt)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
@@ -1721,7 +1882,7 @@ def main():
             cid = s.get("case_id", 0)
             tag = s.get("case_tag", "")
             if cid == 0:
-                note = "Cascaded Baseline: PhoWhisper ASR -> Opus-MT -> MMS-TTS-Eng."
+                note = "Cascaded Baseline: PhoWhisper ASR -> VinAI-Translate/NLLB-200 -> MMS-TTS-Eng."
             elif cid == 1:
                 note = "Zero-baseline (chưa huấn luyện): Sinh nhiễu Gaussian ngẫu nhiên."
             elif cid == 2:
