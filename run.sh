@@ -253,6 +253,22 @@ sys.exit(1)
         MODE="${3:-}"
         MODEL_ID="${4:-}"
         NUM_SAMPLES="${5:-10}"
+        # SeamlessM4T-v2 (direct S2ST, không có biến thể): bash run.sh bench seamless [số_mẫu]
+        if [[ "$ENGINE" == "seamless" ]]; then
+            NUM_SAMPLES="${3:-10}"
+            TAG="case_5_seamless_direct_seamless-m4t-v2-large"
+            rm -f "outputs/benchmark/case_5/metrics.json"
+            echo "🧪 Benchmark SeamlessM4T-v2-large (Direct S2ST, $NUM_SAMPLES mẫu)"
+            bash "$0" eval 5 both "$NUM_SAMPLES" auto 2>&1 | tee "$LOG_DIR/bench_${TAG}.log" || true
+            if [ ! -f "outputs/benchmark/case_5/metrics.json" ]; then
+                echo "❌ Seamless lỗi — KHÔNG đẩy lên Drive. Xem log: $LOG_DIR/bench_${TAG}.log"
+                exit 1
+            fi
+            cp "$LOG_DIR/bench_${TAG}.log" "outputs/benchmark/case_5/bench.log"
+            rclone copy "outputs/benchmark/case_5" "gdrive:runs/benchmark/${TAG}/" -P \
+                && echo "✓ Đã đẩy $TAG lên Drive." || { echo "❌ rclone lỗi"; exit 1; }
+            exit 0
+        fi
         if [[ -z "$ENGINE" || -z "$MODE" || -z "$MODEL_ID" ]]; then
             echo "❌ Thiếu tham số. Cú pháp: bash run.sh bench <xtts|f5> <2step|3step> <model_hf_id> [số_mẫu]"
             echo "   VD: bash run.sh bench xtts 3step vinai/PhoWhisper-large 10"
@@ -295,7 +311,8 @@ sys.exit(1)
     bench-list)
         # In ra toàn bộ lệnh của bộ benchmark đầy đủ (12 biến thể) để copy sang từng notebook
         N="${2:-10}"
-        echo "📋 12 lệnh benchmark độc lập ($N mẫu mỗi lệnh) — mỗi lệnh chạy trên 1 notebook:"
+        echo "📋 13 lệnh benchmark độc lập ($N mẫu mỗi lệnh) — mỗi lệnh chạy trên 1 notebook:"
+        echo "  bash run.sh bench seamless $N"
         for ENG in xtts f5; do
             for M in openai/whisper-small openai/whisper-large-v3 vinai/PhoWhisper-small vinai/PhoWhisper-large; do
                 echo "  bash run.sh bench $ENG 2step $M $N"
@@ -335,7 +352,8 @@ sys.exit(1)
         echo "  bash run.sh eval xtts [both|2step|3step] -> Benchmark riêng XTTS-v2 Voice Cloning"
         echo "  bash run.sh eval f5 [both|2step|3step]   -> Benchmark riêng F5-TTS Flow-Matching"
         echo "  bash run.sh eval all             -> Benchmark toàn bộ hệ sinh thái (Case 0, 6, 7, 1, 2, 3, 4)"
-        echo "  bash run.sh bench-list [N]       -> In 12 lệnh benchmark độc lập (mỗi notebook chạy 1 lệnh)"
+        echo "  bash run.sh bench-list [N]       -> In 13 lệnh benchmark độc lập (mỗi notebook chạy 1 lệnh)"
+        echo "  bash run.sh bench seamless [N]   -> Chạy SeamlessM4T-v2 (Direct S2ST) + tự đẩy lên Drive"
         echo "  bash run.sh bench <xtts|f5> <2step|3step> <model> [N] -> Chạy 1 biến thể + tự đẩy lên Drive"
         echo "  bash run.sh analyze              -> Gom kết quả mọi biến thể từ Drive + xuất báo cáo phân tích"
         echo "  bash run.sh stop [tên_exp]       -> Dừng huấn luyện"

@@ -104,20 +104,26 @@ def apply_torchaudio_mock_if_needed():
             return AudioMetaData()
 
         def _resample(waveform, orig_freq, new_freq, **kwargs):
-            """Thay thế torchaudio.functional.resample bằng torch interpolate."""
+            """Thay thế torchaudio.functional.resample: resample FFT (band-limited, chống aliasing),
+            chất lượng tốt hơn nhiều so với nội suy tuyến tính. Hỗ trợ tensor (..., time)."""
+            orig_freq, new_freq = int(orig_freq), int(new_freq)
             if orig_freq == new_freq:
                 return waveform
-            ratio = new_freq / orig_freq
-            if waveform.ndim == 1:
-                waveform = waveform.unsqueeze(0).unsqueeze(0)
-                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
-                return out.squeeze(0).squeeze(0)
-            elif waveform.ndim == 2:
-                waveform = waveform.unsqueeze(1)
-                out = torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
-                return out.squeeze(1)
+            x = waveform
+            is_int = not torch.is_floating_point(x)
+            if is_int:
+                x = x.float()
+            n = x.shape[-1]
+            m = max(1, int(round(n * new_freq / orig_freq)))
+            X = torch.fft.rfft(x.to(torch.float32), dim=-1)
+            k = m // 2 + 1
+            if X.shape[-1] >= k:
+                X = X[..., :k]                     # hạ tần số: cắt bỏ dải trên Nyquist mới
             else:
-                return torch.nn.functional.interpolate(waveform, scale_factor=ratio, mode='linear', align_corners=False)
+                pad = torch.zeros(X.shape[:-1] + (k - X.shape[-1],), dtype=X.dtype, device=X.device)
+                X = torch.cat([X, pad], dim=-1)    # tăng tần số: chèn 0 ở dải cao
+            y = torch.fft.irfft(X, n=m, dim=-1) * (m / n)
+            return y.to(waveform.dtype) if not is_int else y
 
         ta_func_func.hz_to_mel = _hz_to_mel
         ta_func_func.mel_to_hz = _mel_to_hz
@@ -259,6 +265,15 @@ try:
         def forward(self, x):
             return self.mel_scale(self.spectrogram(x))
 
+    class MockResample(nn.Module):
+        """Mock torchaudio.transforms.Resample (F5-TTS dùng khi audio tham chiếu khác 24kHz)."""
+        def __init__(self, orig_freq=16000, new_freq=16000, *args, **kwargs):
+            super().__init__()
+            self.orig_freq, self.new_freq = int(orig_freq), int(new_freq)
+
+        def forward(self, x):
+            return sys.modules["torchaudio.functional"].resample(x, self.orig_freq, self.new_freq)
+
     def _install_mel_mocks():
         """Gắn các lớp Mock (tính toán thật) vào module torchaudio giả lập.
         Chỉ chạy ở chế độ mock — nếu torchaudio native hoạt động thì giữ nguyên bản gốc."""
@@ -269,11 +284,13 @@ try:
             ta_trans.MelSpectrogram = MockMelSpectrogram
             ta_trans.Spectrogram = MockSpectrogram
             ta_trans.MelScale = MockMelScale
+            ta_trans.Resample = MockResample
         ta_mod = sys.modules.get("torchaudio")
         if ta_mod is not None and hasattr(ta_mod, "transforms"):
             ta_mod.transforms.MelSpectrogram = MockMelSpectrogram
             ta_mod.transforms.Spectrogram = MockSpectrogram
             ta_mod.transforms.MelScale = MockMelScale
+            ta_mod.transforms.Resample = MockResample
         ta_func = sys.modules.get("torchaudio.functional")
         if ta_func is not None:
             ta_func.melscale_fbanks = _mock_melscale_fbanks
@@ -384,7 +401,7 @@ CASE_DESCRIPTIONS = {
     2: "Case 2: Untrained Bridge + Trained CFM (Acoustic Only)",
     3: "Case 3: Trained Bridge + Untrained CFM (Semantic Only)",
     4: "Case 4: Trained CrossAttentionBridge + Trained CFM (Full Proposed Vi-En)",
-    5: "Case 5: Meta SeamlessM4T-v2 (SOTA Direct S2ST Benchmark)",
+    5: "Case 5: Meta SeamlessM4T-v2-large (SOTA Direct S2ST)",
     6: "Case 6: Cascaded Voice Cloning (XTTS-v2)",
     7: "Case 7: Cascaded Voice Cloning (F5-TTS Flow-Matching)",
 }
@@ -1029,7 +1046,8 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
         from transformers import SeamlessM4Tv2Model, AutoProcessor
         print("⏳ Đang nạp Meta SeamlessM4T-v2 (facebook/seamless-m4t-v2-large)...")
         processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large")
-        model = SeamlessM4Tv2Model.from_pretrained("facebook/seamless-m4t-v2-large").to(device).eval()
+        model = SeamlessM4Tv2Model.from_pretrained("facebook/seamless-m4t-v2-large",
+                                                   torch_dtype=_s2tt_dtype(device)).to(device).eval()
         print("✓ Nạp SeamlessM4T-v2 thành công!")
     except Exception as e:
         print(f"[Seamless Warning] Không thể nạp SeamlessM4T ({e}). Thử bản medium...")
@@ -1051,19 +1069,46 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
     secs_list = []
     total_bleu = 0.0
     bleu_hyps, bleu_refs = [], []
+    s2tt_hyps = []
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
         src_w = src_audio[0]
+        tgt_w = tgt_audio[0]
         ref_en_text = en_texts[0]
         ref_vi_text = vi_texts[0] if vi_texts else ""
 
         t_start = time.perf_counter()
-        audio_inputs = processor(audios=src_w.numpy(), return_tensors="pt", sampling_rate=16000).to(device)
+        try:
+            audio_inputs = processor(audio=src_w.numpy(), return_tensors="pt", sampling_rate=16000)
+        except TypeError:
+            audio_inputs = processor(audios=src_w.numpy(), return_tensors="pt", sampling_rate=16000)
+        audio_inputs = {k: (v.to(device=device, dtype=model.dtype) if torch.is_floating_point(v) else v.to(device))
+                        for k, v in audio_inputs.items()}
+        translated_en = ""
         with torch.no_grad():
-            output_tokens = model.generate(**audio_inputs, tgt_lang="eng", generate_speech=True)
-            speech_out = output_tokens[0].cpu().squeeze()
+            try:
+                # return_intermediate_token_ids=True -> lấy luôn chuỗi text tiếng Anh (bước S2TT nội bộ)
+                gen = model.generate(**audio_inputs, tgt_lang="eng", generate_speech=True,
+                                     return_intermediate_token_ids=True)
+            except TypeError:
+                gen = model.generate(**audio_inputs, tgt_lang="eng", generate_speech=True)
+            if hasattr(gen, "waveform"):
+                speech_out = gen.waveform[0]
+                lens = getattr(gen, "waveform_lengths", None)
+                if lens is not None:
+                    speech_out = speech_out[: int(lens[0])]
+                seqs = getattr(gen, "sequences", None)
+                if seqs is not None:
+                    try:
+                        translated_en = processor.decode(seqs[0].tolist(), skip_special_tokens=True).strip()
+                    except Exception:
+                        translated_en = ""
+            else:
+                speech_out = gen[0][0] if gen[0].ndim > 1 else gen[0]
+            speech_out = speech_out.float().cpu().squeeze()
         infer_time = time.perf_counter() - t_start
+        s2tt_hyps.append(translated_en)
 
         gen_duration = len(speech_out) / 16000.0
         rtf = infer_time / max(1e-4, gen_duration)
@@ -1085,11 +1130,17 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
 
         sample_name = f"sample_{idx+1:03d}"
         save_wav_file(os.path.join(wavs_dir, f"{sample_name}_case5_gen.wav"), speech_out, 16000)
+        if not os.path.exists(os.path.join(wavs_dir, f"{sample_name}_src.wav")):
+            save_wav_file(os.path.join(wavs_dir, f"{sample_name}_src.wav"), src_w, 16000)
+            save_wav_file(os.path.join(wavs_dir, f"{sample_name}_tgt.wav"), tgt_w, 16000)
+        s2tt_bleu = compute_sentence_bleu(translated_en, ref_en_text) if translated_en else float("nan")
 
         results.append({
             "sample_id": idx + 1,
             "ref_vi_text": ref_vi_text,
             "ref_en_text": ref_en_text,
+            "translated_en": translated_en,
+            "s2tt_bleu": round(s2tt_bleu, 2) if s2tt_bleu == s2tt_bleu else None,
             "asr_transcribed_en": asr_transcribed_en,
             "rtf": round(rtf, 4),
             "secs_timbre": round(secs, 4),
@@ -1099,6 +1150,8 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
 
         print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] (SeamlessM4T-v2) -------------------")
         print(f"  🇻🇳 Input Vi   : {ref_vi_text}")
+        if translated_en:
+            print(f"  📖 S2TT English: {translated_en}")
         print(f"  🎙️ S2ST ASR (En): {asr_transcribed_en}")
         print(f"  🎯 Target Ref : {ref_en_text}")
         print(f"  📊 RTF: {rtf:.4f} | SECS: {secs:.4f} | ASR-BLEU: {bleu:.2f} | Dur: {gen_duration:.2f}s")
@@ -1107,12 +1160,18 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
     avg_secs = nanmean(secs_list)
     avg_bleu = total_bleu / max(1, args.num_samples)
 
+    has_text = all(h for h in s2tt_hyps)
     summary = {
         "case_id": 5,
+        "case_tag": "case_5_seamless_direct_seamless-m4t-v2-large",
         "case_name": case_name,
+        "tts_engine": "seamless",
+        "s2tt_mode": "direct",
+        "s2tt_model": "facebook/seamless-m4t-v2-large",
+        "corpus_s2tt_bleu": compute_corpus_bleu(s2tt_hyps, bleu_refs) if has_text else float("nan"),
         "avg_rtf": round(avg_rtf, 4),
         "avg_secs_timbre": round(avg_secs, 4),
-        "avg_mel_l1_error": 0.0,
+        "avg_mel_l1_error": float("nan"),
         "avg_asr_bleu": round(avg_bleu, 2),
         "corpus_asr_bleu": compute_corpus_bleu(bleu_hyps, bleu_refs),
         "num_samples": args.num_samples,
@@ -1123,6 +1182,8 @@ def evaluate_seamless_case(args, device, data_pipeline, en_asr_tools=None):
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     return summary
+
+F5_MAX_REF_SEC = 11.0  # F5-TTS chỉ dùng tối đa ~12s audio tham chiếu
 
 def sanitize_text_for_f5(text):
     """Chuẩn hóa văn bản tiếng Việt sang ký tự Latinh ASCII để tương thích hoàn toàn với vocab F5-TTS."""
@@ -1481,7 +1542,7 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
             return gen_wav_24k
         except Exception as e:
             print(f"  ⚠️ XTTS-v2 lỗi tại mẫu {idx+1}: {e}")
-            return torch.zeros(24000)
+            return None
         finally:
             if os.path.exists(temp_out_path):
                 try: os.remove(temp_out_path)
@@ -1489,20 +1550,39 @@ def synthesize_voice_clone(tts_engine, tts_model, text, ref_wav_path, ref_vi_tex
 
     elif tts_engine == "f5tts":
         f5_ref_text = sanitize_text_for_f5(ref_vi_text)
+        f5_ref_path = ref_wav_path
         try:
+            # F5-TTS tự cắt audio tham chiếu > 12s nhưng GIỮ NGUYÊN ref_text -> audio và chữ lệch nhau,
+            # model đọc lẫn phần chữ tiếng Việt thừa vào đầu câu ("Ho Chiwu Mi Heu Lan...").
+            # Tự cắt trước: giữ F5_MAX_REF_SEC giây đầu + cắt ref_text theo tỉ lệ thời lượng.
+            import soundfile as sf
+            ref_np, ref_sr = sf.read(ref_wav_path)
+            ref_dur = len(ref_np) / float(ref_sr)
+            if ref_dur > F5_MAX_REF_SEC:
+                keep = F5_MAX_REF_SEC / ref_dur
+                words = f5_ref_text.split()
+                n_keep = max(1, int(round(len(words) * keep)))
+                f5_ref_text = " ".join(words[:n_keep])
+                f5_ref_path = ref_wav_path.replace(".wav", "_f5clip.wav")
+                sf.write(f5_ref_path, ref_np[: int(F5_MAX_REF_SEC * ref_sr)], ref_sr)
             gen_wav_np, sr, _ = tts_model.infer(
-                ref_file=ref_wav_path,
+                ref_file=f5_ref_path,
                 ref_text=f5_ref_text,
                 gen_text=text,
             )
             gen_wav_24k = torch.as_tensor(gen_wav_np, dtype=torch.float32).squeeze()
             if gen_wav_24k.ndim > 1: gen_wav_24k = gen_wav_24k[0]
             if sr != 24000:
-                gen_wav_24k = resample_16k_to_24k(gen_wav_24k.unsqueeze(0)).squeeze(0)
+                gen_wav_24k = sys.modules["torchaudio.functional"].resample(gen_wav_24k, sr, 24000) \
+                    if "torchaudio.functional" in sys.modules else resample_16k_to_24k(gen_wav_24k.unsqueeze(0)).squeeze(0)
             return gen_wav_24k
         except Exception as e:
             print(f"  ⚠️ F5-TTS lỗi tại mẫu {idx+1}: {e}")
-            return torch.zeros(24000)
+            return None
+        finally:
+            if f5_ref_path != ref_wav_path and os.path.exists(f5_ref_path):
+                try: os.remove(f5_ref_path)
+                except Exception: pass
 
     return torch.zeros(24000)
 
@@ -1543,6 +1623,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
     bleu_hyps, bleu_refs = [], []
     s2tt_hyps = []
     n_not_translated = 0
+    n_tts_failed = 0
 
     for idx in range(args.num_samples):
         src_audio, tgt_audio, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=1, return_text=True)
@@ -1576,7 +1657,9 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
             try: os.remove(temp_ref_path)
             except Exception: pass
 
-        if gen_wav_24k is None or gen_wav_24k.numel() == 0:
+        tts_failed = gen_wav_24k is None or gen_wav_24k.numel() == 0
+        if tts_failed:
+            n_tts_failed += 1
             gen_wav_24k = torch.zeros(24000)
 
         t_end = time.perf_counter()
@@ -1586,8 +1669,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
         rtf = infer_time / max(1e-4, gen_duration)
         total_rtf += rtf
 
-        # Đo SECS thật (WavLM-SV) giữa giọng nguồn và giọng clone sinh ra
-        secs = compute_secs(src_w, 16000, gen_wav_24k, 24000, device)
+        # Đo SECS thật (WavLM-SV) giữa giọng nguồn và giọng clone sinh ra (TTS lỗi -> NaN, không phải 0)
+        secs = float("nan") if tts_failed else compute_secs(src_w, 16000, gen_wav_24k, 24000, device)
         secs_list.append(secs)
 
         # Đo sai số phổ Mel L1
@@ -1630,6 +1713,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
             "asr_vi_text": transcribed_vi,
             "translated_en": translated_en,
             "s2tt_not_translated": bool(not_translated),
+            "tts_failed": bool(tts_failed),
             "ref_en_text": ref_en_text,
             "asr_transcribed_en": asr_transcribed_en,
             "rtf": round(rtf, 4),
@@ -1664,6 +1748,7 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
         "s2tt_mode": s2tt_mode,
         "s2tt_model": variant["model_id"],
         "num_not_translated": n_not_translated,
+        "num_tts_failed": n_tts_failed,
         "corpus_s2tt_bleu": compute_corpus_bleu(s2tt_hyps, bleu_refs),
         "avg_rtf": round(avg_rtf, 4),
         "avg_secs_timbre": round(avg_secs, 4),
@@ -1674,6 +1759,8 @@ def evaluate_single_voice_clone_run(case_num, tts_engine, variant, args, device,
         "samples": results
     }
 
+    if n_tts_failed:
+        print(f"⚠️ {n_tts_failed}/{args.num_samples} mẫu TTS bị LỖI (ASR-BLEU tính 0, SECS bỏ qua) — xem log phía trên.")
     if n_not_translated:
         print(f"⚠️ {n_not_translated}/{args.num_samples} câu S2TT vẫn là tiếng Việt -> {variant['model_id']} không dịch được sang tiếng Anh.")
 
@@ -1963,6 +2050,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        print(f"🖥️ Thiết bị: GPU {props.name} ({props.total_memory / 1024**3:.1f} GB VRAM) | torch {torch.__version__}")
+    else:
+        print(f"🖥️ Thiết bị: CPU ({os.cpu_count()} luồng) | torch {torch.__version__} "
+              "— ⚠️ KHÔNG có GPU: RTF sẽ cao bất thường, nhất là F5-TTS (32 bước ODE)")
 
     vocos = load_vocos(device)
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
@@ -1979,8 +2072,10 @@ def main():
 
     case_arg = args.case.lower()
     if case_arg == "all":
-        cases_to_run = [0, 6, 7, 1, 2, 3, 4]
-    elif case_arg in ["sota", "both_tts", "cascaded_sota"]:
+        cases_to_run = [0, 5, 6, 7, 1, 2, 3, 4]
+    elif case_arg == "sota":
+        cases_to_run = [5, 6, 7]   # SeamlessM4T-v2 (direct S2ST) + XTTS-v2 + F5-TTS (cascaded)
+    elif case_arg in ["both_tts", "cascaded_sota"]:
         cases_to_run = [6, 7]
     elif case_arg in ["xtts", "6"]:
         cases_to_run = [6]
