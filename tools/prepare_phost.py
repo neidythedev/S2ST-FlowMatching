@@ -133,6 +133,38 @@ def cut_talk(wav_path, sents, out_wav_dir, tid, split):
     return rows
 
 
+def repair_manifest(manifest, out_dir):
+    """Làm sạch manifest trước khi chạy tiếp:
+    - bỏ dòng trùng id (do chạy 2 bản cùng lúc)
+    - bỏ dòng có file wav thiếu / hỏng / độ dài không khớp en_dur
+    - bỏ TOÀN BỘ bài nói nào có dòng hỏng -> bài đó sẽ được cắt lại sạch sẽ
+    Trả về (tập bài đã xong, tổng số giây)."""
+    import soundfile as sf
+    with open(manifest, "r", encoding="utf-8") as f:
+        rows = [json.loads(l) for l in f if l.strip()]
+    uniq = {}
+    for r in rows:
+        uniq.setdefault(r["id"], r)
+    bad_talks = set()
+    for r in uniq.values():
+        try:
+            dur = sf.info(os.path.join(out_dir, r["en_wav"])).duration
+            if abs(dur - float(r["en_dur"])) > 0.05:
+                bad_talks.add(r["talk_id"])
+        except Exception:
+            bad_talks.add(r["talk_id"])
+    keep = [r for r in uniq.values() if r["talk_id"] not in bad_talks]
+    if len(keep) != len(rows):
+        tmp = manifest + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in keep:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp, manifest)
+        print(f"🧹 Sửa manifest: {len(rows)} dòng -> {len(uniq)} không trùng -> {len(keep)} hợp lệ "
+              f"(cắt lại {len(bad_talks)} bài có file hỏng)")
+    return {r["talk_id"] for r in keep}, sum(float(r["en_dur"]) for r in keep)
+
+
 def download_text(split, text_root):
     from huggingface_hub import snapshot_download
     print(f"📥 Tải text_data/{split} (HF có thể giới hạn tốc độ -> tự chờ rồi thử lại)...")
@@ -184,12 +216,21 @@ def main():
     manifest = os.path.join(args.out_dir, f"manifest_{args.split}.jsonl")
     done = set()
     have_sec = 0.0
+
+    # Chặn chạy 2 bản cùng lúc trên cùng manifest (2 bản dùng chung seed sẽ xử lý trùng bài,
+    # ghi trùng dòng và tranh nhau file wav tạm -> treo / hỏng file)
+    lock_f = open(os.path.join(args.out_dir, f".prepare_{args.split}.lock"), "w")
+    try:
+        import fcntl
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        pass                                   # Windows: không có fcntl -> bỏ qua khóa
+    except OSError:
+        sys.exit(f"❌ Đang có một tiến trình prepare_phost khác chạy split '{args.split}'. "
+                 "Kiểm tra: pgrep -af prepare_phost.py — chỉ chạy MỘT bản.")
+
     if os.path.exists(manifest):
-        with open(manifest, "r", encoding="utf-8") as f:
-            for line in f:
-                r = json.loads(line)
-                done.add(r["talk_id"])
-                have_sec += r["en_dur"]
+        done, have_sec = repair_manifest(manifest, args.out_dir)
         print(f"⚡ Tiếp tục: đã có {len(done)} bài, {have_sec/3600:.2f} giờ trong {manifest}")
 
     stats = {k: 0 for k in ["talk_missing_text", "talk_misaligned", "drop_duration", "drop_text", "drop_ratio",
