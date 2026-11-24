@@ -834,8 +834,11 @@ def main():
             best_l1 = min(results, key=lambda r: r["mel_l1"])
             lines += ["", f"- WER thấp nhất (rõ chữ nhất): **{best_wer['variant']}**",
                       f"- Mel L1 thấp nhất (sát phổ nhất): **{best_l1['variant']}**",
-                      "- Chênh WER < ~3 điểm với 16 câu là trong vùng nhiễu → ưu tiên Mel L1 và nghe thử "
-                      f"`{out_root}/<biến thể>/val_XX_pred.wav` so với `val_XX_gt_mel_vocos.wav`."]
+                      "- Xếp hạng theo **WER tái tạo** (độ rõ chữ) + nghe thử "
+                      f"`{out_root}/<biến thể>/val_XX_pred.wav` so với `val_XX_gt_mel_vocos.wav`.",
+                      "- ⚠️ KHÔNG xếp hạng giữa các kiến trúc bằng Mel L1 / val loss: loss MSE thưởng cho Mel bị làm mượt "
+                      "(mô hình mờ có Mel L1 thấp nhưng không nghe ra chữ). Chỉ dùng chúng để theo dõi cùng một mô hình qua epoch.",
+                      "- Chênh WER < ~3 điểm với 16 câu là trong vùng nhiễu."]
         report = "\n".join(lines)
         with open(os.path.join(out_root, "compare_report.md"), "w", encoding="utf-8") as f:
             f.write(report)
