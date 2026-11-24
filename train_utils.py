@@ -329,6 +329,11 @@ class EnglishASR:
     def _load(self):
         if self.mod is None:
             from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
+            try:   # tắt cảnh báo lặp "max_new_tokens ... max_length" làm rối log
+                from transformers.utils import logging as hf_logging
+                hf_logging.set_verbosity_error()
+            except Exception:
+                pass
             self.feat = WhisperFeatureExtractor.from_pretrained(self.model_id)
             self.tok = WhisperTokenizer.from_pretrained(self.model_id, language="en", task="transcribe")
             self.mod = WhisperForConditionalGeneration.from_pretrained(self.model_id).to(self.device).eval()
@@ -353,6 +358,95 @@ def resample_24k_to_16k_fft(w24):
     m = int(round(n * 16000 / 24000))
     X = torch.fft.rfft(w)[: m // 2 + 1]
     return torch.fft.irfft(X, n=m) * (m / n)
+
+
+# ------------------------------------------------------------------------------
+# Nguồn dữ liệu audio cục bộ (manifest jsonl, VD PhoST) + trộn nhiều nguồn
+# ------------------------------------------------------------------------------
+class ManifestAudioPipeline:
+    """Đọc audio 16kHz từ manifest jsonl (mỗi dòng có trường `audio_key`, đường dẫn tương đối so với
+    thư mục chứa manifest). Xáo trộn lại mỗi lượt (seed + số lượt). Giao diện giống pipeline FLEURS:
+    fetch_batch(batch_size) -> (audio_đệm [B, N], transcripts) và thuộc tính last_lengths."""
+    def __init__(self, manifest, audio_key="en_wav", text_key="en_text", max_sec=12.0, shuffle_seed=0, name=None):
+        import json
+        self.root = os.path.dirname(os.path.abspath(manifest))
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.rows = [json.loads(l) for l in f if l.strip()]
+        if not self.rows:
+            raise RuntimeError(f"Manifest rỗng: {manifest}")
+        self.audio_key, self.text_key = audio_key, text_key
+        self.max_samples = int(16000 * max_sec) if max_sec else None
+        self.seed, self.pass_idx, self.pos = shuffle_seed, 0, 0
+        self.name = name or os.path.basename(manifest)
+        self.last_lengths = []
+        self._shuffle()
+        hours = sum(float(r.get("en_dur", 0)) for r in self.rows) / 3600.0
+        print(f"✓ Manifest {self.name}: {len(self.rows)} câu, ~{hours:.1f} giờ")
+
+    def _shuffle(self):
+        import random
+        self.order = list(range(len(self.rows)))
+        random.Random(self.seed * 1000 + self.pass_idx).shuffle(self.order)
+        self.pos = 0
+
+    def next_item(self):
+        import soundfile as sf
+        for _ in range(50):
+            if self.pos >= len(self.order):
+                self.pass_idx += 1
+                self._shuffle()
+                print(f"   🔁 [{self.name}] Đã đọc hết -> bắt đầu lượt thứ {self.pass_idx + 1}")
+            r = self.rows[self.order[self.pos]]
+            self.pos += 1
+            try:
+                w, sr = sf.read(os.path.join(self.root, r[self.audio_key]), dtype="float32", always_2d=True)
+            except Exception:
+                continue           # file lỗi -> bỏ qua, lấy câu kế tiếp
+            w = torch.from_numpy(w.mean(axis=1))
+            if sr != 16000:
+                raise RuntimeError(f"{r[self.audio_key]} có sample rate {sr}, cần 16000")
+            if self.max_samples:
+                w = w[: self.max_samples]
+            if w.numel() >= 1600:
+                return w, r.get(self.text_key, "")
+        raise RuntimeError(f"Quá nhiều file lỗi liên tiếp trong {self.name}")
+
+    def fetch_batch(self, batch_size=4):
+        items = [self.next_item() for _ in range(batch_size)]
+        return pad_batch(items, self)
+
+
+def pad_batch(items, owner):
+    """[(wave 1D, text)] -> (tensor đệm [B, N], [text]); ghi owner.last_lengths."""
+    owner.last_lengths = [int(w.shape[0]) for w, _ in items]
+    n = max(owner.last_lengths)
+    return torch.stack([F.pad(w, (0, n - w.shape[0])) for w, _ in items]), [t for _, t in items]
+
+
+class MixedAudioPipeline:
+    """Trộn nhiều nguồn theo tỉ lệ: mỗi câu trong batch được lấy từ nguồn i với xác suất weights[i]
+    (seed cố định -> tái lập được). Nguồn cần có next_item() hoặc fetch_batch(1)."""
+    def __init__(self, sources, weights, seed=0):
+        import random
+        total = float(sum(weights))
+        self.sources, self.weights = sources, [w / total for w in weights]
+        self.rng = random.Random(seed)
+        self.last_lengths = []
+        self.counts = [0] * len(sources)
+
+    def _one(self, src):
+        if hasattr(src, "next_item"):
+            return src.next_item()
+        wav, txt = src.fetch_batch(batch_size=1)
+        return wav[0, : src.last_lengths[0]], txt[0]
+
+    def fetch_batch(self, batch_size=4):
+        items = []
+        for _ in range(batch_size):
+            i = self.rng.choices(range(len(self.sources)), weights=self.weights)[0]
+            self.counts[i] += 1
+            items.append(self._one(self.sources[i]))
+        return pad_batch(items, self)
 
 
 # ------------------------------------------------------------------------------

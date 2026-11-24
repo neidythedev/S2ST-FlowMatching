@@ -11,6 +11,7 @@ import time
 import math
 import argparse
 import json
+import re
 import types
 import importlib.machinery
 import wave
@@ -102,6 +103,7 @@ if "torchaudio" in sys.modules and hasattr(sys.modules["torchaudio"], "transform
 
 from train_utils import (
     FlowMatchingTargetDecoder, ResidualBlock1D, DECODER_PRESETS, sample_t, masked_mel_l1,
+    ManifestAudioPipeline, MixedAudioPipeline,
     encode_whisper, latent_lengths, mel_lengths, length_mask, masked_mse,
     EnglishASR, corpus_wer, resample_24k_to_16k_fft, sync_to_drive,
 )
@@ -197,6 +199,9 @@ def load_yaml_config(config_path):
         "data": {
             "dataset_name": "google/fleurs",
             "lang": "en_us",
+            "sources": "fleurs",                                   # fleurs | fleurs+phost
+            "phost_manifest": "data/phost/manifest_train.jsonl",   # tạo bằng: bash run.sh prepare-phost train 50
+            "phost_weight": 0.7,                                   # tỉ lệ câu PhoST khi trộn
             "sample_rate": 24000,
             "sample_rate_whisper": 16000,
             "max_audio_sec": 12.0,
@@ -515,6 +520,12 @@ def main():
     parser.add_argument("--compare-steps", type=int, default=3000, help="Số bước train cho mỗi biến thể khi so sánh")
     parser.add_argument("--target-encoder", type=str, default=None,
                         help="Encoder PHÍA ĐÍCH (nghe audio tiếng Anh để tạo điều kiện c). Mặc định: model.target_encoder trong config")
+    parser.add_argument("--data", type=str, default=None,
+                        help="Nguồn dữ liệu train: 'fleurs' | 'fleurs+phost' (audio Anh PhoST, không cần text). Mặc định: data.sources")
+    parser.add_argument("--phost-manifest", type=str, default=None, help="Mặc định: data.phost_manifest")
+    parser.add_argument("--phost-weight", type=float, default=None, help="Tỉ lệ câu lấy từ PhoST khi trộn. Mặc định: data.phost_weight")
+    parser.add_argument("--compare-data", type=str, default=None,
+                        help="EXP03: so sánh nguồn dữ liệu, VD 'fleurs,fleurs+phost'; kết hợp --compare-encoders để chạy lưới 2×2")
     parser.add_argument("--compare-encoders", type=str, default=None,
                         help="EXP02: so sánh encoder phía đích, VD 'vinai/PhoWhisper-small,openai/whisper-small' (decoder giữ cố định)")
     args = parser.parse_args()
@@ -678,6 +689,28 @@ def main():
         print("=" * 75 + "\n")
         return
 
+    phost_manifest = args.phost_manifest or cfg["data"].get("phost_manifest", "data/phost/manifest_train.jsonl")
+    phost_weight = float(args.phost_weight if args.phost_weight is not None else cfg["data"].get("phost_weight", 0.7))
+
+    def make_train_pipeline(spec):
+        """'fleurs' -> FLEURS streaming | 'fleurs+phost' -> trộn FLEURS (1-w) + audio Anh PhoST (w), seed cố định."""
+        fleurs = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
+                                                  allow_synthetic=args.smoke_test,
+                                                  shuffle_seed=None if args.smoke_test else 42)
+        if spec == "fleurs":
+            return fleurs
+        if spec == "fleurs+phost":
+            if not os.path.exists(phost_manifest):
+                raise RuntimeError(f"Không thấy {phost_manifest}. Chạy: bash run.sh prepare-phost train 50 "
+                                   "(hoặc rclone copy gdrive:datasets/phost/ data/phost/)")
+            phost = ManifestAudioPipeline(phost_manifest, audio_key="en_wav", text_key="en_text",
+                                          max_sec=12.0, shuffle_seed=42, name="PhoST-en")
+            print(f"🔀 Trộn dữ liệu: FLEURS {1 - phost_weight:.0%} + PhoST {phost_weight:.0%}")
+            return MixedAudioPipeline([fleurs, phost], [1.0 - phost_weight, phost_weight], seed=0)
+        raise ValueError(f"Nguồn dữ liệu không hợp lệ: {spec} (dùng 'fleurs' hoặc 'fleurs+phost')")
+
+    train_data_spec = args.data or cfg["data"].get("sources", "fleurs")
+
     # Huấn luyện thông thường
     if not (feat_extractor and whisper_enc) and not args.smoke_test:
         raise RuntimeError("Không nạp được Whisper encoder — dừng để tránh train trên latent ngẫu nhiên.")
@@ -785,15 +818,21 @@ def main():
     # ==========================================================================
     # CHẾ ĐỘ SO SÁNH KIẾN TRÚC DECODER (công bằng: cùng dữ liệu, cùng thứ tự, cùng seed, cùng số bước)
     # ==========================================================================
-    if args.compare_decoders or args.compare_encoders:
-        compare_enc = bool(args.compare_encoders)
-        if compare_enc:
-            fixed_dec = args.decoder or cfg["model"].get("decoder_preset", "v2")
-            runs = [{"label": e.strip().split("/")[-1], "decoder": fixed_dec, "encoder": e.strip()}
+    if args.compare_decoders or args.compare_encoders or args.compare_data:
+        compare_enc = bool(args.compare_encoders) or bool(args.compare_data)
+        fixed_dec = args.decoder or cfg["model"].get("decoder_preset", "v2")
+        if args.compare_data:
+            encs = [e.strip() for e in (args.compare_encoders or whisper_id).split(",") if e.strip()]
+            datas = [d.strip() for d in args.compare_data.split(",") if d.strip()]
+            runs = [{"label": f"{e.split('/')[-1]} | {d}", "decoder": fixed_dec, "encoder": e, "data": d}
+                    for d in datas for e in encs]
+            out_root, kind = "outputs/sanity/exp03_data_encoder", "DỮ LIỆU × ENCODER ĐÍCH"
+        elif args.compare_encoders:
+            runs = [{"label": e.strip().split("/")[-1], "decoder": fixed_dec, "encoder": e.strip(), "data": train_data_spec}
                     for e in args.compare_encoders.split(",") if e.strip()]
             out_root, kind = "outputs/sanity/encoder_compare", "ENCODER PHÍA ĐÍCH"
         else:
-            runs = [{"label": v.strip(), "decoder": v.strip(), "encoder": whisper_id}
+            runs = [{"label": v.strip(), "decoder": v.strip(), "encoder": whisper_id, "data": train_data_spec}
                     for v in args.compare_decoders.split(",") if v.strip()]
             out_root, kind = "outputs/sanity/decoder_compare", "DECODER"
         variants = [r["label"] for r in runs]
@@ -814,10 +853,8 @@ def main():
                                       weight_decay=float(train_cfg["weight_decay"]), betas=(0.9, 0.999))
             sch_c = torch.optim.lr_scheduler.LambdaLR(
                 opt_c, lambda st: max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, st / n_steps)))))
-            pipe = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
-                                                    allow_synthetic=args.smoke_test,
-                                                    shuffle_seed=None if args.smoke_test else 42)
-            print(f"\n▶️ [{v}] encoder đích {run['encoder']} | decoder {model.decoder.config['arch']} "
+            pipe = make_train_pipeline(run["data"])
+            print(f"\n▶️ [{v}] dữ liệu {run['data']} | encoder đích {run['encoder']} | decoder {model.decoder.config['arch']} "
                   f"| {n_par/1e6:.2f}M tham số | t: {model.t_sampling}")
             model.train()
             t0 = time.time()
@@ -837,8 +874,10 @@ def main():
                     run_loss = 0.0
             sec_per_step = (time.time() - t0) / n_steps
             val_l = eval_val_loss()
-            ev = eval_resynthesis(save_dir=os.path.join(out_root, v.replace("+", "_")))
-            res = {"variant": v, "encoder": run["encoder"], "decoder": run["decoder"],
+            ev = eval_resynthesis(save_dir=os.path.join(out_root, re.sub(r"[^\w.-]+", "_", v)))
+            if hasattr(pipe, "counts"):
+                print(f"   ℹ️ Số câu đã dùng theo nguồn (FLEURS, PhoST): {pipe.counts}")
+            res = {"variant": v, "encoder": run["encoder"], "decoder": run["decoder"], "data": run["data"],
                    "params_M": round(n_par / 1e6, 2), "steps": n_steps, "sec_per_step": round(sec_per_step, 3),
                    "val_loss": round(val_l, 4), "mel_l1": round(ev["mel_l1"], 4), "wer": round(ev["wer"], 1),
                    "gt_wer": round(ev["gt_wer"], 1)}
@@ -854,6 +893,7 @@ def main():
         # Bảng tổng hợp + xếp hạng
         lines = [f"# ⚖️ SO SÁNH {kind} (Stage 1 CFM)", "",
                  (f"Decoder cố định: {runs[0]['decoder']}. " if compare_enc else f"Encoder đích: {whisper_id}. ") +
+                 (f"PhoST: {phost_manifest} (tỉ lệ {phost_weight:.0%}). " if args.compare_data else "") +
                  f"Cùng dữ liệu FLEURS {data_lang}, cùng thứ tự, seed 0, {n_steps} bước/biến thể, batch {batch_size}. "
                  f"Đánh giá trên {sum(x[0].shape[0] for x in val_set)} câu validation cố định "
                  f"(WER trên {eval_wer_clips} câu đầu; WER audio gốc qua cùng ASR = {results[0]['gt_wer'] if results else 'nan'}%).", "",
@@ -878,7 +918,9 @@ def main():
             json.dump(results, f, ensure_ascii=False, indent=2)
         print("\n" + report)
         print(f"\n📁 Báo cáo: {out_root}/compare_report.md | audio nghe thử: {out_root}/<biến thể>/")
-        if compare_enc:
+        if args.compare_data:
+            print("👉 Chọn dữ liệu/encoder rồi đặt 'data.sources' và 'model.target_encoder' trong configs/stage1_cfm_en.yaml")
+        elif compare_enc:
             print("👉 Chọn encoder tốt nhất rồi đặt 'model.target_encoder' trong configs/stage1_cfm_en.yaml")
         else:
             print("👉 Chọn biến thể tốt nhất rồi đặt 'decoder_preset' (và 't_sampling') trong configs/stage1_cfm_en.yaml")
@@ -917,9 +959,8 @@ def main():
     elif args.resume:
         print(f"[Resume] Không thấy {ckpt_path} -> train từ đầu.")
 
-    train_pipeline = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
-                                                      allow_synthetic=args.smoke_test,
-                                                      shuffle_seed=None if args.smoke_test else 42)
+    train_pipeline = make_train_pipeline(train_data_spec)
+    print(f"📚 Dữ liệu train Stage 1: {train_data_spec}")
     sync_enabled = bool(train_cfg.get("sync_drive", True)) and not args.smoke_test
     print(f"[Training Config] {epochs} epochs × {steps_per_epoch} steps × batch {batch_size} "
           f"| LR cosine {train_cfg['learning_rate']} → {train_cfg.get('min_lr', 1e-5)} | WER mỗi {eval_wer_every} epoch")
@@ -976,6 +1017,7 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "history": history,
             "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "target_encoder": whisper_id, "version": 4,
+                            "train_data": train_data_spec,
                             "decoder_config": model.decoder.config, "t_sampling": model.t_sampling,
                             "cond_dim": cfg["model"]["cond_dim"], "spk_dim": cfg["model"]["spk_dim"]},
             "config": cfg,

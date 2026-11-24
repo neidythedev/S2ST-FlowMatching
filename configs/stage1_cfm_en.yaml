@@ -31,6 +31,9 @@ training:
 data:
   dataset_name: "google/fleurs"
   lang: "en_us" # Huấn luyện bộ giải mã nói tiếng Anh chuẩn bản ngữ
+  sources: "fleurs"                                   # fleurs | fleurs+phost (chọn theo EXP03)
+  phost_manifest: "data/phost/manifest_train.jsonl"   # tạo bằng: bash run.sh prepare-phost train 50
+  phost_weight: 0.7                                   # tỉ lệ câu PhoST khi trộn
   sample_rate: 24000
   sample_rate_whisper: 16000
   max_audio_sec: 12.0
