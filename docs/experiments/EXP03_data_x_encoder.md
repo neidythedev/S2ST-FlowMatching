@@ -52,6 +52,26 @@ với phía nhiều dữ liệu; cần so ở điều kiện hội tụ (hoặc 
     tạo điều kiện `c` (VD dùng tầng giữa của Whisper thay vì tầng cuối).
 - Nghe kiểm tra chất lượng cắt câu PhoST (loại trừ khả năng lệch thời gian cắt).
 
+## 5b. Bổ sung (24/11): kiểm tra "PhoST có gây hại không" — chỉ FLEURS, 900 bước
+Ý tưởng: với 70% PhoST, 3000 bước chỉ cho mô hình thấy ~7 200 câu FLEURS ≈ **900 bước chỉ-FLEURS**. Nếu PhoST vô hại,
+chỉ-FLEURS-900 phải tệ ngang hoặc hơn fleurs+phost-3000.
+
+| Cấu hình (PhoWhisper, v2) | Câu FLEURS đã thấy | Val loss | Mel L1 | WER tái tạo |
+| :--- | :---: | :---: | :---: | :---: |
+| fleurs, **900 bước** | ~7 200 | 1.8418 | 2.0298 | **145.9%** |
+| fleurs+phost, 3000 bước | ~7 200 (+~16 800 PhoST) | 1.4082 | 2.2459 | **86.2%** |
+| fleurs, 3000 bước | ~24 000 | 1.3281 | 1.7591 | 69.2% |
+
+⇒ Cùng lượng FLEURS, **thêm PhoST tốt hơn hẳn** (86% vs 146%): PhoST **không gây hại**, mà giúp mô hình học phát âm tiếng
+Anh. Kết quả tệ hơn ở EXP03 là do **FLEURS bị chia bớt** ở ngân sách bước cố định, không phải do lệch miền. (WER > 100%:
+ASR nghe ra nhiều từ hơn câu gốc — mô hình mới học rất ít.) Lưu ý nhỏ: lịch LR cosine của bản 900 bước giảm nhanh hơn,
+nhưng chênh lệch 60 điểm lớn hơn nhiều so với ảnh hưởng đó.
+
+**Hệ quả:** giả thuyết "thêm dữ liệu giúp khi train đủ lâu" vẫn đứng → sau lần train Stage 1 chỉ-FLEURS đầy đủ, chạy
+**EXP04: train đầy đủ fleurs+phost** để so ở điều kiện hội tụ.
+
+*(Dòng log "train loss TB 250 bước" ở bước cuối của bản 900 bước bị chia sai — đã sửa; không ảnh hưởng train/đánh giá.)*
+
 ## 6. Giới hạn
 - 1 seed, 3000 bước; WER trên 16 câu; biến thiên giữa các lần chạy ≈ 3 điểm WER.
 - Đánh giá chỉ trên FLEURS (trong miền của FLEURS); chưa đo trên tập TED/PhoST dev.

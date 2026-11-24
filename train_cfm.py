@@ -858,7 +858,7 @@ def main():
                   f"| {n_par/1e6:.2f}M tham số | t: {model.t_sampling}")
             model.train()
             t0 = time.time()
-            run_loss = 0.0
+            run_loss, run_n = 0.0, 0
             for st in range(1, n_steps + 1):
                 opt_c.zero_grad()
                 audio_16k, _ = pipe.fetch_batch(batch_size=batch_size)
@@ -869,9 +869,11 @@ def main():
                 opt_c.step()
                 sch_c.step()
                 run_loss += loss.item()
+                run_n += 1
                 if st % 250 == 0 or st == n_steps:
-                    print(f"   [{v}] bước {st}/{n_steps} | train loss TB 250 bước: {run_loss / min(250, st):.4f}")
-                    run_loss = 0.0
+                    # Chia đúng số bước thực có trong đoạn (đoạn cuối có thể < 250 bước)
+                    print(f"   [{v}] bước {st}/{n_steps} | train loss TB {run_n} bước: {run_loss / run_n:.4f}")
+                    run_loss, run_n = 0.0, 0
             sec_per_step = (time.time() - t0) / n_steps
             val_l = eval_val_loss()
             ev = eval_resynthesis(save_dir=os.path.join(out_root, re.sub(r"[^\w.-]+", "_", v)))
