@@ -728,6 +728,16 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         print("ℹ️ Case 1: Bridge NGẪU NHIÊN + CFM NGẪU NHIÊN (zero-baseline).")
     model.eval()
 
+    # Encoder phía đích (Stage 1 có thể dùng encoder khác PhoWhisper, VD openai/whisper-small).
+    # Speaker lúc suy luận = spk_encoder(encoder_đích(audio NGUỒN)) — đúng cách lúc train Stage 2.
+    tgt_enc_id = getattr(model, "target_encoder_id", None)
+    feat_tgt = enc_tgt = None
+    if tgt_enc_id and tgt_enc_id != "vinai/PhoWhisper-small":
+        from transformers import WhisperFeatureExtractor, WhisperModel
+        print(f"⏳ Nạp encoder phía đích {tgt_enc_id} để tính speaker...")
+        feat_tgt = WhisperFeatureExtractor.from_pretrained(tgt_enc_id)
+        enc_tgt = WhisperModel.from_pretrained(tgt_enc_id).encoder.eval().to(device=device, dtype=dtype)
+
     # 2. Suy luận trên tập mẫu
     results = []
     total_rtf = 0.0
@@ -759,8 +769,13 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
 
         # Đo RTF
         t_start = time.perf_counter()
+        spk_emb = None
+        if enc_tgt is not None:
+            from train_utils import encode_whisper
+            with torch.no_grad():
+                spk_emb = model.spk_encoder(encode_whisper(src_w.unsqueeze(0), feat_tgt, enc_tgt, device, dtype))
         with torch.no_grad():
-            gen_mel = model.inference(src_latents, num_steps=args.num_steps)
+            gen_mel = model.inference(src_latents, speaker_emb=spk_emb, num_steps=args.num_steps)
         infer_time = time.perf_counter() - t_start
 
         # Giải mã Vocos

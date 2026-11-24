@@ -477,6 +477,7 @@ class ViEnS2STSystem(nn.Module):
         # mà CFM decoder đã quen -> làm NHÃN trực tiếp cho Bridge (loss chưng cất L_cond).
         self.teacher_cond_proj = nn.Linear(encoder_dim, bridge_dim)
         self.has_teacher = False
+        self.target_encoder_id = None   # None = cùng encoder với phía nguồn
 
     def teacher_condition(self, tgt_whisper, T_tgt):
         """c* [B, bridge_dim, T_tgt] = interp(cond_proj_stage1(Whisper(audio En đích)))."""
@@ -595,6 +596,8 @@ def load_stage1_into(model, ckpt_path, device, allow_legacy=False):
         if sp:
             model.spk_encoder.load_state_dict(sp, strict=True)
     model.has_teacher = has_teacher
+    # Encoder phía đích mà Stage 1 đã dùng (c* và speaker PHẢI tính bằng đúng encoder này)
+    model.target_encoder_id = (meta or {}).get("target_encoder") or (meta or {}).get("whisper_model")
     print(f"✓ Nạp Stage 1 từ {ckpt_path}: decoder ✓ | cond_proj (teacher) {'✓' if has_teacher else '✗'} "
           f"| spk_encoder {'✓' if full and any(k.startswith('spk_encoder.') for k in full) else '✗'}")
     return has_teacher
@@ -611,6 +614,7 @@ def load_stage2_into(model, ckpt_path, device):
         model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
+    model.target_encoder_id = meta.get("target_encoder")
     return meta
 
 # ==============================================================================
@@ -870,6 +874,27 @@ def main():
         if not (args.overfit_16 or args.sanity_check or args.smoke_test):
             raise RuntimeError("Train Stage 2 cần CFM Stage 1 đã train. Chạy: bash run.sh restore cfm_en  (hoặc start cfm_en).")
 
+    # Encoder phía đích (nghe audio tiếng Anh -> c*, speaker). Khác encoder nguồn thì nạp riêng.
+    tgt_enc_id = getattr(model, "target_encoder_id", None) or whisper_id
+    feat_tgt, enc_tgt = feat_extractor, whisper_enc
+    if tgt_enc_id != whisper_id:
+        from transformers import WhisperFeatureExtractor, WhisperModel
+        print(f"⏳ Nạp encoder PHÍA ĐÍCH {tgt_enc_id} (Stage 1 dùng encoder này; nguồn Vi vẫn là {whisper_id})...")
+        feat_tgt = WhisperFeatureExtractor.from_pretrained(tgt_enc_id)
+        enc_tgt = WhisperModel.from_pretrained(tgt_enc_id).encoder.eval().to(device=device, dtype=dtype)
+        for p in enc_tgt.parameters():
+            p.requires_grad = False
+    print(f"ℹ️ Encoder nguồn (Vi -> Bridge): {whisper_id} | Encoder đích (c*, speaker): {tgt_enc_id}")
+
+    def speaker_from_audio(audio_16k_padded, lengths):
+        """Speaker embedding = spk_encoder(encoder_đích(audio)), tính TỪNG câu (không lẫn phần đệm).
+        Lúc suy luận áp lên audio NGUỒN (giọng người nói Việt) -> giữ giọng."""
+        embs = []
+        for i, n in enumerate(lengths):
+            lat = encode_whisper(audio_16k_padded[i:i + 1, :n], feat_tgt, enc_tgt, device, dtype)
+            embs.append(model.spk_encoder(lat))
+        return torch.cat(embs, dim=0)
+
     if not has_teacher and float(loss_weights.get("cond_weight", 0)) > 0:
         print("⚠️ Không có cond_proj Stage 1 -> TẮT loss chưng cất L_cond (cond_weight = 0).")
         loss_weights = dict(loss_weights, cond_weight=0.0)
@@ -919,8 +944,8 @@ def main():
         l_lens = latent_lengths(src_lens)
         d_ratio = torch.tensor([m / max(1, l) for m, l in zip(m_lens, l_lens)], device=device, dtype=dtype)
         c_star, spk_tgt = None, None
-        if has_teacher and feat_extractor is not None and whisper_enc is not None:
-            t_lat = encode_whisper(tgt_16k, feat_extractor, whisper_enc, device, dtype)
+        if has_teacher and feat_tgt is not None and enc_tgt is not None:
+            t_lat = encode_whisper(tgt_16k, feat_tgt, enc_tgt, device, dtype)
             with torch.no_grad():
                 c_star = model.teacher_condition(t_lat, t_mel.shape[-1])
                 spk_tgt = model.spk_encoder(t_lat)
@@ -1025,8 +1050,10 @@ def main():
             try:
                 vocos = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
                 # Suy luận đúng như lúc dùng thật: speaker = giọng NGUỒN, độ dài = DurationPredictor
-                gen_mels = model.inference(s_lat, num_steps=32)
-                gen_mels_oracle = model.inference(s_lat, target_len=tgt_m.shape[-1], num_steps=32)
+                with torch.no_grad():
+                    spk_src = speaker_from_audio(fix_src, data_pipeline.last_src_lengths)
+                gen_mels = model.inference(s_lat, speaker_emb=spk_src, num_steps=32)
+                gen_mels_oracle = model.inference(s_lat, speaker_emb=spk_src, target_len=tgt_m.shape[-1], num_steps=32)
                 with torch.no_grad():
                     print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_src)} FILE AUDIO VI -> EN QUA VOCOS...")
                     for idx in range(len(fix_src)):
@@ -1163,7 +1190,9 @@ def main():
                 for v_src, v_lens, v_en, (s_lat, *_), _, _ in val_set:
                     for i in range(v_src.shape[0]):
                         li = latent_lengths([v_lens[i]])[0]
-                        mel = model.inference(s_lat[i:i + 1, :max(10, li)], num_steps=32)
+                        with torch.no_grad():
+                            spk_i = speaker_from_audio(v_src[i:i + 1], [v_lens[i]])
+                        mel = model.inference(s_lat[i:i + 1, :max(10, li)], speaker_emb=spk_i, num_steps=32)
                         with torch.no_grad():
                             w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
                         hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
@@ -1193,6 +1222,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "history": history,
             "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
+                            "source_encoder": whisper_id, "target_encoder": tgt_enc_id,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,

@@ -243,6 +243,20 @@ sys.exit(1)
         python tools/benchmark_encoders.py --num-samples "$SAMPLES" --batch-size 10
         ;;
 
+    compare-encoder)
+        # EXP02: so sánh encoder PHÍA ĐÍCH cho Stage 1 (decoder cố định theo config), cùng dữ liệu/seed/số bước
+        # Cú pháp: bash run.sh compare-encoder [số_bước] [danh_sách_encoder]
+        STEPS="${2:-3000}"
+        ENCODERS="${3:-vinai/PhoWhisper-small,openai/whisper-small}"
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece -q 2>/dev/null || true
+        echo "⚖️ So sánh encoder phía đích: $ENCODERS | $STEPS bước/biến thể"
+        python -u train_cfm.py --config configs/stage1_cfm_en.yaml --exp-name encoder_compare             --compare-encoders "$ENCODERS" --compare-steps "$STEPS" 2>&1 | tee "$LOG_DIR/encoder_compare.log"
+        if [ -d "outputs/sanity/encoder_compare" ]; then
+            rclone copy outputs/sanity/encoder_compare "gdrive:runs/encoder_compare/" -P || echo "⚠️ Không đẩy được lên Drive"
+        fi
+        ;;
+
     prepare-phost)
         # Cắt câu PhoST (MuST-C) -> 16kHz + manifest. Cần: hf auth login + đã chấp nhận điều khoản vinai/PhoST
         # Cú pháp: bash run.sh prepare-phost [train|dev|test] [số_giờ]
@@ -432,6 +446,7 @@ PYEOF
         echo "  bash run.sh overfit [cfm|bridge] -> Overfit 500 bước trên 16 câu & xuất audio nghe thử"
         echo "  bash run.sh compare-decoder [bước] [biến_thể] -> So sánh kiến trúc decoder (mặc định 3000 bước, v1,v2-small,v2,v2+ln)"
         echo "  bash run.sh prepare-phost [split] [giờ] -> Cắt câu PhoST + manifest (mặc định train, 50 giờ)"
+        echo "  bash run.sh compare-encoder [bước] [encoders] -> EXP02: so encoder phía đích (PhoWhisper vs whisper-small)"
         echo "  bash run.sh start cfm_en         -> Huấn luyện Stage 1 OT-CFM Tiếng Anh"
         echo "  bash run.sh start bridge_vien    -> Huấn luyện Stage 2 CrossAttentionBridge Vi -> En"
         echo "  bash run.sh logs [tên_exp]       -> Xem log trực tiếp"

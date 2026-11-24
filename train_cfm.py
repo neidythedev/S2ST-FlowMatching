@@ -175,6 +175,7 @@ def load_yaml_config(config_path):
             "spk_dim": 192,
             "decoder_hidden": 384,
             "num_res_blocks": 4,
+            "target_encoder": None,      # encoder phía đích; None = dùng whisper_model
             "decoder_preset": "v2",      # v1 (cũ) | v2 (FiLM + dilated) | v2-small
             "t_sampling": "uniform"      # uniform | logit_normal
         },
@@ -512,6 +513,10 @@ def main():
     parser.add_argument("--compare-decoders", type=str, default=None,
                         help="So sánh kiến trúc, VD 'v1,v2-small,v2,v2+ln': train ngắn cùng dữ liệu/seed rồi đo Mel L1, WER, val loss")
     parser.add_argument("--compare-steps", type=int, default=3000, help="Số bước train cho mỗi biến thể khi so sánh")
+    parser.add_argument("--target-encoder", type=str, default=None,
+                        help="Encoder PHÍA ĐÍCH (nghe audio tiếng Anh để tạo điều kiện c). Mặc định: model.target_encoder trong config")
+    parser.add_argument("--compare-encoders", type=str, default=None,
+                        help="EXP02: so sánh encoder phía đích, VD 'vinai/PhoWhisper-small,openai/whisper-small' (decoder giữ cố định)")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
@@ -530,17 +535,29 @@ def main():
     print(f"Thiết bị: {device} | Kiểu số thực: {dtype} | Batch Size: {train_cfg['batch_size']}")
     print("=" * 75)
 
-    # Nạp Whisper
-    whisper_id = cfg["model"]["whisper_model"]
+    # Nạp encoder PHÍA ĐÍCH: nghe audio tiếng Anh -> đặc trưng -> cond_proj -> điều kiện c của CFM.
+    # (Stage 2 dùng ĐÚNG encoder này để tính nhãn c* và speaker; encoder phía nguồn Vi có thể khác.)
+    _enc_cache = {}
+
+    def load_encoder(model_id):
+        if model_id not in _enc_cache:
+            from transformers import WhisperFeatureExtractor, WhisperModel
+            print(f"⏳ Đang nạp encoder phía đích ({model_id})...")
+            fe = WhisperFeatureExtractor.from_pretrained(model_id)
+            enc = WhisperModel.from_pretrained(model_id).encoder.eval().to(device=device, dtype=dtype)
+            for p_ in enc.parameters():
+                p_.requires_grad = False
+            if enc.config.d_model != cfg["model"]["encoder_dim"]:
+                raise ValueError(f"{model_id} có d_model={enc.config.d_model}, cần {cfg['model']['encoder_dim']} (encoder_dim)")
+            _enc_cache[model_id] = (fe, enc)
+            print(f"✓ Encoder {model_id} đã nạp và đóng băng.")
+        return _enc_cache[model_id]
+
+    whisper_id = args.target_encoder or cfg["model"].get("target_encoder") or cfg["model"]["whisper_model"]
     feat_extractor = None
     whisper_enc = None
     try:
-        from transformers import WhisperFeatureExtractor, WhisperModel
-        print(f"⏳ Đang nạp Whisper Encoder ({whisper_id})...")
-        feat_extractor = WhisperFeatureExtractor.from_pretrained(whisper_id)
-        whisper_enc = WhisperModel.from_pretrained(whisper_id).encoder.eval().to(device=device, dtype=dtype)
-        for p in whisper_enc.parameters(): p.requires_grad = False
-        print("✓ Whisper Encoder đã nạp và đóng băng an toàn!")
+        feat_extractor, whisper_enc = load_encoder(whisper_id)
     except Exception as e:
         print(f"[Cảnh báo Whisper] {e}. Sẽ dùng đặc trưng mô phỏng.")
 
@@ -768,18 +785,30 @@ def main():
     # ==========================================================================
     # CHẾ ĐỘ SO SÁNH KIẾN TRÚC DECODER (công bằng: cùng dữ liệu, cùng thứ tự, cùng seed, cùng số bước)
     # ==========================================================================
-    if args.compare_decoders:
-        variants = [v.strip() for v in args.compare_decoders.split(",") if v.strip()]
+    if args.compare_decoders or args.compare_encoders:
+        compare_enc = bool(args.compare_encoders)
+        if compare_enc:
+            fixed_dec = args.decoder or cfg["model"].get("decoder_preset", "v2")
+            runs = [{"label": e.strip().split("/")[-1], "decoder": fixed_dec, "encoder": e.strip()}
+                    for e in args.compare_encoders.split(",") if e.strip()]
+            out_root, kind = "outputs/sanity/encoder_compare", "ENCODER PHÍA ĐÍCH"
+        else:
+            runs = [{"label": v.strip(), "decoder": v.strip(), "encoder": whisper_id}
+                    for v in args.compare_decoders.split(",") if v.strip()]
+            out_root, kind = "outputs/sanity/decoder_compare", "DECODER"
+        variants = [r["label"] for r in runs]
         n_steps = 20 if args.smoke_test else int(args.compare_steps)
-        out_root = "outputs/sanity/decoder_compare"
         os.makedirs(out_root, exist_ok=True)
         results = []
         print("\n" + "=" * 75)
-        print(f"⚖️ SO SÁNH DECODER: {variants} | {n_steps} bước/biến thể | batch {batch_size} | cùng seed & thứ tự dữ liệu")
+        print(f"⚖️ SO SÁNH {kind}: {variants} | {n_steps} bước/biến thể | batch {batch_size} | cùng seed & thứ tự dữ liệu")
         print("=" * 75)
-        for v in variants:
+        for run in runs:
+            v = run["label"]
+            # Đổi encoder phía đích (featurize / eval đọc biến feat_extractor, whisper_enc tại thời điểm gọi)
+            feat_extractor, whisper_enc = load_encoder(run["encoder"])
             torch.manual_seed(0)
-            model = build_model(v)
+            model = build_model(run["decoder"])
             n_par = sum(p.numel() for p in model.decoder.parameters())
             opt_c = torch.optim.AdamW(model.parameters(), lr=float(train_cfg["learning_rate"]),
                                       weight_decay=float(train_cfg["weight_decay"]), betas=(0.9, 0.999))
@@ -788,7 +817,8 @@ def main():
             pipe = UniversalSpeechStreamingPipeline(split='train', max_sec=12.0, lang=data_lang,
                                                     allow_synthetic=args.smoke_test,
                                                     shuffle_seed=None if args.smoke_test else 42)
-            print(f"\n▶️ [{v}] decoder {model.decoder.config['arch']} | {n_par/1e6:.2f}M tham số | t: {model.t_sampling}")
+            print(f"\n▶️ [{v}] encoder đích {run['encoder']} | decoder {model.decoder.config['arch']} "
+                  f"| {n_par/1e6:.2f}M tham số | t: {model.t_sampling}")
             model.train()
             t0 = time.time()
             run_loss = 0.0
@@ -808,7 +838,8 @@ def main():
             sec_per_step = (time.time() - t0) / n_steps
             val_l = eval_val_loss()
             ev = eval_resynthesis(save_dir=os.path.join(out_root, v.replace("+", "_")))
-            res = {"variant": v, "params_M": round(n_par / 1e6, 2), "steps": n_steps, "sec_per_step": round(sec_per_step, 3),
+            res = {"variant": v, "encoder": run["encoder"], "decoder": run["decoder"],
+                   "params_M": round(n_par / 1e6, 2), "steps": n_steps, "sec_per_step": round(sec_per_step, 3),
                    "val_loss": round(val_l, 4), "mel_l1": round(ev["mel_l1"], 4), "wer": round(ev["wer"], 1),
                    "gt_wer": round(ev["gt_wer"], 1)}
             results.append(res)
@@ -821,7 +852,8 @@ def main():
                 torch.cuda.empty_cache()
 
         # Bảng tổng hợp + xếp hạng
-        lines = ["# ⚖️ SO SÁNH KIẾN TRÚC DECODER (Stage 1 CFM)", "",
+        lines = [f"# ⚖️ SO SÁNH {kind} (Stage 1 CFM)", "",
+                 (f"Decoder cố định: {runs[0]['decoder']}. " if compare_enc else f"Encoder đích: {whisper_id}. ") +
                  f"Cùng dữ liệu FLEURS {data_lang}, cùng thứ tự, seed 0, {n_steps} bước/biến thể, batch {batch_size}. "
                  f"Đánh giá trên {sum(x[0].shape[0] for x in val_set)} câu validation cố định "
                  f"(WER trên {eval_wer_clips} câu đầu; WER audio gốc qua cùng ASR = {results[0]['gt_wer'] if results else 'nan'}%).", "",
@@ -846,7 +878,10 @@ def main():
             json.dump(results, f, ensure_ascii=False, indent=2)
         print("\n" + report)
         print(f"\n📁 Báo cáo: {out_root}/compare_report.md | audio nghe thử: {out_root}/<biến thể>/")
-        print("👉 Chọn biến thể tốt nhất rồi đặt 'decoder_preset' (và 't_sampling') trong configs/stage1_cfm_en.yaml")
+        if compare_enc:
+            print("👉 Chọn encoder tốt nhất rồi đặt 'model.target_encoder' trong configs/stage1_cfm_en.yaml")
+        else:
+            print("👉 Chọn biến thể tốt nhất rồi đặt 'decoder_preset' (và 't_sampling') trong configs/stage1_cfm_en.yaml")
         return
 
     # ---- Resume ----
@@ -940,7 +975,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "history": history,
-            "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "version": 3,
+            "stage1_meta": {"lang": data_lang, "whisper_model": whisper_id, "target_encoder": whisper_id, "version": 4,
                             "decoder_config": model.decoder.config, "t_sampling": model.t_sampling,
                             "cond_dim": cfg["model"]["cond_dim"], "spk_dim": cfg["model"]["spk_dim"]},
             "config": cfg,
