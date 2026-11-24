@@ -48,7 +48,9 @@
 | Dán lệnh nhiều dòng bị cắt / lẫn chữ (`EOFnt(...`) | Terminal Molab cắt khi dán đoạn dài nhiều dòng | Dùng lệnh 1 dòng (`bash run.sh rclone-token ...`) |
 | `run.sh restore/sync` báo "thành công" nhưng không có file | `run.sh` nuốt lỗi rclone (`|| true`) | Kiểm tra bằng `ls -lh checkpoints/` hoặc `rclone ls gdrive:...` |
 
-**Hết phải làm mỗi tuần:** Google Cloud Console → *APIs & Services* → *OAuth consent screen* → *Publishing status* → **In production**. Token khi đó không còn hết hạn sau 7 ngày.
+**Vì sao phải làm mỗi tuần:** OAuth app (project `KLTN`) đang ở chế độ *Testing* → refresh token hết hạn sau 7 ngày.
+Chuyển sang *In production* (Google Auth Platform → **Audience** → *Publish app*) đòi hỏi khai báo **domain** ở mục
+*Branding* → **quyết định (24/11/2026): giữ Testing, gia hạn token mỗi tuần theo Bảng 2** (~2 phút/lần).
 
 ---
 
