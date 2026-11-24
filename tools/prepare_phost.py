@@ -241,6 +241,7 @@ def main():
     target = args.hours * 3600.0
     tmp_dir = os.path.join(args.out_dir, "_tmp_talk_wav")
     n_new, t0 = 0, time.time()
+    sync_proc = None
     with open(manifest, "a", encoding="utf-8") as mf:
         for tid in order:
             if have_sec >= target:
@@ -268,7 +269,12 @@ def main():
             print(f"   ✓ [{n_new}] bài {tid}: {len(rows)} câu | tổng {have_sec/3600:.2f}/{args.hours} giờ "
                   f"| {(time.time()-t0)/max(1,n_new):.1f}s/bài")
             if args.drive and n_new % 20 == 0:
-                subprocess.call(["rclone", "copy", args.out_dir, args.drive, "--exclude", "_tmp_talk_wav/**"])
+                # Đồng bộ NGẦM (không chặn việc cắt câu); bỏ qua nếu lần đồng bộ trước chưa xong
+                if sync_proc is None or sync_proc.poll() is not None:
+                    print("   ☁️ Đồng bộ ngầm lên Drive (không chặn)...")
+                    sync_proc = subprocess.Popen(["rclone", "copy", args.out_dir, args.drive,
+                                                  "--exclude", "_tmp_talk_wav/**", "--exclude", ".prepare_*"],
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if os.path.isdir(tmp_dir) and not args.keep_talk_wav:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -279,8 +285,13 @@ def main():
           f"| bài lệch dòng {stats['talk_misaligned']} | bài thiếu audio {stats['talk_no_audio']}")
     print("=" * 70)
     if args.drive:
-        print(f"☁️ Đẩy lên {args.drive} ...")
-        subprocess.call(["rclone", "copy", args.out_dir, args.drive, "--exclude", "_tmp_talk_wav/**", "-P"])
+        if sync_proc is not None and sync_proc.poll() is None:
+            print("☁️ Chờ lần đồng bộ ngầm trước xong...")
+            sync_proc.wait()
+        print(f"☁️ Đẩy bản cuối lên {args.drive} (có hiển thị tiến độ; manifest ở đây đã là bản sạch)...")
+        subprocess.call(["rclone", "copy", args.out_dir, args.drive,
+                         "--exclude", "_tmp_talk_wav/**", "--exclude", ".prepare_*", "-P", "--stats", "30s"])
+        print("✓ Đã đồng bộ xong lên Drive. Có thể chạy: bash run.sh exp03 3000")
 
 
 if __name__ == "__main__":
