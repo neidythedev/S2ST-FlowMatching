@@ -386,9 +386,17 @@ class DurationPredictor(nn.Module):
             nn.GELU(),
             nn.Conv1d(256, 1, kernel_size=1)
         )
-    def forward(self, x):
-        h = self.conv(x.transpose(1, 2))
-        return torch.sigmoid(h.mean(dim=[-1, -2])) * 1.4 + 0.8  # scale trong khoảng [0.8, 2.2]
+    def forward(self, x, pad_mask=None):
+        """x [B, T, C]; pad_mask [B, T] (True = phần đệm) -> trung bình chỉ trên frame thật."""
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)   # conv k=3 ở frame biên không "nhìn thấy" phần đệm
+        h = self.conv(x.transpose(1, 2)).squeeze(1)          # [B, T]
+        if pad_mask is not None:
+            keep = (~pad_mask).to(h.dtype)
+            h_mean = (h * keep).sum(dim=-1) / keep.sum(dim=-1).clamp(min=1.0)
+        else:
+            h_mean = h.mean(dim=-1)
+        return torch.sigmoid(h_mean) * 1.4 + 0.8  # scale trong khoảng [0.8, 2.2]
 
 class CrossAttentionBridge(nn.Module):
     """Cầu nối dịch thuật Non-Autoregressive sử dụng Cross-Attention Transformer Decoder.
@@ -419,16 +427,31 @@ class CrossAttentionBridge(nn.Module):
         # Positional Embeddings học được cho Query đích
         self.pos_emb = nn.Embedding(4096, hidden_dim)
 
-    def forward(self, whisper_features, target_len=None):
+        # Lớp chiếu đầu ra: đầu ra TransformerDecoder (post-norm) đã qua LayerNorm -> mỗi frame bị ép cùng
+        # trung bình/phương sai, KHÔNG khớp được c* (độ lớn khác nhau giữa frame im lặng và frame có tiếng).
+        # Linear tự do phía sau gỡ bỏ giới hạn đó (overfit cũ kẹt L1(c*) ≈ 0.555).
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    @staticmethod
+    def _pad_mask(lengths, T, device):
+        if lengths is None:
+            return None
+        lens = torch.as_tensor(lengths, device=device).view(-1, 1)
+        return torch.arange(T, device=device).view(1, -1) >= lens       # True = phần đệm
+
+    def forward(self, whisper_features, target_len=None, src_lengths=None, tgt_lengths=None):
         """
         whisper_features: [B, T_src, in_dim]
         target_len: Số frame Mel đích T_tgt (lúc train) hoặc None (lúc inference)
+        src_lengths / tgt_lengths: độ dài thật (frame) từng câu -> attention bỏ qua phần đệm,
+            nên một câu trong batch đệm cho kết quả như khi chạy riêng (train/suy luận nhất quán).
         """
         B, T_src, _ = whisper_features.shape
+        src_pad = self._pad_mask(src_lengths, T_src, whisper_features.device)
         src_h = self.src_proj(whisper_features)
-        memory = self.src_encoder(src_h)
+        memory = self.src_encoder(src_h, src_key_padding_mask=src_pad)
 
-        dur_scale = self.duration_predictor(memory)  # [B]
+        dur_scale = self.duration_predictor(memory, src_pad)  # [B]
 
         if target_len is None:
             # Lúc Inference: Ước lượng T_tgt từ dur_scale
@@ -439,7 +462,10 @@ class CrossAttentionBridge(nn.Module):
         queries = self.pos_emb(positions).unsqueeze(0).expand(B, -1, -1)
 
         # Cross-Attention: Cho phép từ tiếng Anh đảo vị trí tùy ý so với tiếng Việt
-        latents = self.decoder(tgt=queries, memory=memory)
+        tgt_pad = self._pad_mask(tgt_lengths, target_len, whisper_features.device)
+        latents = self.decoder(tgt=queries, memory=memory,
+                               tgt_key_padding_mask=tgt_pad, memory_key_padding_mask=src_pad)
+        latents = self.out_proj(latents)
         return latents, dur_scale
 
 # Alias tương thích ngược
@@ -485,7 +511,7 @@ class ViEnS2STSystem(nn.Module):
         return F.interpolate(c.transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
 
     def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None,
-                     mel_mask=None, cond_target=None, t=None, x_0=None, **kwargs):
+                     mel_mask=None, cond_target=None, t=None, x_0=None, src_lengths=None, **kwargs):
         """Trả về (total, cfm, dur, cond).
         speaker_emb: lúc TRAIN nên là embedding của audio ĐÍCH (người đọc tiếng Anh) để decoder tái tạo đúng Mel đích.
         cond_target: c* từ teacher_condition() -> loss chưng cất L1 (None = tắt).
@@ -494,8 +520,10 @@ class ViEnS2STSystem(nn.Module):
         weights.update(loss_weights or {})
         B, _, T_tgt = target_mel.shape
 
-        # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích
-        translated_latents, dur_scale = self.bridge(src_whisper, target_len=T_tgt)
+        # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích; độ dài thật -> mask phần đệm
+        tgt_lengths = mel_mask.sum(dim=-1).long() if mel_mask is not None else None
+        translated_latents, dur_scale = self.bridge(src_whisper, target_len=T_tgt,
+                                                    src_lengths=src_lengths, tgt_lengths=tgt_lengths)
 
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
@@ -996,6 +1024,7 @@ def main():
         fix_src, fix_tgt, fix_en_texts, fix_vi_texts = data_pipeline.fetch_batch(batch_size=num_samples)
         s_lat, tgt_m, fix_mask, d_ratio, c_star, spk_tgt = featurize(
             fix_src, fix_tgt, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths)
+        fix_src_lat_lens = latent_lengths(data_pipeline.last_src_lengths)
         print(f"✓ Latent tiếng Việt [Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps, eta_min=1e-5)
@@ -1006,7 +1035,7 @@ def main():
             optimizer.zero_grad()
             l_tot, cfm_l, d_l, c_l = model.compute_loss(
                 s_lat, tgt_m, speaker_emb=spk_tgt, target_dur_ratio=d_ratio, loss_weights=loss_weights,
-                mel_mask=fix_mask, cond_target=c_star)
+                mel_mask=fix_mask, cond_target=c_star, src_lengths=fix_src_lat_lens)
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -1025,21 +1054,39 @@ def main():
         else:
             print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
 
-        # Kiểm tra CFM có THẬT SỰ dùng điều kiện c không: thay c bằng 0 -> loss CFM phải tăng rõ
+        # Kiểm tra điều kiện c (trung bình 8 lần lấy t/x0 cố định để bớt nhiễu):
+        #   L(c*)   = CFM loss với điều kiện ĐÚNG (mốc tốt nhất decoder có thể đạt)
+        #   L(0)    = CFM loss khi bỏ hẳn điều kiện (mốc tệ nhất)
+        #   L(Bridge) nằm giữa -> "% khoảng cách đã thu hẹp" = (L(0) - L(Bridge)) / (L(0) - L(c*))
+        model.eval()
         with torch.no_grad():
             g = torch.Generator(device="cpu").manual_seed(0)
-            tt = torch.rand(num_samples, generator=g).to(device=device, dtype=dtype)
-            x0 = torch.randn(tgt_m.shape, generator=g).to(device=device, dtype=dtype)
-            lat, _ = model.bridge(s_lat, target_len=tgt_m.shape[-1])
+            lat, _ = model.bridge(s_lat, target_len=tgt_m.shape[-1],
+                                  src_lengths=fix_src_lat_lens, tgt_lengths=fix_mask.sum(-1).long())
+            c_bridge = lat.transpose(1, 2)
             spk = spk_tgt if spk_tgt is not None else model.spk_encoder(s_lat)
-            xt = (1 - tt.view(-1, 1, 1)) * x0 + tt.view(-1, 1, 1) * tgt_m
-            ut = tgt_m - x0
-            l_with = masked_mse(model.decoder(xt, tt, lat.transpose(1, 2), spk, mask=fix_mask), ut, fix_mask).item()
-            l_zero = masked_mse(model.decoder(xt, tt, torch.zeros_like(lat.transpose(1, 2)), spk, mask=fix_mask), ut, fix_mask).item()
-        ratio = l_zero / max(1e-8, l_with)
-        print(f"🔎 Kiểm tra dùng điều kiện: CFM loss với c của Bridge = {l_with:.4f} | với c = 0: {l_zero:.4f} (gấp {ratio:.2f} lần)")
-        print("   " + ("✓ CFM phụ thuộc rõ vào c -> Bridge học là thật." if ratio > 1.5 else
-                      "⚠️ CFM gần như KHÔNG dùng c -> loss giảm có thể do CFM tự thuộc lòng, Bridge chưa chắc học được."))
+            sums = {"c*": 0.0, "Bridge": 0.0, "0": 0.0}
+            for _ in range(8):
+                tt = torch.rand(num_samples, generator=g).to(device=device, dtype=dtype)
+                x0 = torch.randn(tgt_m.shape, generator=g).to(device=device, dtype=dtype)
+                xt = (1 - tt.view(-1, 1, 1)) * x0 + tt.view(-1, 1, 1) * tgt_m
+                ut = tgt_m - x0
+                for name, cc in [("c*", c_star), ("Bridge", c_bridge), ("0", torch.zeros_like(c_bridge))]:
+                    if cc is None:
+                        continue
+                    sums[name] += masked_mse(model.decoder(xt, tt, cc.to(dtype), spk, mask=fix_mask), ut, fix_mask).item() / 8
+            cond_trivial = masked_l1(c_star.mean(dim=-1, keepdim=True).expand_as(c_star), c_star, fix_mask).item() \
+                if c_star is not None else float("nan")
+            cond_bridge = masked_l1(c_bridge, c_star, fix_mask).item() if c_star is not None else float("nan")
+        l_star, l_br, l_0 = sums["c*"], sums["Bridge"], sums["0"]
+        print(f"🔎 CFM loss: với c* (đúng) = {l_star:.4f} | với c của Bridge = {l_br:.4f} | với c = 0 = {l_0:.4f}")
+        if c_star is not None and l_0 - l_star > 1e-4:
+            closed = (l_0 - l_br) / (l_0 - l_star) * 100.0
+            print(f"   Bridge thu hẹp {closed:.0f}% khoảng cách giữa 'không có điều kiện' và 'điều kiện đúng' "
+                  f"(decoder dùng c: L(0)/L(c*) = {l_0 / max(1e-8, l_star):.2f}x)")
+            print(f"   L1(Bridge, c*) = {cond_bridge:.4f} | mốc 'đoán trung bình theo thời gian' = {cond_trivial:.4f}")
+            print("   " + ("✓ Bridge khớp điều kiện tốt (≥ 70%)." if closed >= 70 else
+                          "⚠️ Bridge mới khớp một phần điều kiện — overfit thêm bước hoặc kiểm tra kiến trúc."))
 
         # Nếu là Overfit sâu 800 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
         if is_deep:
@@ -1143,7 +1190,8 @@ def main():
 
             total_loss, cfm_l, dur_l, cond_l = model.compute_loss(
                 src_latents, tgt_mel, speaker_emb=spk_tgt, target_dur_ratio=dur_ratio,
-                loss_weights=loss_weights, mel_mask=mel_mask, cond_target=c_star
+                loss_weights=loss_weights, mel_mask=mel_mask, cond_target=c_star,
+                src_lengths=latent_lengths(data_pipeline.last_src_lengths)
             )
 
             total_loss.backward()
@@ -1172,7 +1220,8 @@ def main():
             for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk), tt, x0 in val_set:
                 lt, lc, ld, lco = model.compute_loss(
                     s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
-                    mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype))
+                    mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype),
+                    src_lengths=latent_lengths(v_lens))
                 v_tot += lt.item(); v_cfm += lc.item(); v_dur += ld.item(); v_cond += lco.item()
         nv = max(1, len(val_set))
         val_loss = v_tot / nv
