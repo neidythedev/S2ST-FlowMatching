@@ -12,20 +12,29 @@ mkdir -p "$LOG_DIR" "checkpoints" "outputs/sanity" "outputs/benchmark"
 PID_FILE="$LOG_DIR/${EXP_NAME}.pid"
 LOG_FILE="$LOG_DIR/${EXP_NAME}.log"
 
-# Tự động liên kết thư mục dự án với mọi vị trí hiển thị của Marimo File Explorer trên Molab
+# Tự động liên kết thư mục dự án với mọi vị trí hiển thị của Marimo File Explorer trên Molab.
+# Dùng đường dẫn THẬT (pwd -P): nếu dùng $PWD khi đang đứng trong chính đường link
+# /marimo/S2ST-FlowMatching, 'ln -sfn' sẽ ghi đè link thành link TRỎ VÀO CHÍNH NÓ
+# ("Too many levels of symbolic links").
+REPO_REAL="$(pwd -P)"
+safe_link() {
+    local dest="$1/S2ST-FlowMatching"
+    [ -d "$1" ] || return 0
+    [ "$1" = "$REPO_REAL" ] && return 0
+    # Đích là thư mục thật (không phải link) -> có thể chính là repo / dữ liệu khác: KHÔNG đụng vào
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then return 0; fi
+    # Link đã trỏ đúng repo -> giữ nguyên
+    if [ -L "$dest" ] && [ "$(readlink -f "$dest" 2>/dev/null)" = "$REPO_REAL" ]; then return 0; fi
+    ln -sfn "$REPO_REAL" "$dest" 2>/dev/null || true
+}
 for target_dir in "/marimo" "/home/marimo" "/workspace"; do
-    if [ -d "$target_dir" ] && [ "$PWD" != "$target_dir" ]; then
-        ln -sfn "$PWD" "$target_dir/S2ST-FlowMatching" 2>/dev/null || true
-    fi
+    safe_link "$target_dir"
 done
 NOTEBOOK_PY=$(find /marimo /home/marimo /root /workspace -maxdepth 2 -name "notebook.py" 2>/dev/null | head -n 1 || true)
 # Chỉ tạo link khi thật sự tìm thấy notebook.py (nếu không, dirname "" = "." sẽ tạo bản sao repo lồng trong repo)
-NOTEBOOK_DIR=""
 if [ -n "$NOTEBOOK_PY" ]; then
     NOTEBOOK_DIR=$(dirname "$NOTEBOOK_PY")
-fi
-if [ -n "$NOTEBOOK_DIR" ] && [ -d "$NOTEBOOK_DIR" ] && [ "$NOTEBOOK_DIR" != "." ] && [ "$PWD" != "$NOTEBOOK_DIR" ]; then
-    ln -sfn "$PWD" "$NOTEBOOK_DIR/S2ST-FlowMatching" 2>/dev/null || true
+    [ "$NOTEBOOK_DIR" != "." ] && safe_link "$NOTEBOOK_DIR"
 fi
 
 case "$ACTION" in
