@@ -179,7 +179,9 @@ case "$ACTION" in
             python train_cfm.py --config configs/stage1_cfm_en.yaml --overfit-16
         else
             echo "🧪 Đang chạy Sanity Check #3: Overfit 500 bước trên 16 cặp câu Vi-En cho Stage 2 Bridge..."
-            python train_bridge.py --overfit-16
+            # Tham số thứ 3 trở đi chuyển thẳng cho train_bridge.py, VD:
+            #   bash run.sh overfit bridge --overfit-steps 3000 --overfit-lr 1e-3
+            python train_bridge.py --overfit-16 "${@:3}"
         fi
         ;;
 

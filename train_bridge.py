@@ -922,6 +922,10 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm_en-best.pth")
     parser.add_argument("--no-freeze-cfm", action="store_true")
+    parser.add_argument("--overfit-steps", type=int, default=800,
+                        help="Số bước overfit 16 câu (mặc định 800; kiểm tra khả năng học sâu: 3000)")
+    parser.add_argument("--overfit-lr", type=float, default=None,
+                        help="LR đỉnh khi overfit (mặc định = training.learning_rate); warmup 5% rồi cosine về 1e-5")
     parser.add_argument("--allow-legacy-cfm", action="store_true",
                         help="Cho phép nạp CFM không có stage1_meta (KHÔNG khuyến nghị: dễ nạp nhầm bản En->Vi cũ)")
     args = parser.parse_args()
@@ -1102,7 +1106,7 @@ def main():
     if args.sanity_check or args.overfit_16:
         is_deep = args.overfit_16
         num_samples = 16 if is_deep else 4
-        num_steps = 800 if is_deep else 50
+        num_steps = int(args.overfit_steps) if is_deep else 50
         print("\n" + "=" * 75)
         print(f"🧪 BẮT ĐẦU KIỂM TRA OVERFIT ({num_steps} BƯỚC TRÊN {num_samples} CẶP CÂU VI -> EN)")
         print("Mục tiêu: Đảm bảo Gradient chảy thông suốt qua Cross-Attention Bridge và kiểm tra khả năng học.")
@@ -1114,7 +1118,19 @@ def main():
         fix_src_lat_lens = latent_lengths(data_pipeline.last_src_lengths)
         print(f"✓ Latent tiếng Việt [Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps, eta_min=1e-5)
+        peak_lr = float(args.overfit_lr) if args.overfit_lr else float(train_cfg["learning_rate"])
+        for g_ in optimizer.param_groups:
+            g_["lr"] = peak_lr
+        warm = max(1, int(0.05 * num_steps))
+        min_ratio = 1e-5 / peak_lr
+
+        def _ovf_lr(st):   # warmup tuyến tính 5% rồi cosine về 1e-5
+            if st < warm:
+                return (st + 1) / warm
+            prog = (st - warm) / max(1, num_steps - warm)
+            return max(min_ratio, 0.5 * (1.0 + math.cos(math.pi * prog)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _ovf_lr)
+        print(f"ℹ️ Overfit: {num_steps} bước | LR đỉnh {peak_lr:.1e} (warmup {warm} bước, cosine về 1e-5)")
         initial_loss = None
         final_loss = None
         t_start = time.time()
@@ -1129,10 +1145,10 @@ def main():
             scheduler.step()
 
             if st == 0: initial_loss = l_tot.item()
-            log_interval = 50 if is_deep else 10
+            log_interval = max(50, num_steps // 16) if is_deep else 10
             if (st + 1) % log_interval == 0 or st == 0:
-                print(f"   [Overfit Step {st+1:03d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
-                      f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f}")
+                print(f"   [Overfit Step {st+1:04d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
+                      f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f} | LR: {scheduler.get_last_lr()[0]:.1e}")
             final_loss = l_tot.item()
 
         print("-" * 75)
@@ -1152,25 +1168,34 @@ def main():
                                   src_lengths=fix_src_lat_lens, tgt_lengths=fix_mask.sum(-1).long())
             c_bridge = lat.transpose(1, 2)
             spk = model._in(spk_tgt) if spk_tgt is not None else model.speaker(s_lat)
-            sums = {"c*": 0.0, "Bridge": 0.0, "0": 0.0}
+            c_mean = None
+            if c_star is not None:   # mốc trung bình: trung bình c* theo thời gian (chỉ frame THẬT) của từng câu
+                m3 = fix_mask.unsqueeze(1).to(c_star.dtype)
+                c_mean = (c_star * m3).sum(-1, keepdim=True) / m3.sum(-1, keepdim=True).clamp(min=1.0)
+            sums = {"c*": 0.0, "Bridge": 0.0, "TB(c*)": 0.0, "0": 0.0}
             for _ in range(8):
                 tt = torch.rand(num_samples, generator=g).to(device=device, dtype=dtype)
                 x0 = torch.randn(tgt_m.shape, generator=g).to(device=device, dtype=dtype)
                 xt = (1 - tt.view(-1, 1, 1)) * x0 + tt.view(-1, 1, 1) * tgt_m
                 ut = tgt_m - x0
-                for name, cc in [("c*", c_star), ("Bridge", c_bridge), ("0", torch.zeros_like(c_bridge))]:
+                c_mean_full = c_mean.expand_as(c_star) if c_mean is not None else None
+                for name, cc in [("c*", c_star), ("Bridge", c_bridge), ("TB(c*)", c_mean_full),
+                                 ("0", torch.zeros_like(c_bridge))]:
                     if cc is None:
                         continue
                     sums[name] += masked_mse(model.decoder(model._in(xt), model._in(tt), model._in(cc), spk, mask=fix_mask),
                                              ut, fix_mask).item() / 8
-            if c_star is not None:   # mốc trung bình: chỉ lấy trung bình trên frame THẬT của từng câu
-                m3 = fix_mask.unsqueeze(1).to(c_star.dtype)
-                c_mean = (c_star * m3).sum(-1, keepdim=True) / m3.sum(-1, keepdim=True).clamp(min=1.0)
             cond_trivial = masked_l1(c_mean.expand_as(c_star), c_star, fix_mask).item() \
                 if c_star is not None else float("nan")
             cond_bridge = masked_l1(c_bridge, c_star, fix_mask).item() if c_star is not None else float("nan")
-        l_star, l_br, l_0 = sums["c*"], sums["Bridge"], sums["0"]
-        print(f"🔎 CFM loss: với c* (đúng) = {l_star:.4f} | với c của Bridge = {l_br:.4f} | với c = 0 = {l_0:.4f}")
+        l_star, l_br, l_0, l_mean = sums["c*"], sums["Bridge"], sums["0"], sums["TB(c*)"]
+        print(f"🔎 CFM loss: với c* (đúng) = {l_star:.4f} | với c của Bridge = {l_br:.4f} | "
+              f"với trung bình c* = {l_mean:.4f} | với c = 0 = {l_0:.4f}")
+        if c_star is not None:
+            if l_br < l_mean - 0.005:
+                print("   ✓ Bridge TỐT HƠN mốc 'trung bình c*' -> đã học được thông tin theo từng frame (thời gian).")
+            else:
+                print("   ⚠️ Bridge chưa tốt hơn mốc 'trung bình c*' -> mới học được thông tin mức câu, chưa theo từng frame.")
         if c_star is not None and l_0 - l_star > 1e-4:
             closed = (l_0 - l_br) / (l_0 - l_star) * 100.0
             print(f"   Bridge thu hẹp {closed:.0f}% khoảng cách giữa 'không có điều kiện' và 'điều kiện đúng' "
