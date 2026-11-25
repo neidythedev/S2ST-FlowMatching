@@ -10,6 +10,7 @@ model:
   bridge_layers: 6
   bridge_heads: 8
   bridge_query_mode: "interp"   # interp (query = nguồn nội suy + vị trí tương đối) | learned (cũ, ablation)
+  bridge_norm: "prenorm_skip"   # prenorm_skip (pre-norm + đường tắt query->đầu ra) | postnorm (cũ: sụp về hằng số theo thời gian)
   n_mels: 100
   spk_dim: 192
   decoder_hidden: 384

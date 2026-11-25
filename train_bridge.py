@@ -402,16 +402,27 @@ class CrossAttentionBridge(nn.Module):
     """Cầu nối dịch thuật Non-Autoregressive sử dụng Cross-Attention Transformer Decoder.
     Giải quyết triệt để vấn đề đảo ngữ pháp (non-monotonic word reordering) giữa Tiếng Việt và Tiếng Anh.
     """
-    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, query_mode="interp"):
+    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, query_mode="interp",
+                 norm_mode="prenorm_skip"):
         """query_mode:
           'interp'  (mặc định): query đích = memory nguồn nội suy theo thời gian sang độ dài đích + mã hóa vị trí
                     TƯƠNG ĐỐI (0→1) ở cả 2 phía -> ngay từ đầu frame i đã "nhìn" đúng vùng tương ứng của câu nguồn,
                     cross-attention học thêm phần đảo trật tự.
           'learned' (cũ, giữ làm ablation): query = positional embedding học từ đầu, nguồn không có vị trí tương
-                    đối -> attention dễ sụp thành trung bình đều (overfit 16 câu: L1(c*) ≈ mốc đoán trung bình)."""
+                    đối -> attention dễ sụp thành trung bình đều (overfit 16 câu: L1(c*) ≈ mốc đoán trung bình).
+        norm_mode:
+          'prenorm_skip' (mặc định): Transformer PRE-norm (norm_first) + LayerNorm cuối + đường tắt skip_proj(query)
+                    cộng thẳng vào đầu ra -> thông tin theo từng frame của query đi thẳng ra, không bị rửa trôi.
+          'postnorm' (cũ, chỉ để nạp checkpoint cũ): post-norm 6 tầng SỤP về hằng số theo thời gian khi train
+                    (đo 26/11/2026: std theo thời gian của đầu ra 0.0002, L1 = đúng mốc trung bình, kể cả khi
+                    mục tiêu chỉ là ánh xạ gần đồng nhất). Pre-norm + skip: L1 = 18% mốc trên cùng bài."""
         super().__init__()
+        if norm_mode not in ("prenorm_skip", "postnorm"):
+            raise ValueError(f"norm_mode không hợp lệ: {norm_mode}")
         self.hidden_dim = hidden_dim
         self.query_mode = query_mode
+        self.norm_mode = norm_mode
+        pre = norm_mode == "prenorm_skip"
         self.src_proj = nn.Linear(in_dim, hidden_dim)
         self.query_proj = nn.Linear(hidden_dim, hidden_dim)
         # Hệ số học được cho mã hóa vị trí tương đối (khởi tạo vừa phải để không lấn át nội dung)
@@ -420,16 +431,19 @@ class CrossAttentionBridge(nn.Module):
         # Encoder tự chú ý trên đặc trưng nguồn (tiếng Việt)
         src_enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-            batch_first=True, activation="gelu"
+            batch_first=True, activation="gelu", norm_first=pre
         )
-        self.src_encoder = nn.TransformerEncoder(src_enc_layer, num_layers=max(2, num_layers // 2))
+        self.src_encoder = nn.TransformerEncoder(src_enc_layer, num_layers=max(2, num_layers // 2),
+                                                 norm=nn.LayerNorm(hidden_dim) if pre else None,
+                                                 enable_nested_tensor=False)
 
         # Decoder chú ý chéo (Cross-Attention) sang đặc trưng đích (tiếng Anh)
         dec_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
-            batch_first=True, activation="gelu"
+            batch_first=True, activation="gelu", norm_first=pre
         )
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers,
+                                             norm=nn.LayerNorm(hidden_dim) if pre else None)
 
         # Bộ dự đoán tỷ lệ co dãn thời lượng
         self.duration_predictor = DurationPredictor(in_dim=hidden_dim)
@@ -441,6 +455,8 @@ class CrossAttentionBridge(nn.Module):
         # trung bình/phương sai, KHÔNG khớp được c* (độ lớn khác nhau giữa frame im lặng và frame có tiếng).
         # Linear tự do phía sau gỡ bỏ giới hạn đó (overfit cũ kẹt L1(c*) ≈ 0.555).
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Đường tắt: query (đã căn chỉnh theo thời gian) -> đầu ra, để Bridge không thể "quên" cấu trúc từng frame
+        self.skip_proj = nn.Linear(hidden_dim, hidden_dim) if pre else None
 
     def _rel_pos(self, lengths, T, device, dtype):
         """Mã hóa vị trí TƯƠNG ĐỐI: frame j của câu dài L có vị trí p = j/(L-1) ∈ [0, 1];
@@ -509,6 +525,8 @@ class CrossAttentionBridge(nn.Module):
         latents = self.decoder(tgt=queries, memory=memory,
                                tgt_key_padding_mask=tgt_pad, memory_key_padding_mask=src_pad)
         latents = self.out_proj(latents)
+        if self.skip_proj is not None:
+            latents = latents + self.skip_proj(queries)
         return latents, dur_scale
 
 # Alias tương thích ngược
@@ -536,11 +554,11 @@ class AcousticSpeakerEncoder(nn.Module):
 class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
-                 bridge_query_mode="interp"):
+                 bridge_query_mode="interp", bridge_norm="prenorm_skip"):
         super().__init__()
         self.n_mels = n_mels
         self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers,
-                                           query_mode=bridge_query_mode)
+                                           query_mode=bridge_query_mode, norm_mode=bridge_norm)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
@@ -718,10 +736,12 @@ def load_stage2_into(model, ckpt_path, device):
     if dec_cfg and dec_cfg != getattr(model.decoder, "config", None):
         model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=ref.device, dtype=ref.dtype)
     qm = meta.get("bridge_query_mode", "learned")   # checkpoint trước khi có tùy chọn này dùng query 'learned'
-    if qm != model.bridge.query_mode:
+    nm = meta.get("bridge_norm", "postnorm")         # checkpoint trước 26/11/2026 dùng post-norm
+    if qm != model.bridge.query_mode or nm != model.bridge.norm_mode:
         b = model.bridge
         model.bridge = CrossAttentionBridge(in_dim=b.src_proj.in_features, hidden_dim=b.hidden_dim,
-                                            num_layers=len(b.decoder.layers), query_mode=qm).to(device=ref.device, dtype=ref.dtype)
+                                            num_layers=len(b.decoder.layers), query_mode=qm,
+                                            norm_mode=nm).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
     model.target_encoder_id = meta.get("target_encoder")
@@ -926,6 +946,15 @@ def main():
                         help="Số bước overfit 16 câu (mặc định 800; kiểm tra khả năng học sâu: 3000)")
     parser.add_argument("--overfit-lr", type=float, default=None,
                         help="LR đỉnh khi overfit (mặc định = training.learning_rate); warmup 5% rồi cosine về 1e-5")
+    parser.add_argument("--overfit-cond-only", action="store_true",
+                        help="Chẩn đoán A: chỉ train L1(Bridge, c*) (+Dur), BỎ CFM loss -> Bridge có học thuộc được c* không?")
+    parser.add_argument("--overfit-oracle-src", action="store_true",
+                        help="Chẩn đoán B: đưa PhoWhisper của audio TIẾNG ANH (đích) vào Bridge thay cho audio Việt "
+                             "(gần như ánh xạ đồng nhất) -> học không được = lỗi kiến trúc")
+    parser.add_argument("--overfit-no-dropout", action="store_true",
+                        help="Tắt dropout trong Bridge khi overfit (học thuộc 16 câu không bị nhiễu dropout cản)")
+    parser.add_argument("--overfit-tag", type=str, default="",
+                        help="Hậu tố thư mục audio overfit (outputs/sanity/bridge_overfit16<_tag>/) để các biến thể không ghi đè nhau")
     parser.add_argument("--allow-legacy-cfm", action="store_true",
                         help="Cho phép nạp CFM không có stage1_meta (KHÔNG khuyến nghị: dễ nạp nhầm bản En->Vi cũ)")
     args = parser.parse_args()
@@ -964,6 +993,7 @@ def main():
 
     # 2. Khởi tạo mô hình ViEnS2STSystem
     bridge_query_mode = cfg["model"].get("bridge_query_mode", "interp")
+    bridge_norm = cfg["model"].get("bridge_norm", "prenorm_skip")
     model = ViEnS2STSystem(
         encoder_dim=cfg["model"]["encoder_dim"],
         bridge_dim=cfg["model"]["bridge_dim"],
@@ -971,10 +1001,11 @@ def main():
         n_mels=cfg["model"]["n_mels"],
         spk_dim=cfg["model"]["spk_dim"],
         bridge_query_mode=bridge_query_mode,
+        bridge_norm=bridge_norm,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
-    print(f"🌉 Bridge query mode: {bridge_query_mode}")
+    print(f"🌉 Bridge query mode: {bridge_query_mode} | norm: {bridge_norm}")
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
@@ -1118,6 +1149,50 @@ def main():
         fix_src_lat_lens = latent_lengths(data_pipeline.last_src_lengths)
         print(f"✓ Latent tiếng Việt [Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
 
+        # ---- Các biến thể chẩn đoán ----
+        variant = []
+        if args.overfit_oracle_src:
+            if feat_tgt is None or enc_tgt is None:
+                raise RuntimeError("--overfit-oracle-src cần encoder phía đích (Stage 1 checkpoint).")
+            s_lat = encode_whisper(fix_tgt, feat_tgt, enc_tgt, device, dtype)
+            fix_src_lat_lens = latent_lengths(data_pipeline.last_tgt_lengths)
+            d_ratio = torch.tensor([m / max(1, l) for m, l in zip(mel_lengths(data_pipeline.last_tgt_lengths),
+                                                                    fix_src_lat_lens)], device=device, dtype=dtype)
+            variant.append("ORACLE: đầu vào Bridge = PhoWhisper(audio TIẾNG ANH)")
+            print(f"🔬 [Chẩn đoán B] Đầu vào Bridge = PhoWhisper(audio TIẾNG ANH đích) [Shape: {list(s_lat.shape)}] "
+                  f"-> gần như ánh xạ đồng nhất, phải học được dễ dàng.")
+        ovf_weights = dict(loss_weights)
+        if args.overfit_cond_only:
+            if c_star is None:
+                raise RuntimeError("--overfit-cond-only cần c* (Stage 1 checkpoint có teacher cond_proj).")
+            ovf_weights.update(cfm_weight=0.0, cond_weight=1.0)
+            variant.append("CHỈ L1(c*) (bỏ CFM loss)")
+            print("🔬 [Chẩn đoán A] Chỉ train L1(Bridge, c*) + 0.1·Dur, BỎ CFM loss.")
+        if args.overfit_no_dropout:
+            n_drop = 0
+            for m_ in model.bridge.modules():
+                if isinstance(m_, nn.Dropout):
+                    m_.p = 0.0
+                    n_drop += 1
+                elif isinstance(m_, nn.MultiheadAttention):
+                    m_.dropout = 0.0
+                    n_drop += 1
+            variant.append("không dropout")
+            print(f"🔬 Đã tắt dropout trong Bridge ({n_drop} lớp).")
+        print(f"ℹ️ Biến thể overfit: {', '.join(variant) if variant else 'mặc định (đủ loss, Vi -> Bridge)'} | "
+              f"loss = {ovf_weights.get('cfm_weight', 1.0)}·CFM + {ovf_weights.get('dur_weight', 0.1)}·Dur "
+              f"+ {ovf_weights.get('cond_weight', 0.0)}·L1(c*)")
+
+        # Mốc so sánh cho Cond: L1 nếu Bridge chỉ đoán trung bình c* theo thời gian của từng câu
+        cond_trivial0 = None
+        if c_star is not None:
+            with torch.no_grad():
+                m3_ = fix_mask.unsqueeze(1).to(c_star.dtype)
+                c_mean0 = (c_star * m3_).sum(-1, keepdim=True) / m3_.sum(-1, keepdim=True).clamp(min=1.0)
+                cond_trivial0 = masked_l1(c_mean0.expand_as(c_star), c_star, fix_mask).item()
+            print(f"ℹ️ Mốc Cond 'đoán trung bình theo thời gian' = {cond_trivial0:.4f} "
+                  f"(Cond phải xuống RÕ dưới mốc này; học thuộc thật -> gần 0)")
+
         peak_lr = float(args.overfit_lr) if args.overfit_lr else float(train_cfg["learning_rate"])
         for g_ in optimizer.param_groups:
             g_["lr"] = peak_lr
@@ -1137,7 +1212,7 @@ def main():
         for st in range(num_steps):
             optimizer.zero_grad()
             l_tot, cfm_l, d_l, c_l = model.compute_loss(
-                s_lat, tgt_m, speaker_emb=spk_tgt, target_dur_ratio=d_ratio, loss_weights=loss_weights,
+                s_lat, tgt_m, speaker_emb=spk_tgt, target_dur_ratio=d_ratio, loss_weights=ovf_weights,
                 mel_mask=fix_mask, cond_target=c_star, src_lengths=fix_src_lat_lens)
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -1152,10 +1227,8 @@ def main():
             final_loss = l_tot.item()
 
         print("-" * 75)
-        if final_loss < initial_loss:
-            print(f"✅ OVERFIT PASS! Loss giảm từ {initial_loss:.4f} xuống {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%) trong {time.time()-t_start:.1f}s.")
-        else:
-            print(f"⚠️ Cảnh báo: Loss chưa giảm sâu ({initial_loss:.4f} -> {final_loss:.4f}).")
+        print(f"📉 Loss tổng: {initial_loss:.4f} -> {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%) "
+              f"trong {time.time()-t_start:.1f}s. (CFM loss có sàn nhiễu nên KHÔNG dùng % này để kết luận — xem phần dưới)")
 
         # Kiểm tra điều kiện c (trung bình 8 lần lấy t/x0 cố định để bớt nhiễu):
         #   L(c*)   = CFM loss với điều kiện ĐÚNG (mốc tốt nhất decoder có thể đạt)
@@ -1201,12 +1274,19 @@ def main():
             print(f"   Bridge thu hẹp {closed:.0f}% khoảng cách giữa 'không có điều kiện' và 'điều kiện đúng' "
                   f"(decoder dùng c: L(0)/L(c*) = {l_0 / max(1e-8, l_star):.2f}x)")
             print(f"   L1(Bridge, c*) = {cond_bridge:.4f} | mốc 'đoán trung bình theo thời gian' = {cond_trivial:.4f}")
-            print("   " + ("✓ Bridge khớp điều kiện tốt (≥ 70%)." if closed >= 70 else
-                          "⚠️ Bridge mới khớp một phần điều kiện — overfit thêm bước hoặc kiểm tra kiến trúc."))
+        if c_star is not None:
+            ratio = cond_bridge / max(1e-8, cond_trivial)
+            if ratio < 0.5:
+                verdict = "✅ OVERFIT PASS: Bridge HỌC THUỘC được c* (L1 < 50% mốc trung bình)."
+            elif ratio < 0.9:
+                verdict = "🟡 Bridge học được một phần c* (L1 50–90% mốc trung bình)."
+            else:
+                verdict = "❌ OVERFIT FAIL: L1(Bridge, c*) không xuống dưới mốc trung bình -> Bridge KHÔNG học thuộc được c*."
+            print(f"🏁 KẾT LUẬN [{', '.join(variant) if variant else 'mặc định'}]: L1/mốc = {ratio:.2f} -> {verdict}")
 
         # Nếu là Overfit sâu 800 bước -> Xuất trọn bộ 16 file audio nghe thử qua Vocos
         if is_deep:
-            out_dir = "outputs/sanity/bridge_overfit16"
+            out_dir = "outputs/sanity/bridge_overfit16" + (f"_{args.overfit_tag}" if args.overfit_tag else "")
             legacy_dir = "outputs/sanity"
             os.makedirs(out_dir, exist_ok=True)
             os.makedirs(legacy_dir, exist_ok=True)
@@ -1388,7 +1468,7 @@ def main():
             "history": history,
             "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
                             "source_encoder": whisper_id, "target_encoder": tgt_enc_id,
-                            "bridge_query_mode": bridge_query_mode,
+                            "bridge_query_mode": bridge_query_mode, "bridge_norm": bridge_norm,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,

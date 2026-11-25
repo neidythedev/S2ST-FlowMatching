@@ -185,6 +185,35 @@ case "$ACTION" in
         fi
         ;;
 
+    overfit-diag)
+        # Chẩn đoán vì sao Bridge không học thuộc được c* khi overfit 16 câu. Mỗi biến thể chạy riêng, cùng 16 câu:
+        #   A  = chỉ L1(c*), không dropout, đầu vào Vi        -> Bridge có học thuộc c* không (không bị CFM kéo lệch)?
+        #   B  = như A nhưng đầu vào = PhoWhisper(audio Anh)   -> ánh xạ gần đồng nhất; học không được = lỗi kiến trúc
+        #   C  = đủ loss, không dropout, đầu vào Vi           -> so với A: CFM loss có kéo Bridge lệch khỏi c* không?
+        # Cách dùng: bash run.sh overfit-diag [bước=2000] [lr=2e-4] [biến_thể=A,B,C]
+        D_STEPS="${2:-2000}"
+        D_LR="${3:-2e-4}"
+        D_VARS="${4:-A,B,C}"
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
+        mkdir -p "$LOG_DIR"
+        IFS=',' read -ra VLIST <<< "$D_VARS"
+        for V in "${VLIST[@]}"; do
+            case "$V" in
+                A) FLAGS="--overfit-cond-only --overfit-no-dropout" ;;
+                B) FLAGS="--overfit-cond-only --overfit-no-dropout --overfit-oracle-src" ;;
+                C) FLAGS="--overfit-no-dropout" ;;
+                *) echo "❌ Biến thể không hợp lệ: $V (chỉ A, B, C)"; continue ;;
+            esac
+            echo "================ 🔬 Chẩn đoán $V: $FLAGS ($D_STEPS bước, LR $D_LR) ================"
+            python -u train_bridge.py --overfit-16 --overfit-steps "$D_STEPS" --overfit-lr "$D_LR" \
+                --overfit-tag "diag$V" $FLAGS 2>&1 | tee "$LOG_DIR/overfit_diag_$V.log"
+        done
+        echo ""
+        echo "=================== 🏁 TÓM TẮT CHẨN ĐOÁN ==================="
+        grep -h "KẾT LUẬN\|CFM loss: với\|L1(Bridge, c\*)" "$LOG_DIR"/overfit_diag_*.log
+        ;;
+
     eval)
         CASE_CHOICE="${2:-sota}"
         S2TT_MODE="${3:-both}"
