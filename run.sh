@@ -176,12 +176,12 @@ case "$ACTION" in
         pip install "datasets<4.0.0" soundfile vocos sentencepiece sacremoses -q 2>/dev/null || true
         if [[ "$TARGET" == *"cfm"* ]]; then
             echo "🧪 Đang chạy Sanity Check #3: Overfit 500 bước trên 16 câu Tiếng Anh cho Stage 1 CFM..."
-            python train_cfm.py --config configs/stage1_cfm_en.yaml --overfit-16
+            python -u train_cfm.py --config configs/stage1_cfm_en.yaml --overfit-16
         else
             echo "🧪 Đang chạy Sanity Check #3: Overfit 500 bước trên 16 cặp câu Vi-En cho Stage 2 Bridge..."
             # Tham số thứ 3 trở đi chuyển thẳng cho train_bridge.py, VD:
             #   bash run.sh overfit bridge --overfit-steps 3000 --overfit-lr 1e-3
-            python train_bridge.py --overfit-16 "${@:3}"
+            python -u train_bridge.py --overfit-16 "${@:3}"
         fi
         ;;
 
