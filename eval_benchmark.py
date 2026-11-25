@@ -773,7 +773,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         if enc_tgt is not None:
             from train_utils import encode_whisper
             with torch.no_grad():
-                spk_emb = model.spk_encoder(encode_whisper(src_w.unsqueeze(0), feat_tgt, enc_tgt, device, dtype))
+                spk_emb = model.speaker(encode_whisper(src_w.unsqueeze(0), feat_tgt, enc_tgt, device, dtype))
         with torch.no_grad():
             gen_mel = model.inference(src_latents, speaker_emb=spk_emb, num_steps=args.num_steps)
         infer_time = time.perf_counter() - t_start

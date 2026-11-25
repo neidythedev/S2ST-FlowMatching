@@ -402,10 +402,20 @@ class CrossAttentionBridge(nn.Module):
     """Cầu nối dịch thuật Non-Autoregressive sử dụng Cross-Attention Transformer Decoder.
     Giải quyết triệt để vấn đề đảo ngữ pháp (non-monotonic word reordering) giữa Tiếng Việt và Tiếng Anh.
     """
-    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8):
+    def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, query_mode="interp"):
+        """query_mode:
+          'interp'  (mặc định): query đích = memory nguồn nội suy theo thời gian sang độ dài đích + mã hóa vị trí
+                    TƯƠNG ĐỐI (0→1) ở cả 2 phía -> ngay từ đầu frame i đã "nhìn" đúng vùng tương ứng của câu nguồn,
+                    cross-attention học thêm phần đảo trật tự.
+          'learned' (cũ, giữ làm ablation): query = positional embedding học từ đầu, nguồn không có vị trí tương
+                    đối -> attention dễ sụp thành trung bình đều (overfit 16 câu: L1(c*) ≈ mốc đoán trung bình)."""
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.query_mode = query_mode
         self.src_proj = nn.Linear(in_dim, hidden_dim)
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Hệ số học được cho mã hóa vị trí tương đối (khởi tạo vừa phải để không lấn át nội dung)
+        self.rel_pos_scale = nn.Parameter(torch.tensor(1.0))
 
         # Encoder tự chú ý trên đặc trưng nguồn (tiếng Việt)
         src_enc_layer = nn.TransformerEncoderLayer(
@@ -432,6 +442,29 @@ class CrossAttentionBridge(nn.Module):
         # Linear tự do phía sau gỡ bỏ giới hạn đó (overfit cũ kẹt L1(c*) ≈ 0.555).
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
 
+    def _rel_pos(self, lengths, T, device, dtype):
+        """Mã hóa vị trí TƯƠNG ĐỐI: frame j của câu dài L có vị trí p = j/(L-1) ∈ [0, 1];
+        sin/cos nhiều tần số của p -> [B, T, hidden]. Cùng p ở nguồn và đích => cùng mã -> attention dễ căn chỉnh."""
+        B = len(lengths)
+        lens = torch.as_tensor(lengths, device=device, dtype=torch.float32).view(B, 1)
+        p = torch.arange(T, device=device, dtype=torch.float32).view(1, T) / (lens - 1).clamp(min=1.0)
+        p = p.clamp(max=1.0)
+        half = self.hidden_dim // 2
+        freqs = torch.exp(torch.linspace(0.0, math.log(256.0), half, device=device)) * math.pi
+        ang = p.unsqueeze(-1) * freqs.view(1, 1, half)
+        return (torch.cat([ang.sin(), ang.cos()], dim=-1) * self.rel_pos_scale).to(dtype)
+
+    @staticmethod
+    def _interp_to(memory, src_lengths, tgt_lengths, T_tgt):
+        """Nội suy tuyến tính phần thật của memory từng câu (độ dài src_len) sang độ dài đích tgt_len, đệm tới T_tgt."""
+        B, _, D = memory.shape
+        out = memory.new_zeros(B, T_tgt, D)
+        for b in range(B):
+            ls, lt = int(src_lengths[b]), int(tgt_lengths[b])
+            seg = memory[b:b + 1, :ls].transpose(1, 2)                       # [1, D, ls]
+            out[b, :lt] = F.interpolate(seg, size=lt, mode="linear", align_corners=True)[0].transpose(0, 1)
+        return out
+
     @staticmethod
     def _pad_mask(lengths, T, device):
         if lengths is None:
@@ -447,8 +480,12 @@ class CrossAttentionBridge(nn.Module):
             nên một câu trong batch đệm cho kết quả như khi chạy riêng (train/suy luận nhất quán).
         """
         B, T_src, _ = whisper_features.shape
-        src_pad = self._pad_mask(src_lengths, T_src, whisper_features.device)
+        dev = whisper_features.device
+        src_pad = self._pad_mask(src_lengths, T_src, dev)
+        src_lens = list(src_lengths) if src_lengths is not None else [T_src] * B
         src_h = self.src_proj(whisper_features)
+        if self.query_mode == "interp":
+            src_h = src_h + self._rel_pos(src_lens, T_src, dev, src_h.dtype)
         memory = self.src_encoder(src_h, src_key_padding_mask=src_pad)
 
         dur_scale = self.duration_predictor(memory, src_pad)  # [B]
@@ -458,11 +495,17 @@ class CrossAttentionBridge(nn.Module):
             avg_scale = float(dur_scale.mean().item())
             target_len = max(20, min(2048, int(T_src * avg_scale)))
 
-        positions = torch.arange(target_len, device=whisper_features.device).clamp(max=4095)
-        queries = self.pos_emb(positions).unsqueeze(0).expand(B, -1, -1)
+        tgt_lens = [int(x) for x in tgt_lengths] if tgt_lengths is not None else [target_len] * B
+        if self.query_mode == "interp":
+            # Query = nội dung nguồn kéo giãn theo thời gian (căn chỉnh đơn điệu ban đầu) + vị trí tương đối
+            queries = self.query_proj(self._interp_to(memory, src_lens, tgt_lens, target_len))
+            queries = queries + self._rel_pos(tgt_lens, target_len, dev, queries.dtype)
+        else:
+            positions = torch.arange(target_len, device=dev).clamp(max=4095)
+            queries = self.pos_emb(positions).unsqueeze(0).expand(B, -1, -1)
 
         # Cross-Attention: Cho phép từ tiếng Anh đảo vị trí tùy ý so với tiếng Việt
-        tgt_pad = self._pad_mask(tgt_lengths, target_len, whisper_features.device)
+        tgt_pad = self._pad_mask(tgt_lengths, target_len, dev)
         latents = self.decoder(tgt=queries, memory=memory,
                                tgt_key_padding_mask=tgt_pad, memory_key_padding_mask=src_pad)
         latents = self.out_proj(latents)
@@ -492,10 +535,12 @@ class AcousticSpeakerEncoder(nn.Module):
 
 class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
-    def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192):
+    def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
+                 bridge_query_mode="interp"):
         super().__init__()
         self.n_mels = n_mels
-        self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers)
+        self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers,
+                                           query_mode=bridge_query_mode)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
@@ -504,11 +549,29 @@ class ViEnS2STSystem(nn.Module):
         self.teacher_cond_proj = nn.Linear(encoder_dim, bridge_dim)
         self.has_teacher = False
         self.target_encoder_id = None   # None = cùng encoder với phía nguồn
+        # Mixed precision: TRỌNG SỐ giữ fp32 (cập nhật nhỏ không bị làm tròn mất), PHÉP TÍNH chạy bf16 qua autocast.
+        # Trước đây model.to(bfloat16) -> LR 2e-4 bị làm tròn ở bf16 -> Bridge "đứng yên" (overfit kẹt ở mốc trung bình).
+        self.amp_dtype = None           # đặt torch.bfloat16 khi train trên GPU
+
+    def _amp(self):
+        dev = next(self.parameters()).device.type
+        return torch.autocast(device_type=dev, dtype=self.amp_dtype or torch.float32,
+                              enabled=self.amp_dtype is not None)
+
+    def _in(self, x):
+        """Đưa tensor đầu vào về đúng dtype của trọng số (fp32 khi train, bf16 nếu cả model ở bf16 như eval)."""
+        return x.to(next(self.parameters()).dtype) if torch.is_tensor(x) and x.is_floating_point() else x
+
+    def speaker(self, feats):
+        """Speaker embedding từ đặc trưng encoder (tự khớp dtype / autocast)."""
+        with self._amp():
+            return self.spk_encoder(self._in(feats))
 
     def teacher_condition(self, tgt_whisper, T_tgt):
         """c* [B, bridge_dim, T_tgt] = interp(cond_proj_stage1(Whisper(audio En đích)))."""
-        c = self.teacher_cond_proj(tgt_whisper)
-        return F.interpolate(c.transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
+        with self._amp():
+            c = self.teacher_cond_proj(self._in(tgt_whisper))
+        return F.interpolate(c.float().transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
 
     def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None,
                      mel_mask=None, cond_target=None, t=None, x_0=None, src_lengths=None, **kwargs):
@@ -519,6 +582,14 @@ class ViEnS2STSystem(nn.Module):
         weights = {"cfm_weight": 1.0, "dur_weight": 0.1, "cond_weight": 0.0}
         weights.update(loss_weights or {})
         B, _, T_tgt = target_mel.shape
+        src_whisper, target_mel = self._in(src_whisper), self._in(target_mel)
+        speaker_emb, t, x_0 = self._in(speaker_emb), self._in(t), self._in(x_0)
+        with self._amp():
+            return self._compute_loss(src_whisper, target_mel, speaker_emb, target_dur_ratio, weights,
+                                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt)
+
+    def _compute_loss(self, src_whisper, target_mel, speaker_emb, target_dur_ratio, weights,
+                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt):
 
         # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích; độ dài thật -> mask phần đệm
         tgt_lengths = mel_mask.sum(dim=-1).long() if mel_mask is not None else None
@@ -545,13 +616,13 @@ class ViEnS2STSystem(nn.Module):
 
         # 2. Duration Loss
         if target_dur_ratio is not None:
-            dur_loss = F.smooth_l1_loss(dur_scale.view(-1), target_dur_ratio.view(-1).to(dur_scale.dtype))
+            dur_loss = F.smooth_l1_loss(dur_scale.float().view(-1), target_dur_ratio.float().view(-1))
         else:
             dur_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
 
         # 3. Loss chưng cất điều kiện: Bridge phải sinh ra đúng c* của audio tiếng Anh
         if cond_target is not None and weights["cond_weight"] > 0:
-            cond_loss = masked_l1(cond, cond_target.to(cond.dtype), mel_mask)
+            cond_loss = masked_l1(cond, cond_target, mel_mask)
         else:
             cond_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
 
@@ -562,6 +633,12 @@ class ViEnS2STSystem(nn.Module):
     @torch.no_grad()
     def inference(self, src_whisper, speaker_emb=None, target_len=None, num_steps=32):
         self.eval()
+        src_whisper, speaker_emb = self._in(src_whisper), self._in(speaker_emb)
+        with self._amp():
+            out = self._inference(src_whisper, speaker_emb, target_len, num_steps)
+        return out.float()
+
+    def _inference(self, src_whisper, speaker_emb, target_len, num_steps):
         B = src_whisper.shape[0]
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
@@ -637,9 +714,14 @@ def load_stage2_into(model, ckpt_path, device):
     if meta is None:
         raise RuntimeError(f"{ckpt_path} không có stage2_meta (bản cũ En->Vi?) — train lại Stage 2.")
     dec_cfg = meta.get("decoder_config")
+    ref = next(model.parameters())
     if dec_cfg and dec_cfg != getattr(model.decoder, "config", None):
-        ref = next(model.parameters())
         model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=ref.device, dtype=ref.dtype)
+    qm = meta.get("bridge_query_mode", "learned")   # checkpoint trước khi có tùy chọn này dùng query 'learned'
+    if qm != model.bridge.query_mode:
+        b = model.bridge
+        model.bridge = CrossAttentionBridge(in_dim=b.src_proj.in_features, hidden_dim=b.hidden_dim,
+                                            num_layers=len(b.decoder.layers), query_mode=qm).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
     model.target_encoder_id = meta.get("target_encoder")
@@ -877,13 +959,18 @@ def main():
         print(f"[Whisper Warning] Chưa thể nạp transformers ({e}). Sẽ dùng đặc trưng mô phỏng.")
 
     # 2. Khởi tạo mô hình ViEnS2STSystem
+    bridge_query_mode = cfg["model"].get("bridge_query_mode", "interp")
     model = ViEnS2STSystem(
         encoder_dim=cfg["model"]["encoder_dim"],
         bridge_dim=cfg["model"]["bridge_dim"],
         bridge_layers=cfg["model"]["bridge_layers"],
         n_mels=cfg["model"]["n_mels"],
-        spk_dim=cfg["model"]["spk_dim"]
-    ).to(device=device, dtype=dtype)
+        spk_dim=cfg["model"]["spk_dim"],
+        bridge_query_mode=bridge_query_mode,
+    ).to(device=device)                                  # trọng số fp32
+    model.amp_dtype = dtype if dtype == torch.bfloat16 else None
+    print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
+    print(f"🌉 Bridge query mode: {bridge_query_mode}")
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
@@ -896,7 +983,7 @@ def main():
     has_teacher = False
     if found_cfm:
         has_teacher = load_stage1_into(model, found_cfm, device, allow_legacy=args.allow_legacy_cfm)
-        model.to(device=device, dtype=dtype)
+        model.to(device=device, dtype=torch.float32)     # giữ trọng số fp32 sau khi nạp Stage 1
     else:
         print("[Cảnh báo] Không tìm thấy CFM Stage 1 (checkpoints/cfm_en-best.pth)! CFM sẽ dùng weights ngẫu nhiên.")
         if not (args.overfit_16 or args.sanity_check or args.smoke_test):
@@ -920,7 +1007,7 @@ def main():
         embs = []
         for i, n in enumerate(lengths):
             lat = encode_whisper(audio_16k_padded[i:i + 1, :n], feat_tgt, enc_tgt, device, dtype)
-            embs.append(model.spk_encoder(lat))
+            embs.append(model.speaker(lat))
         return torch.cat(embs, dim=0)
 
     if not has_teacher and float(loss_weights.get("cond_weight", 0)) > 0:
@@ -976,7 +1063,7 @@ def main():
             t_lat = encode_whisper(tgt_16k, feat_tgt, enc_tgt, device, dtype)
             with torch.no_grad():
                 c_star = model.teacher_condition(t_lat, t_mel.shape[-1])
-                spk_tgt = model.spk_encoder(t_lat)
+                spk_tgt = model.speaker(t_lat)
         return s_lat, t_mel, mask, d_ratio, c_star, spk_tgt
 
     start_epoch = 0
@@ -1059,12 +1146,12 @@ def main():
         #   L(0)    = CFM loss khi bỏ hẳn điều kiện (mốc tệ nhất)
         #   L(Bridge) nằm giữa -> "% khoảng cách đã thu hẹp" = (L(0) - L(Bridge)) / (L(0) - L(c*))
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), model._amp():
             g = torch.Generator(device="cpu").manual_seed(0)
-            lat, _ = model.bridge(s_lat, target_len=tgt_m.shape[-1],
+            lat, _ = model.bridge(model._in(s_lat), target_len=tgt_m.shape[-1],
                                   src_lengths=fix_src_lat_lens, tgt_lengths=fix_mask.sum(-1).long())
             c_bridge = lat.transpose(1, 2)
-            spk = spk_tgt if spk_tgt is not None else model.spk_encoder(s_lat)
+            spk = model._in(spk_tgt) if spk_tgt is not None else model.speaker(s_lat)
             sums = {"c*": 0.0, "Bridge": 0.0, "0": 0.0}
             for _ in range(8):
                 tt = torch.rand(num_samples, generator=g).to(device=device, dtype=dtype)
@@ -1074,8 +1161,12 @@ def main():
                 for name, cc in [("c*", c_star), ("Bridge", c_bridge), ("0", torch.zeros_like(c_bridge))]:
                     if cc is None:
                         continue
-                    sums[name] += masked_mse(model.decoder(xt, tt, cc.to(dtype), spk, mask=fix_mask), ut, fix_mask).item() / 8
-            cond_trivial = masked_l1(c_star.mean(dim=-1, keepdim=True).expand_as(c_star), c_star, fix_mask).item() \
+                    sums[name] += masked_mse(model.decoder(model._in(xt), model._in(tt), model._in(cc), spk, mask=fix_mask),
+                                             ut, fix_mask).item() / 8
+            if c_star is not None:   # mốc trung bình: chỉ lấy trung bình trên frame THẬT của từng câu
+                m3 = fix_mask.unsqueeze(1).to(c_star.dtype)
+                c_mean = (c_star * m3).sum(-1, keepdim=True) / m3.sum(-1, keepdim=True).clamp(min=1.0)
+            cond_trivial = masked_l1(c_mean.expand_as(c_star), c_star, fix_mask).item() \
                 if c_star is not None else float("nan")
             cond_bridge = masked_l1(c_bridge, c_star, fix_mask).item() if c_star is not None else float("nan")
         l_star, l_br, l_0 = sums["c*"], sums["Bridge"], sums["0"]
@@ -1272,6 +1363,7 @@ def main():
             "history": history,
             "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
                             "source_encoder": whisper_id, "target_encoder": tgt_enc_id,
+                            "bridge_query_mode": bridge_query_mode,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,

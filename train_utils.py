@@ -48,6 +48,7 @@ def length_mask(lengths, max_len, device):
 
 def masked_mse(pred, target, mask):
     """MSE chỉ tính trên frame thật. pred/target: [B, C, T]; mask: [B, T]."""
+    pred, target = pred.float(), target.float()          # loss luôn tính ở fp32 (ổn định khi autocast bf16)
     if mask is None:
         return F.mse_loss(pred, target)
     m = mask.to(pred.dtype).unsqueeze(1)
@@ -57,6 +58,7 @@ def masked_mse(pred, target, mask):
 
 def masked_l1(pred, target, mask):
     """L1 chỉ tính trên frame thật. pred/target: [B, C, T]; mask: [B, T]."""
+    pred, target = pred.float(), target.float()
     if mask is None:
         return F.l1_loss(pred, target)
     m = mask.to(pred.dtype).unsqueeze(1)
