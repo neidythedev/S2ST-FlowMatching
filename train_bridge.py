@@ -606,7 +606,7 @@ class MASBridge(nn.Module):
     is_mas = True
 
     def __init__(self, in_dim=1024, hidden_dim=512, num_layers=4, n_heads=8, refine_blocks=4, dropout=0.1,
-                 prior_sigma=0.15, prior_weight=1.0, char_vocab=0):
+                 prior_sigma=0.15, prior_weight=1.0, char_vocab=0, align_on="mel", n_mels=100):
         """char_vocab > 0: đầu vào là đơn vị KÝ TỰ — kênh cuối của x là id ký tự (embedding riêng),
         các kênh còn lại là trạng thái NLLB của token chứa ký tự đó (in_dim đã gồm cả kênh id)."""
         super().__init__()
@@ -615,6 +615,11 @@ class MASBridge(nn.Module):
         # rơi gần vị trí tương đối n/N của câu. Không có prior, MAS bị "khóa" vào căn chỉnh sai ngay từ đầu (μ ngẫu nhiên
         # -> căn đại -> μ học theo -> tự củng cố; thử CPU: lệch 59% số frame). Chỉ dùng lúc train.
         self.prior_sigma, self.prior_weight = float(prior_sigma), float(prior_weight)
+        # Căn chỉnh theo MEL (như Glow-TTS / Matcha-TTS): μ -> μ_mel (100 kênh) so với Mel đích đã chuẩn hóa.
+        # Căn theo c* (512 chiều, đặc trưng PhoWhisper lẫn giọng/kênh thu) chỉ chạy với 16 câu; với ~2.9k câu nhiều
+        # giọng thì căn chỉnh trôi (26/11: Cond kẹt 0.43 kể cả khi có MAS).
+        self.align_on = align_on
+        self.mel_head = nn.Linear(hidden_dim, n_mels) if align_on == "mel" else None
         # thuộc tính tương thích với CrossAttentionBridge (meta / loader / log)
         self.query_mode, self.norm_mode, self.ctc_vocab, self.ctc_head = "mas", "prenorm", 0, None
         self.dur_range = (1.0, 1.0)
@@ -642,6 +647,8 @@ class MASBridge(nn.Module):
             nn.init.zeros_(c2.weight)
             nn.init.zeros_(c2.bias)
         self.last_logw = self.last_logw_target = self.last_mu_frames = self.last_src_mask = None
+        self.last_mu_mel_frames = self.last_mel_norm = None
+        self.last_align_stats = None
 
     @staticmethod
     def _pos(N, D, device):
@@ -669,8 +676,21 @@ class MASBridge(nn.Module):
             y = y + c2(F.gelu(c1(z))) * m
         return y.transpose(1, 2)
 
-    def forward(self, x, target_len=None, src_lengths=None, tgt_lengths=None, return_ctc=False, align_target=None):
-        """x [B, N, in_dim] trạng thái ẩn token; align_target: c* [B, D, T] (chỉ lúc train) -> căn chỉnh bằng MAS.
+    @staticmethod
+    def norm_mel(mel, t_lens):
+        """Chuẩn hóa Mel [B, C, T] theo từng kênh (trung bình / độ lệch trên frame THẬT của cả batch) -> [B, T, C]."""
+        B, C, T = mel.shape
+        m = (torch.arange(T, device=mel.device).view(1, -1) < torch.as_tensor(t_lens, device=mel.device).view(-1, 1))
+        m3 = m.unsqueeze(1).float()
+        x = mel.float()
+        mean = (x * m3).sum((0, 2), keepdim=True) / m3.sum((0, 2), keepdim=True).clamp(min=1.0)
+        std = ((((x - mean) ** 2) * m3).sum((0, 2), keepdim=True) / m3.sum((0, 2), keepdim=True).clamp(min=1.0)).sqrt()
+        return (((x - mean) / std.clamp(min=1e-3)) * m3).transpose(1, 2)
+
+    def forward(self, x, target_len=None, src_lengths=None, tgt_lengths=None, return_ctc=False, align_target=None,
+                align_mel=None):
+        """x [B, N, in_dim] trạng thái ẩn token; align_target: c* [B, D, T] (chỉ lúc train) -> căn chỉnh bằng MAS;
+        align_mel: Mel đích [B, 100, T] -> nếu align_on='mel' thì MAS so μ_mel với Mel (chuẩn hóa) thay cho c*.
         Không có align_target: dùng thời lượng dự đoán (co giãn về target_len / tgt_lengths nếu cho)."""
         B, N, _ = x.shape
         dev = x.device
@@ -688,12 +708,18 @@ class MASBridge(nn.Module):
         logw = self._dp(h, keep.to(h.dtype)).float()              # [B, N]
         self.last_logw, self.last_src_mask = logw, keepf
 
+        mu_mel = self.mel_head(mu) * keep.unsqueeze(-1).to(mu.dtype) if self.mel_head is not None else None
+        self.last_mu_mel_frames = self.last_mel_norm = None
         if align_target is not None:
             T = align_target.shape[-1]
             t_lens = [int(v) for v in tgt_lengths] if tgt_lengths is not None else [T] * B
+            if mu_mel is not None and align_mel is not None:
+                self.last_mel_norm = self.norm_mel(align_mel[..., :T], t_lens)     # [B, T, 100]
             with torch.no_grad():
-                c = align_target.float().transpose(1, 2)                          # [B, T, D]
-                m = mu.float()
+                if self.last_mel_norm is not None:                                  # căn theo MEL
+                    c, m = self.last_mel_norm, mu_mel.float()
+                else:                                                               # căn theo c*
+                    c, m = align_target.float().transpose(1, 2), mu.float()
                 # log-likelihood Gaussian đơn vị: -0.5 ||c_t - μ_n||^2  -> [B, N, T]
                 ll = -0.5 * ((m * m).sum(-1, keepdim=True) - 2.0 * m @ c.transpose(1, 2)
                              + (c * c).sum(-1).unsqueeze(1)) / m.shape[-1]       # chuẩn hóa theo số chiều
@@ -706,6 +732,17 @@ class MASBridge(nn.Module):
                 path = maximum_path(ll, n_lens, t_lens)
             dur = path.sum(-1)                                                    # [B, N] frame thật / token
             self.last_logw_target = torch.log(dur.clamp(min=1.0)) * keepf
+            # Thống kê căn chỉnh (để thấy ngay căn chỉnh có thoái hóa không)
+            with torch.no_grad():
+                nl = torch.tensor(n_lens, device=dev)
+                tot_f = dur.sum(-1).clamp(min=1.0)
+                edge = dur[:, 0] + dur[torch.arange(B, device=dev), (nl - 1).clamp(min=0)]
+                self.last_align_stats = {
+                    "edge_share": float((edge / tot_f).mean()),               # phần frame rơi vào đơn vị đầu+cuối (lặng)
+                    "max_dur": float(dur.max()),                              # đơn vị dài nhất (frame)
+                    "one_frame": float(((dur == 1).float() * keepf).sum() / keepf.sum().clamp(min=1.0)),
+                    "mean_dur": float((dur.sum() / keepf.sum().clamp(min=1.0))),
+                }
         else:
             w = torch.exp(logw).clamp(min=1.0) * keepf
             if tgt_lengths is not None or target_len is not None:
@@ -720,6 +757,8 @@ class MASBridge(nn.Module):
             path = durations_to_path(dur.round().long(), T)
             self.last_logw_target = None
         frames = path.transpose(1, 2).to(mu.dtype) @ mu                          # [B, T, D] μ kéo dài theo token
+        if mu_mel is not None and self.last_mel_norm is not None:
+            self.last_mu_mel_frames = path.transpose(1, 2).to(mu_mel.dtype) @ mu_mel   # [B, T, 100]
         fmask = path.sum(1) > 0                                                   # [B, T]
         self.last_mu_frames, self.last_frame_mask = frames, fmask
         out = self._refine(frames, fmask)
@@ -751,14 +790,15 @@ class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
                  bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0,
-                 bridge_in_dim=None, dur_range=(0.8, 2.2), bridge_type="cross", bridge_char_vocab=0):
+                 bridge_in_dim=None, dur_range=(0.8, 2.2), bridge_type="cross", bridge_char_vocab=0,
+                 mas_align_on="cond"):
         """bridge_in_dim: số chiều đầu vào Bridge (None = encoder_dim). Chế độ ngữ nghĩa: = d_model của decoder dịch
         (NLLB-600M: 1024). spk_encoder / teacher_cond_proj vẫn dùng encoder_dim (đặc trưng PhoWhisper)."""
         super().__init__()
         self.n_mels = n_mels
         if bridge_type == "mas":
             self.bridge = MASBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
-                                    char_vocab=bridge_char_vocab)
+                                    char_vocab=bridge_char_vocab, align_on=mas_align_on, n_mels=n_mels)
         else:
             self.bridge = CrossAttentionBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
                                                num_layers=bridge_layers, query_mode=bridge_query_mode,
@@ -825,7 +865,7 @@ class ViEnS2STSystem(nn.Module):
                 raise RuntimeError("MASBridge cần c* (teacher Stage 1) để căn chỉnh lúc train.")
             translated_latents, dur_scale, ctc_logits = self.bridge(
                 src_whisper, target_len=T_tgt, src_lengths=src_lengths, tgt_lengths=tgt_lengths,
-                return_ctc=True, align_target=cond_target)
+                return_ctc=True, align_target=cond_target, align_mel=target_mel)
         else:
             translated_latents, dur_scale, ctc_logits = self.bridge(src_whisper, target_len=T_tgt, src_lengths=src_lengths,
                                                                     tgt_lengths=tgt_lengths, return_ctc=True)
@@ -875,6 +915,13 @@ class ViEnS2STSystem(nn.Module):
             prior = masked_l1(self.bridge.last_mu_frames.transpose(1, 2), cond_target, mel_mask)
             total_loss = total_loss + weights["cond_weight"] * prior
             self.last_prior_loss = prior.detach()
+        # MAS căn theo Mel: "prior Mel" (như Matcha-TTS) — μ_mel kéo dài phải gần Mel đích chuẩn hóa
+        self.last_prior_mel = None
+        if is_mas and getattr(self.bridge, "last_mu_mel_frames", None) is not None:
+            pm = masked_l1(self.bridge.last_mu_mel_frames.transpose(1, 2), self.bridge.last_mel_norm.transpose(1, 2),
+                           mel_mask)
+            total_loss = total_loss + weights.get("mel_prior_weight", 1.0) * pm
+            self.last_prior_mel = pm.detach()
 
         # 4. CTC phụ: chuỗi ký tự tiếng Anh từ trạng thái ẩn của Bridge (không cần căn chỉnh frame)
         self.last_ctc_loss, self.last_ctc_logp = None, None
@@ -1033,7 +1080,8 @@ class NLLBSemanticSource:
     def char_states(self, vi_texts, en_texts):
         """Đơn vị KÝ TỰ cho MAS (mỗi ký tự ~7 frame, như Glow-TTS/Matcha-TTS; token NLLB = cả từ ~20-40 frame,
         1 vector/token không tả được âm thay đổi trong từ -> overfit MAS theo token chỉ tới L1 0.31).
-        Mỗi ký tự = [trạng thái ẩn decoder NLLB của token chứa nó (sau khi đã "đọc" token đó) | id ký tự].
+        Mỗi ký tự = [trạng thái ẩn decoder NLLB của token chứa nó (sau khi đã "đọc" token đó) | id ký tự];
+        thêm đơn vị LẶNG (id 0) ở đầu và cuối câu.
         -> (x [B, C, d_model + 1] — kênh cuối là id ký tự (float), độ dài ký tự từng câu)."""
         from train_utils import EN_CTC_CHARS
         cidx = {c: i + 1 for i, c in enumerate(EN_CTC_CHARS)}
@@ -1054,6 +1102,10 @@ class NLLBSemanticSource:
                         src_b.append(min(j + 1, L - 1))   # trạng thái ở vị trí j+1 = đã đọc xong token j
             if not ids_b:
                 ids_b, src_b = [cidx[" "]], [0]
+            # Đơn vị LẶNG (id 0) ở đầu và cuối câu: audio FLEURS có khoảng lặng trước/sau lời; không có đơn vị này
+            # MAS buộc dồn cả khoảng lặng vào chữ đầu/cuối -> thời lượng ngẫu nhiên, Dur loss tăng (26/11: 0.4 -> 1.5).
+            ids_b = [0] + ids_b + [0]
+            src_b = [0] + src_b + [L - 1]
             rows.append((ids_b, src_b))
         C = max(len(r[0]) for r in rows)
         x = h.new_zeros(h.shape[0], C, h.shape[2] + 1)
@@ -1085,7 +1137,8 @@ def load_stage2_into(model, ckpt_path, device):
     if bt == "mas":
         ref_b = model.bridge
         model.bridge = MASBridge(in_dim=bi, hidden_dim=ref_b.hidden_dim,
-                                 char_vocab=int(meta.get("bridge_char_vocab", 0))).to(device=ref.device, dtype=ref.dtype)
+                                 char_vocab=int(meta.get("bridge_char_vocab", 0)),
+                                 align_on=meta.get("mas_align_on", "cond")).to(device=ref.device, dtype=ref.dtype)
     elif (qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab
             or bi != model.bridge.src_proj.in_features or dr != model.bridge.dur_range
             or getattr(model.bridge, "is_mas", False)):
@@ -1357,6 +1410,7 @@ def main():
     bridge_char_vocab = EN_CTC_VOCAB if sem_unit == "char" else 0
     dur_range = tuple(sem_cfg.get("dur_range", (4.0, 80.0))) if sem_src is not None else (0.8, 2.2)
     bridge_type = cfg["model"].get("bridge_type", "cross")
+    mas_align_on = sem_cfg.get("align_on", "cond") if sem_src is not None else "cond"
     if sem_unit == "char" and bridge_type != "mas":
         raise RuntimeError("semantic.unit 'char' chỉ dùng với bridge_type 'mas'.")
     if bridge_type == "mas" and sem_src is None:
@@ -1389,12 +1443,14 @@ def main():
         dur_range=dur_range,
         bridge_type=bridge_type,
         bridge_char_vocab=bridge_char_vocab,
+        mas_align_on=mas_align_on,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
     if bridge_type == "mas":
         print(f"🌉 Bridge MAS theo {'KÝ TỰ (id ký tự + trạng thái NLLB của token chứa nó)' if sem_unit == 'char' else 'TOKEN'}"
-              f" -> μ -> căn chỉnh đơn điệu (MAS lúc train, thời lượng dự đoán lúc suy luận)")
+              f" -> μ -> căn chỉnh đơn điệu theo {'MEL' if mas_align_on == 'mel' else 'c*'} "
+              f"(MAS lúc train, thời lượng dự đoán lúc suy luận)")
     print(f"🌉 Bridge query mode: {model.bridge.query_mode} | norm: {model.bridge.norm_mode} | "
           f"CTC phụ (ký tự Anh): {'BẬT, ' + str(bridge_ctc_vocab) + ' ký hiệu' if use_ctc else 'tắt'}")
 
@@ -1635,6 +1691,12 @@ def main():
                 ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
                 if getattr(model, "last_prior_loss", None) is not None:
                     ctc_s += f" | Prior: {model.last_prior_loss.item():.4f}"
+                if getattr(model, "last_prior_mel", None) is not None:
+                    ctc_s += f" | PMel: {model.last_prior_mel.item():.3f}"
+                st_ = getattr(model.bridge, "last_align_stats", None)
+                if st_:
+                    ctc_s += (f" | MAS: lặng {st_['edge_share']*100:.0f}% max {st_['max_dur']:.0f}f "
+                              f"1-frame {st_['one_frame']*100:.0f}% tb {st_['mean_dur']:.1f}f")
                 print(f"   [Overfit Step {st+1:04d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
                       f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f}{ctc_s} | LR: {scheduler.get_last_lr()[0]:.1e}")
             final_loss = l_tot.item()
@@ -1836,6 +1898,12 @@ def main():
                 ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
                 if getattr(model, "last_prior_loss", None) is not None:
                     ctc_s += f" | Prior: {model.last_prior_loss.item():.4f}"
+                if getattr(model, "last_prior_mel", None) is not None:
+                    ctc_s += f" | PMel: {model.last_prior_mel.item():.3f}"
+                st_ = getattr(model.bridge, "last_align_stats", None)
+                if st_:
+                    ctc_s += (f" | MAS: lặng {st_['edge_share']*100:.0f}% max {st_['max_dur']:.0f}f "
+                              f"1-frame {st_['one_frame']*100:.0f}% tb {st_['mean_dur']:.1f}f")
                 print(f"   [E{epoch:02d}|Step {global_step:04d}] Total: {total_loss.item():.4f} | "
                       f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | Cond: {cond_l.item():.4f}{ctc_s} | LR: {cur_lr:.2e}")
 
@@ -1919,6 +1987,7 @@ def main():
                             "bridge_ctc_vocab": bridge_ctc_vocab,
                             "bridge_in_dim": model.bridge.src_proj.in_features, "dur_range": list(dur_range),
                             "bridge_type": bridge_type, "bridge_char_vocab": bridge_char_vocab,
+                            "mas_align_on": mas_align_on,
                             "semantic": sem_cfg if sem_src is not None else None,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
