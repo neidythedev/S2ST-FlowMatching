@@ -108,7 +108,8 @@ Tất cả nằm trong [`sanity_and_eda_suite.py`](file:///d:/Github/ai%20biet/S
 | **EDA & Sanity Check** | `bash run.sh sanity` | Kiểm tra Vocos round-trip + PhoWhisper health |
 | **Overfit 16 câu** | `bash run.sh overfit [cfm\|bridge]` | Chạy 500 bước kiểm tra học trên batch nhỏ |
 | **Train Stage 1 CFM** | `bash run.sh start cfm_en` | Huấn luyện bộ giải mã Flow-Matching tiếng Anh |
-| **Train Stage 2 Bridge** | `bash run.sh start bridge_vien` | Huấn luyện Cross-Attention Bridge Vi $\rightarrow$ En |
+| **Train Stage 2 Bridge** | `bash run.sh start bridge_vien_mas --fresh` | MASBridge ngữ nghĩa (config sem). `bridge_vien` = bản trực tiếp cũ (baseline) |
+| **Đo sàn Cond** | `bash run.sh floor 40` | L1 giữa c\* của 2 người đọc cùng câu (căn theo ký tự) |
 | **Theo dõi tiến trình** | `bash run.sh logs [tên_exp]` | Xem log thời gian thực |
 | **Kiểm tra trạng thái** | `bash run.sh status [tên_exp]` | Kiểm tra PID tiến trình đang chạy |
 | **Vẽ đồ thị Loss** | `bash run.sh plot [tên_exp]` | Xuất biểu đồ ASCII và file ảnh SVG |
