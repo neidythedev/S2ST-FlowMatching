@@ -1227,7 +1227,7 @@ def main():
             print(f"🔬 Đã tắt dropout trong Bridge ({n_drop} lớp).")
         print(f"ℹ️ Biến thể overfit: {', '.join(variant) if variant else 'mặc định (đủ loss, Vi -> Bridge)'} | "
               f"loss = {ovf_weights.get('cfm_weight', 1.0)}·CFM + {ovf_weights.get('dur_weight', 0.1)}·Dur "
-              f"+ {ovf_weights.get('cond_weight', 0.0)}·L1(c*)")
+              f"+ {ovf_weights.get('cond_weight', 0.0)}·L1(c*) + {ovf_weights.get('ctc_weight', 0.0)}·CTC")
 
         # Mốc so sánh cho Cond: L1 nếu Bridge chỉ đoán trung bình c* theo thời gian của từng câu
         cond_trivial0 = None
