@@ -7,6 +7,7 @@
 
 import argparse
 import importlib.machinery
+import json
 import math
 import os
 import random
@@ -1531,6 +1532,9 @@ def main():
     parser.add_argument("--overfit-16", action="store_true",
                         help="Sanity Check #3: Huấn luyện overfit 500 bước trên 16 cặp câu Vi-En và xuất audio")
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--eval-ckpt", type=str, default="",
+                        help="Chỉ đánh giá (không train) một/nhiều checkpoint Stage 2, phân tách bằng dấu phẩy: "
+                             "val loss + ASR-BLEU (seed cố định, CI 95%%) trên tập val cố định")
     parser.add_argument("--measure-floor", type=int, default=0, metavar="N",
                         help="Đo SÀN của L1(·, c*): c* của 2 bản ghi KHÁC nhau cùng một câu FLEURS (căn theo ký tự bằng "
                              "wav2vec2) trên N cặp — mức Cond không thể xuống dưới khi chỉ biết văn bản")
@@ -1817,7 +1821,7 @@ def main():
     data_pipeline = RealStreamingSpeechPipeline(
         split='train', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l,
         allow_synthetic=args.smoke_test,
-        max_pairs=None if (args.overfit_16 or args.sanity_check or args.smoke_test) else train_cfg.get("max_train_pairs", 4000))
+        max_pairs=None if (args.overfit_16 or args.sanity_check or args.smoke_test or args.eval_ckpt) else train_cfg.get("max_train_pairs", 4000))
 
     # 4. Chế độ Sanity Check & Overfit 16 mẫu
     if args.sanity_check or args.overfit_16:
@@ -2085,6 +2089,97 @@ def main():
     vocos_eval = None
     sync_enabled = bool(train_cfg.get("sync_drive", True)) and not args.smoke_test
 
+    def run_val_loss():
+        """Val loss trên tập val CỐ ĐỊNH (cùng t, x0 mỗi lần) -> dict trung bình theo batch."""
+        model.eval()
+        v_tot = v_cfm_ = v_dur_ = v_cond_ = v_ctc = 0.0
+        v_ctc_hyp, v_ctc_ref = [], []
+        with torch.no_grad():
+            for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk, s_lens, v_ext), tt, x0, _ in val_set:
+                lt, lc, ld, lco = model.compute_loss(
+                    s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
+                    mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype),
+                    src_lengths=s_lens, ctc_targets=ctc_ids(v_en), ext_durations=v_ext)
+                v_tot += lt.item(); v_cfm_ += lc.item(); v_dur_ += ld.item(); v_cond_ += lco.item()
+                if model.last_ctc_loss is not None:
+                    v_ctc += model.last_ctc_loss.item()
+                    v_ctc_hyp += ctc_decode_batch(); v_ctc_ref += list(v_en)
+        n_ = max(1, len(val_set))
+        ctc_s = ""
+        if v_ctc_hyp:
+            ctc_s = f" | CTC {v_ctc / n_:.3f} (CER {char_error_rate(v_ctc_hyp, v_ctc_ref) * 100:.1f}%)"
+        return {"total": v_tot / n_, "cfm": v_cfm_ / n_, "dur": v_dur_ / n_, "cond": v_cond_ / n_,
+                "ctc_s": ctc_s, "ctc_hyp": v_ctc_hyp, "ctc_ref": v_ctc_ref}
+
+    def run_asr_eval(n_show=2):
+        """ASR-BLEU như lúc suy luận thật trên tập val: seed nhiễu CFM cố định theo câu, Whisper chép lời,
+        SacreBLEU + khoảng tin cậy 95% bootstrap. -> (bleu, lo, hi, wer, hyps, refs)."""
+        nonlocal vocos_eval
+        model.eval()
+        if vocos_eval is None:
+            vocos_eval = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
+            vocos_eval.eval()
+        hyps, refs = [], []
+        n_eval = 0
+        for v_src, v_lens, v_en, _, _, _, (e_lat, e_lens, _) in val_set:
+            for i in range(v_src.shape[0]):
+                li = int(e_lens[i])
+                with torch.no_grad():
+                    spk_i = speaker_from_audio(v_src[i:i + 1], [v_lens[i]])
+                # Nhiễu khởi tạo CFM CỐ ĐỊNH theo câu: chênh lệch BLEU giữa các epoch chỉ còn do mô hình
+                # (26/11: không cố định seed, 16 câu -> BLEU nhảy ±3-4 điểm giữa các lần đo)
+                with torch.random.fork_rng(devices=[torch.cuda.current_device()] if device.type == "cuda" else []):
+                    torch.manual_seed(10_000 + n_eval)
+                    mel = model.inference(e_lat[i:i + 1], speaker_emb=spk_i, num_steps=32, src_lengths=[li])
+                n_eval += 1
+                with torch.no_grad():
+                    w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
+                hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
+                refs.append(v_en[i])
+        bleu, b_lo, b_hi = bleu_with_ci(hyps, refs)
+        wer_ = corpus_wer(hyps, refs)
+        ci = f" [95% CI {b_lo:.1f}–{b_hi:.1f}]" if b_lo is not None else ""
+        print(f"   🎧 Val ASR-BLEU: {bleu if bleu is not None else float('nan'):.2f}{ci} | WER: {wer_:.1f}% "
+              f"| {len(hyps)} câu, seed cố định")
+        for h, r in list(zip(hyps, refs))[:n_show]:
+            print(f"      • ref : {r[:70]}\n        pred: {h[:70]}")
+        return bleu, b_lo, b_hi, wer_, hyps, refs
+
+    if args.eval_ckpt:
+        # Chỉ đánh giá (không train): đo lại các checkpoint theo cùng một cách đo
+        out_dir = os.path.join("outputs", "eval_bridge")
+        os.makedirs(out_dir, exist_ok=True)
+        table = []
+        for ck in [c_.strip() for c_ in args.eval_ckpt.split(",") if c_.strip()]:
+            if not os.path.exists(ck):
+                print(f"⚠️ Không thấy {ck} — bỏ qua")
+                continue
+            print(f"\n📏 Đánh giá {ck}")
+            sd = torch.load(ck, map_location=device, weights_only=False)
+            missing, unexpected = model.load_state_dict(sd["model_state_dict"], strict=False)
+            if missing or unexpected:
+                print(f"   ⚠️ Khóa thiếu {len(missing)} / thừa {len(unexpected)} (VD: {(list(missing) + list(unexpected))[:3]})")
+            vl = run_val_loss()
+            print(f"   Val: Total {vl['total']:.4f} | CFM {vl['cfm']:.4f} | Dur {vl['dur']:.4f} | Cond {vl['cond']:.4f}")
+            bleu, lo, hi, wer_, hyps, refs = run_asr_eval(n_show=3)
+            row = {"ckpt": ck, "epoch": sd.get("epoch"), "bleu": bleu, "ci": [lo, hi], "wer": wer_,
+                   "val_cond": vl["cond"], "val_cfm": vl["cfm"], "val_dur": vl["dur"]}
+            table.append(row)
+            name = os.path.splitext(os.path.basename(ck))[0]
+            with open(os.path.join(out_dir, f"{name}.json"), "w", encoding="utf-8") as f:
+                json.dump({**row, "samples": [{"ref": r, "hyp": h} for r, h in zip(refs, hyps)]}, f,
+                          ensure_ascii=False, indent=1)
+        print("\n" + "=" * 75)
+        print(f"{'checkpoint':<36} {'epoch':>5} {'ASR-BLEU':>9} {'95% CI':>13} {'WER':>7} {'Cond':>7} {'CFM':>7}")
+        for r_ in table:
+            ci_ = f"{r_['ci'][0]:.1f}–{r_['ci'][1]:.1f}" if r_["ci"][0] is not None else "-"
+            b_ = r_["bleu"] if r_["bleu"] is not None else float("nan")
+            print(f"{os.path.basename(r_['ckpt']):<36} {str(r_['epoch']):>5} {b_:>9.2f} {ci_:>13} "
+                  f"{r_['wer']:>6.1f}% {r_['val_cond']:>7.4f} {r_['val_cfm']:>7.4f}")
+        print(f"   ({sum(v[0].shape[0] for v in val_set)} câu FLEURS validation; chi tiết từng câu: {out_dir}/)")
+        print("=" * 75)
+        return
+
     print(f"\n[Training Config] Bắt đầu: {epochs} Epochs | {steps_per_epoch} Steps/Epoch (~{num_pairs} câu) | Batch: {batch_size}")
     print(f"   → Tổng cộng: {total_train_steps} Steps | Warmup: {warmup_steps} Steps | LR Scheduler: Cosine Warmup")
     print("-" * 75)
@@ -2136,63 +2231,20 @@ def main():
         data_pipeline.shuffle()
 
         # Validation cố định
-        model.eval()
-        v_tot = v_cfm = v_dur = v_cond = v_ctc = 0.0
-        v_ctc_hyp, v_ctc_ref = [], []
-        with torch.no_grad():
-            for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk, s_lens, v_ext), tt, x0, _ in val_set:
-                lt, lc, ld, lco = model.compute_loss(
-                    s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
-                    mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype),
-                    src_lengths=s_lens, ctc_targets=ctc_ids(v_en), ext_durations=v_ext)
-                v_tot += lt.item(); v_cfm += lc.item(); v_dur += ld.item(); v_cond += lco.item()
-                if model.last_ctc_loss is not None:
-                    v_ctc += model.last_ctc_loss.item()
-                    v_ctc_hyp += ctc_decode_batch(); v_ctc_ref += list(v_en)
-        nv = max(1, len(val_set))
-        val_loss = v_tot / nv
-        ctc_s = ""
-        if v_ctc_hyp:
-            v_cer = char_error_rate(v_ctc_hyp, v_ctc_ref)
-            ctc_s = f" | CTC {v_ctc/nv:.3f} (CER {v_cer*100:.1f}%)"
-        print(f"   Val (cố định): Total {val_loss:.4f} | CFM {v_cfm/nv:.4f} | Dur {v_dur/nv:.4f} | Cond {v_cond/nv:.4f}{ctc_s} "
+        vl = run_val_loss()
+        val_loss, v_cfm, v_dur, v_cond, nv = vl["total"], vl["cfm"], vl["dur"], vl["cond"], 1
+        print(f"   Val (cố định): Total {val_loss:.4f} | CFM {v_cfm:.4f} | Dur {v_dur:.4f} | Cond {v_cond:.4f}{vl['ctc_s']} "
               f"| Best: {min(best_loss, val_loss):.4f}")
-        if v_ctc_hyp:
+        if vl["ctc_hyp"]:
             # Bridge "hiểu" câu đích đến đâu (độc lập với chất lượng âm thanh): giải mã CTC 1 câu val
-            print(f"      ctc ref : {v_ctc_ref[0][:90]}\n      ctc pred: {v_ctc_hyp[0][:90]}")
+            print(f"      ctc ref : {vl['ctc_ref'][0][:90]}\n      ctc pred: {vl['ctc_hyp'][0][:90]}")
 
-        # ASR-BLEU nhanh trên tập val (suy luận như thật: độ dài dự đoán + giọng nguồn)
+        # ASR-BLEU trên tập val (suy luận như thật: văn bản NLLB, độ dài dự đoán, giọng nguồn)
         val_bleu, val_bleu_ci, wer = None, (None, None), None
         if not args.smoke_test and eval_bleu_every > 0 and ((epoch + 1) % eval_bleu_every == 0 or epoch == epochs - 1):
             try:
-                if vocos_eval is None:
-                    vocos_eval = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
-                    vocos_eval.eval()
-                hyps, refs = [], []
-                n_eval = 0
-                for v_src, v_lens, v_en, _, _, _, (e_lat, e_lens, _) in val_set:
-                    for i in range(v_src.shape[0]):
-                        li = int(e_lens[i])
-                        with torch.no_grad():
-                            spk_i = speaker_from_audio(v_src[i:i + 1], [v_lens[i]])
-                        # Nhiễu khởi tạo CFM CỐ ĐỊNH theo câu: chênh lệch BLEU giữa các epoch chỉ còn do mô hình
-                        # (26/11: không cố định seed, 16 câu -> BLEU nhảy ±3-4 điểm giữa các lần đo)
-                        with torch.random.fork_rng(devices=[torch.cuda.current_device()] if device.type == "cuda" else []):
-                            torch.manual_seed(10_000 + n_eval)
-                            mel = model.inference(e_lat[i:i + 1], speaker_emb=spk_i, num_steps=32, src_lengths=[li])
-                        n_eval += 1
-                        with torch.no_grad():
-                            w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
-                        hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
-                        refs.append(v_en[i])
-                val_bleu, b_lo, b_hi = bleu_with_ci(hyps, refs)
-                wer = corpus_wer(hyps, refs)
-                ci = f" [95% CI {b_lo:.1f}–{b_hi:.1f}]" if b_lo is not None else ""
-                print(f"   🎧 Val ASR-BLEU: {val_bleu if val_bleu is not None else float('nan'):.2f}{ci} | WER: {wer:.1f}% "
-                      f"| {len(hyps)} câu, seed cố định")
+                val_bleu, b_lo, b_hi, wer, _, _ = run_asr_eval()
                 val_bleu_ci = (b_lo, b_hi)
-                for h, r in list(zip(hyps, refs))[:2]:
-                    print(f"      • ref : {r[:70]}\n        pred: {h[:70]}")
             except Exception as e:
                 print(f"   [Val ASR] Không đo được: {e}")
         history.append({"epoch": epoch, "train": avg_loss, "val": val_loss, "val_cond": v_cond / nv,

@@ -172,6 +172,13 @@ case "$ACTION" in
         python sanity_and_eda_suite.py --all
         ;;
 
+    eval-bridge)
+        # Chỉ đánh giá checkpoint Stage 2 (không train). VD:
+        #   bash run.sh eval-bridge checkpoints/bridge_vien_mas-best.pth,checkpoints/bridge_vien_mas-last.pth
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        python -u train_bridge.py --config configs/stage2_bridge_sem.yaml --eval-ckpt "${2:-checkpoints/bridge_vien_mas-best.pth}"
+        ;;
+
     eda)
         # EDA FLEURS Vi->En: ảnh PNG + summary.md ở outputs/eda/. VD: bash run.sh eda | bash run.sh eda --quick
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
