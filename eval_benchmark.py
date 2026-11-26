@@ -308,6 +308,7 @@ except ImportError as e:
 # Import module hệ thống từ train_bridge.py
 from train_bridge import (
     ViEnS2STSystem, EnViS2STSystem, CrossAttentionBridge, ToneAwareBridge, load_stage1_into, load_stage2_into,
+    NLLBSemanticSource,
     RealStreamingSpeechPipeline, build_mel_filterbank, extract_100_mel,
     resample_16k_to_24k, resample_24k_to_16k
 )
@@ -703,6 +704,7 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
     # 1. Khởi tạo mô hình ViEnS2STSystem
     model = ViEnS2STSystem(encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100).to(device=device, dtype=dtype)
     model.eval()
+    sem_src = sem_asr = sem_asr_proc = None   # chỉ dùng khi checkpoint Stage 2 là bản ngữ nghĩa (NLLB)
 
     # Case 1: Bridge ngẫu nhiên + CFM ngẫu nhiên | Case 2: Bridge ngẫu nhiên + CFM Stage 1
     # Case 3: Bridge đã train + CFM ngẫu nhiên    | Case 4: Bridge đã train + CFM Stage 1 (hệ đề xuất)
@@ -710,9 +712,21 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         if not os.path.exists(args.bridge_ckpt):
             raise RuntimeError(f"Case {case_num} cần {args.bridge_ckpt} (chạy 'bash run.sh restore bridge_vien' hoặc train Stage 2).")
         print(f"⏳ Đang nạp Stage 2 (Bridge + CFM đóng băng) từ: {args.bridge_ckpt}...")
-        load_stage2_into(model, args.bridge_ckpt, device)
+        s2_meta = load_stage2_into(model, args.bridge_ckpt, device)
         model.to(device=device, dtype=dtype)
         print("✓ Nạp Stage 2 thành công!")
+        sem_cfg = (s2_meta or {}).get("semantic")
+        if sem_cfg:
+            # Bản "hai lượt": audio Vi -> PhoWhisper CHÉP LỜI -> NLLB dịch -> trạng thái ẩn decoder NLLB -> Bridge -> c
+            from transformers import WhisperForConditionalGeneration, WhisperProcessor
+            sem_id = sem_cfg.get("model", "facebook/nllb-200-distilled-600M")
+            print(f"⏳ Checkpoint ngữ nghĩa: nạp ASR vinai/PhoWhisper-small + decoder dịch {sem_id}...")
+            sem_src = NLLBSemanticSource(sem_id, device, dtype)
+            sem_asr_proc = WhisperProcessor.from_pretrained("vinai/PhoWhisper-small")
+            sem_asr = WhisperForConditionalGeneration.from_pretrained("vinai/PhoWhisper-small").to(device=device, dtype=dtype).eval()
+            sem_asr.config.forced_decoder_ids = None
+            if getattr(sem_asr, "generation_config", None) is not None:
+                sem_asr.generation_config.forced_decoder_ids = None
         if case_num == 3:
             # Giữ Bridge đã train, nhưng thay CFM bằng bản KHỞI TẠO NGẪU NHIÊN cùng kiến trúc
             torch.manual_seed(0)
@@ -767,15 +781,31 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         else:
             src_latents = torch.randn(1, 100, 768, device=device, dtype=dtype)
 
-        # Đo RTF
+        # Đo RTF (bản ngữ nghĩa: tính CẢ thời gian chép lời + dịch NLLB, cho công bằng với cascaded)
         t_start = time.perf_counter()
         spk_emb = None
+        asr_vi_hyp = mt_en_hyp = ""
         if enc_tgt is not None:
             from train_utils import encode_whisper
             with torch.no_grad():
                 spk_emb = model.speaker(encode_whisper(src_w.unsqueeze(0), feat_tgt, enc_tgt, device, dtype))
         with torch.no_grad():
-            gen_mel = model.inference(src_latents, speaker_emb=spk_emb, num_steps=args.num_steps)
+            if sem_src is not None:
+                if spk_emb is None:   # encoder đích = PhoWhisper -> speaker từ latent nguồn đã tính
+                    spk_emb = model.speaker(src_latents)
+                feats_asr = sem_asr_proc.feature_extractor(src_w.numpy(), sampling_rate=16000,
+                                                           return_tensors="pt").input_features.to(device=device, dtype=dtype)
+                try:
+                    ids_asr = sem_asr.generate(feats_asr, max_new_tokens=128, language="vi", task="transcribe")
+                except Exception:
+                    ids_asr = sem_asr.generate(feats_asr, max_new_tokens=128)
+                asr_vi_hyp = sem_asr_proc.tokenizer.batch_decode(ids_asr, skip_special_tokens=True)[0].strip()
+                mt_en_hyp = sem_src.translate([asr_vi_hyp or "."])[0]
+                h_sem, l_sem = sem_src.states([asr_vi_hyp or "."], [mt_en_hyp])
+                gen_mel = model.inference(h_sem.to(dtype=dtype), speaker_emb=spk_emb, num_steps=args.num_steps,
+                                          src_lengths=l_sem)
+            else:
+                gen_mel = model.inference(src_latents, speaker_emb=spk_emb, num_steps=args.num_steps)
         infer_time = time.perf_counter() - t_start
 
         # Giải mã Vocos
@@ -830,12 +860,15 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
             "secs_timbre": round(secs, 4),
             "mel_l1_error": round(mel_l1, 4),
             "asr_bleu": round(bleu, 2),
-            "gen_duration": round(gen_duration, 2)
+            "gen_duration": round(gen_duration, 2),
+            **({"semantic_asr_vi": asr_vi_hyp, "semantic_mt_en": mt_en_hyp} if sem_src is not None else {}),
         })
 
         print(f"\n--- [Sample {idx+1:02d}/{args.num_samples}] ------------------------------------------")
         if ref_vi_text:
             print(f"  🇻🇳 Input Text (Vi): {ref_vi_text}")
+        if sem_src is not None:
+            print(f"  📝 PhoWhisper (Vi): {asr_vi_hyp}\n  🔁 NLLB dịch (En): {mt_en_hyp}")
         if asr_transcribed_en:
             print(f"  🎙️ Synthesized ASR (En): {asr_transcribed_en}")
         print(f"  🎯 Reference (En) : {ref_en_text}")
@@ -857,6 +890,11 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
         "num_samples": args.num_samples,
         "samples": results
     }
+    if sem_src is not None:
+        # BLEU của chính bản dịch NLLB (cận trên của ASR-BLEU): tách lỗi DỊCH khỏi lỗi SINH ÂM THANH
+        summary["semantic_s2tt_bleu"] = compute_corpus_bleu([r["semantic_mt_en"] for r in results], bleu_refs)
+        print(f"\nℹ️ Bản ngữ nghĩa: S2TT-BLEU của lượt dịch (PhoWhisper + NLLB) = {summary['semantic_s2tt_bleu']} "
+              f"| ASR-BLEU audio sinh ra = {summary['corpus_asr_bleu']}")
 
     with open(os.path.join(out_case_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
