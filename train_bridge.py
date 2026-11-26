@@ -1209,6 +1209,27 @@ def warp_by_units(c_b, d_a, d_b):
     return c_b[:, torch.as_tensor(idx, dtype=torch.long, device=c_b.device)]
 
 
+def bleu_with_ci(hyps, refs, n_boot=1000, seed=0):
+    """Corpus BLEU (SacreBLEU, chuẩn hóa như normalize_en) + khoảng tin cậy 95% bằng bootstrap theo câu.
+    -> (bleu, lo, hi) hoặc (None, None, None) nếu thiếu sacrebleu."""
+    try:
+        import sacrebleu
+    except Exception:
+        return None, None, None
+    import numpy as np
+    from train_utils import normalize_en
+    H = [normalize_en(h) for h in hyps]
+    R = [normalize_en(r) for r in refs]
+    bleu = sacrebleu.corpus_bleu(H, [R]).score
+    rng = np.random.default_rng(seed)
+    n = len(H)
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        boots.append(sacrebleu.corpus_bleu([H[i] for i in idx], [[R[i] for i in idx]]).score)
+    return bleu, float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+
+
 def extrapolate_floor(lk):
     """lk: {k: L1(c*_a, trung bình k bản ghi khác)}. Nếu c* = nội dung chung + nhiễu riêng độc lập (độ lệch σ) và L1 ∝ σ:
     L(k) = F·sqrt(1 + 1/k), F = L1 khi đoán đúng nội dung chung (k -> ∞). Bình phương tối thiểu theo F."""
@@ -2141,37 +2162,41 @@ def main():
             print(f"      ctc ref : {v_ctc_ref[0][:90]}\n      ctc pred: {v_ctc_hyp[0][:90]}")
 
         # ASR-BLEU nhanh trên tập val (suy luận như thật: độ dài dự đoán + giọng nguồn)
-        val_bleu = None
+        val_bleu, val_bleu_ci, wer = None, (None, None), None
         if not args.smoke_test and eval_bleu_every > 0 and ((epoch + 1) % eval_bleu_every == 0 or epoch == epochs - 1):
             try:
                 if vocos_eval is None:
                     vocos_eval = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
                     vocos_eval.eval()
                 hyps, refs = [], []
+                n_eval = 0
                 for v_src, v_lens, v_en, _, _, _, (e_lat, e_lens, _) in val_set:
                     for i in range(v_src.shape[0]):
                         li = int(e_lens[i])
                         with torch.no_grad():
                             spk_i = speaker_from_audio(v_src[i:i + 1], [v_lens[i]])
-                        mel = model.inference(e_lat[i:i + 1], speaker_emb=spk_i, num_steps=32, src_lengths=[li])
+                        # Nhiễu khởi tạo CFM CỐ ĐỊNH theo câu: chênh lệch BLEU giữa các epoch chỉ còn do mô hình
+                        # (26/11: không cố định seed, 16 câu -> BLEU nhảy ±3-4 điểm giữa các lần đo)
+                        with torch.random.fork_rng(devices=[torch.cuda.current_device()] if device.type == "cuda" else []):
+                            torch.manual_seed(10_000 + n_eval)
+                            mel = model.inference(e_lat[i:i + 1], speaker_emb=spk_i, num_steps=32, src_lengths=[li])
+                        n_eval += 1
                         with torch.no_grad():
                             w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
                         hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
                         refs.append(v_en[i])
-                try:
-                    import sacrebleu
-                    from train_utils import normalize_en
-                    val_bleu = sacrebleu.corpus_bleu([normalize_en(h) for h in hyps], [[normalize_en(r) for r in refs]]).score
-                except Exception:
-                    val_bleu = None
+                val_bleu, b_lo, b_hi = bleu_with_ci(hyps, refs)
                 wer = corpus_wer(hyps, refs)
-                print(f"   🎧 Val ASR-BLEU: {val_bleu if val_bleu is not None else float('nan'):.2f} | WER: {wer:.1f}%")
+                ci = f" [95% CI {b_lo:.1f}–{b_hi:.1f}]" if b_lo is not None else ""
+                print(f"   🎧 Val ASR-BLEU: {val_bleu if val_bleu is not None else float('nan'):.2f}{ci} | WER: {wer:.1f}% "
+                      f"| {len(hyps)} câu, seed cố định")
+                val_bleu_ci = (b_lo, b_hi)
                 for h, r in list(zip(hyps, refs))[:2]:
                     print(f"      • ref : {r[:70]}\n        pred: {h[:70]}")
             except Exception as e:
                 print(f"   [Val ASR] Không đo được: {e}")
         history.append({"epoch": epoch, "train": avg_loss, "val": val_loss, "val_cond": v_cond / nv,
-                        "val_cfm": v_cfm / nv, "val_bleu": val_bleu})
+                        "val_cfm": v_cfm / nv, "val_bleu": val_bleu, "val_bleu_ci": list(val_bleu_ci), "val_wer": wer})
 
         # Lưu Checkpoint Last & Best (best theo VAL cố định, không theo train loss)
         os.makedirs(paths["checkpoint_dir"], exist_ok=True)
