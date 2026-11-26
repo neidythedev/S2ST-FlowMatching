@@ -16,6 +16,10 @@ model:
   bridge_type: "mas"            # mas = căn chỉnh token->frame bằng MAS + thời lượng theo token (Glow-TTS/Matcha-TTS)
                                 # cross = Bridge cũ (kéo giãn đều + cross-attention): kẹt val Cond 0.44 ngày 26/11
   semantic:
+    alignment: "w2v"                              # w2v = forced alignment wav2vec2-base-960h (đóng băng, chỉ lúc train, như MFA của FastSpeech 2)
+                                                  # mas = MAS tự học (26/11: không hội tụ trên FLEURS nhiều giọng, 55-70% ký tự chỉ 1 frame)
+    aligner_model: "facebook/wav2vec2-base-960h"
+    dp_speaker: true                              # bộ dự đoán thời lượng nhận vector giọng (như VITS nhiều người nói)
     align_on: "mel"                               # MAS căn theo: mel (Glow-TTS/Matcha-TTS) | cond (c*, kẹt 0.43 trên dữ liệu đầy đủ)
     unit: "char"                                  # đơn vị MAS: char (~7 frame/ký tự, như Glow-TTS) | token (cả từ, overfit chỉ tới L1 0.31)
     source: "nllb"                                # none = latent PhoWhisper (bản trực tiếp) | nllb = trạng thái ẩn decoder NLLB

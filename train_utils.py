@@ -339,6 +339,111 @@ def char_error_rate(hyps, refs):
     return errs / max(1, tot)
 
 
+# ---- Forced alignment ký tự tiếng Anh bằng mô hình CTC pretrain (wav2vec2-base-960h), không cần torchaudio ----
+def ctc_viterbi_align(logp, target, blank=0, wildcard=None):
+    """Căn chỉnh CTC cưỡng bức (Viterbi): logp [T, V] (log-softmax), target: list id (−1 = ký tự KHÔNG có trong bộ
+    từ vựng, ví dụ chữ số -> dùng max log-prob trên `wildcard`). -> list frame bắt đầu của từng ký tự + frame kết thúc
+    (sau frame cuối của ký tự cuối). None nếu không đủ frame."""
+    import numpy as np
+    lp = np.asarray(logp, dtype=np.float32)
+    T, L = lp.shape[0], len(target)
+    if L == 0 or T < L:
+        return None
+    wild = lp[:, wildcard].max(axis=1) if wildcard is not None and len(wildcard) else lp.max(axis=1)
+    z = [blank]
+    for y in target:
+        z += [y, blank]
+    S = len(z)
+    em = np.stack([wild if s == -1 else lp[:, s] for s in z], axis=1)           # [T, S]
+    neg = np.float32(-1e30)
+    alpha = np.full(S, neg, dtype=np.float32)
+    alpha[0] = em[0, 0]
+    alpha[1] = em[0, 1]
+    zz = np.array(z)
+    skip_ok = np.zeros(S, dtype=bool)
+    skip_ok[2:] = (zz[2:] != blank) & (zz[2:] != zz[:-2])
+    bp = np.zeros((T, S), dtype=np.int8)
+    for t in range(1, T):
+        a1 = np.concatenate([[neg], alpha[:-1]])
+        a2 = np.concatenate([[neg, neg], alpha[:-2]])
+        a2 = np.where(skip_ok, a2, neg)
+        stack = np.stack([alpha, a1, a2])                                        # dịch 0 / 1 / 2 trạng thái
+        k = stack.argmax(axis=0)
+        alpha = stack[k, np.arange(S)] + em[t]
+        bp[t] = k
+    s = S - 1 if alpha[S - 1] >= alpha[S - 2] else S - 2
+    states = np.zeros(T, dtype=np.int64)
+    for t in range(T - 1, -1, -1):
+        states[t] = s
+        s -= int(bp[t, s])
+    starts, last_end = [None] * L, None
+    for t, st in enumerate(states):
+        if st % 2 == 1:
+            k = (st - 1) // 2
+            if starts[k] is None:
+                starts[k] = t
+            if k == L - 1:
+                last_end = t + 1
+    for k in range(L):                       # (an toàn) ký tự bị bỏ qua -> dùng biên của ký tự trước
+        if starts[k] is None:
+            starts[k] = starts[k - 1] if k > 0 else 0
+    return starts, (last_end if last_end is not None else T)
+
+
+class CTCCharAligner:
+    """Biết mỗi KÝ TỰ tiếng Anh nằm ở frame nào trong audio tiếng Anh — dùng wav2vec2-base-960h (ASR tiếng Anh CTC
+    theo ký tự, pretrain 960 giờ, ĐÓNG BĂNG). Thay cho MAS: MAS phải tự học căn chỉnh cùng lúc với μ ("con gà – quả
+    trứng") và thất bại trên FLEURS nhiều giọng (26/11: 55-70% ký tự chỉ 1 frame). Chỉ dùng lúc TRAIN."""
+
+    def __init__(self, model_id="facebook/wav2vec2-base-960h", device="cpu"):
+        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+        self.device = device
+        self.proc = Wav2Vec2Processor.from_pretrained(model_id)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_id).eval().to(device)   # fp32 cho log-prob ổn định
+        for p in self.model.parameters():
+            p.requires_grad = False
+        vocab = self.proc.tokenizer.get_vocab()
+        self.blank = int(self.proc.tokenizer.pad_token_id)
+        self.map = {}
+        for c in EN_CTC_CHARS:
+            key = "|" if c == " " else (c.upper() if c.isalpha() else c)
+            self.map[c] = vocab.get(key, -1)                                    # chữ số -> -1 (wildcard)
+        self.wildcard = [i for k, i in vocab.items() if len(k) == 1 and (k.isalpha() or k == "'")]
+
+    @torch.no_grad()
+    def logprobs(self, wav_16k):
+        x = self.proc(wav_16k.float().cpu().numpy(), sampling_rate=16000, return_tensors="pt").input_values.to(self.device)
+        return torch.log_softmax(self.model(x).logits[0].float(), dim=-1).cpu().numpy()    # [T_w, V], 50 fps
+
+    def durations(self, wav_16k, char_ids, mel_len):
+        """char_ids: id ký tự theo EN_CTC_CHARS (id 0 = đơn vị LẶNG ở đầu/cuối) -> thời lượng (frame Mel) từng đơn vị,
+        tổng = mel_len. Đơn vị lặng đầu nhận phần trước ký tự đầu, đơn vị lặng cuối nhận phần sau ký tự cuối."""
+        import numpy as np
+        ids = [int(i) for i in char_ids]
+        core = [k for k, i in enumerate(ids) if i != 0]
+        target = [self.map[EN_CTC_CHARS[ids[k] - 1]] for k in core]
+        lp = self.logprobs(wav_16k)
+        Tw = lp.shape[0]
+        res = ctc_viterbi_align(lp, target, blank=self.blank, wildcard=self.wildcard)
+        if res is None:                                  # không căn được -> chia đều (hiếm)
+            b = np.linspace(0, mel_len, len(ids) + 1)
+            return np.diff(np.round(b)).astype(np.float32)
+        starts, end = res
+        # biên theo frame wav2vec2: [lặng đầu | ký tự 1 ... ký tự L | lặng cuối]
+        bounds_w = [0] + starts + [end, Tw]
+        bm = np.round(np.array(bounds_w, dtype=np.float64) * (mel_len / max(1, Tw)))
+        bm[0], bm[-1] = 0, mel_len
+        bm = np.maximum.accumulate(bm)
+        d_core = np.diff(bm).astype(np.float32)              # [L + 2]: lặng đầu, L ký tự, lặng cuối
+        out = np.zeros(len(ids), dtype=np.float32)
+        # ghép vào đúng vị trí (đơn vị lặng nằm ở đầu/cuối chuỗi char_states)
+        out[0] += d_core[0]
+        for j, k in enumerate(core):
+            out[k] = d_core[1 + j]
+        out[-1] += d_core[-1]
+        return out
+
+
 def word_errors(hyp, ref):
     """(số lỗi edit distance theo từ, số từ tham chiếu)."""
     h, r = normalize_en(hyp).split(), normalize_en(ref).split()
