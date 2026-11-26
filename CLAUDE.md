@@ -133,11 +133,13 @@ Tất cả nằm trong [`sanity_and_eda_suite.py`](file:///d:/Github/ai%20biet/S
 
 ## 🎯 8. KẾ HOẠCH HÀNH ĐỘNG TIẾP THEO (NEXT PRIORITIES)
 
-Trạng thái và việc dở dang mới nhất luôn ở **mục cuối của file mới nhất trong `docs/worklog/`** — đọc trước khi làm tiếp. Tóm tắt (26/11 chiều):
+Trạng thái và việc dở dang mới nhất luôn ở **mục cuối của file mới nhất trong `docs/worklog/`** — đọc trước khi làm tiếp. Tóm tắt (26/11 tối):
 
-1. Đo sàn Cond: `bash run.sh floor 40`.
-2. Train Stage 2 lên 60 epoch: `bash run.sh start bridge_vien_mas --resume` (hoặc `--fresh`), theo dõi ASR-BLEU.
-3. Đo S2TT-BLEU của PhoWhisper + NLLB (cận trên của ASR-BLEU).
-4. Benchmark Case 4 (checkpoint ngữ nghĩa) so với baseline: `bash run.sh eval all both 30`.
-5. Nếu BLEU bão hòa thấp: thêm dữ liệu phía Anh cho Stage 2 (PhoST, LibriTTS).
+1. Đo lại mốc FLEURS-only: `bash run.sh eval-bridge checkpoints/bridge_vien_mas-best.pth,checkpoints/bridge_vien_mas-last.pth` (64 câu, seed cố định, CI 95%).
+2. EDA: `bash run.sh eda` → `bash run.sh upload`; kiểm tra % audio > 12 s (bị cắt khi train).
+3. S2TT-BLEU của PhoWhisper + NLLB (cận trên).
+4. Thêm PhoST cho Stage 2 (EXP05), so với mốc bước 1; Stage 2 trên FLEURS đã bão hòa (BLEU ~18–21) và overfit.
+5. Benchmark Case 4 so với baseline trên FLEURS test, kèm CI: `bash run.sh eval all both 30`.
 6. Gia hạn token rclone ~30/11, thu hồi token đã lộ.
+
+Lệnh tiện ích: đo sàn Cond `bash run.sh floor 40`; xem lịch sử BLEU trong checkpoint mà không động vào job: tải `-last.pth` về `/tmp/peek` và đọc `history`.
