@@ -76,8 +76,8 @@ case "$ACTION" in
         else
             SCRIPT="train_bridge.py"
             CONFIG="configs/stage2_bridge.yaml"
-            # Tên thí nghiệm có "sem" -> bản hai lượt (nguồn ngữ nghĩa NLLB)
-            if [[ "$EXP_NAME" == *"sem"* ]]; then CONFIG="configs/stage2_bridge_sem.yaml"; fi
+            # Tên thí nghiệm có "sem" hoặc "mas" -> bản hai lượt (nguồn ngữ nghĩa NLLB + MAS)
+            if [[ "$EXP_NAME" == *"sem"* || "$EXP_NAME" == *"mas"* ]]; then CONFIG="configs/stage2_bridge_sem.yaml"; fi
         fi
 
         echo "🚀 Đang khởi chạy '$EXP_NAME' (Script: $SCRIPT, Config: $CONFIG)..."

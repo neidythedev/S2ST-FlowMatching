@@ -801,7 +801,10 @@ def evaluate_case(case_num, args, device, dtype, vocos, mel_fb, data_pipeline, f
                     ids_asr = sem_asr.generate(feats_asr, max_new_tokens=128)
                 asr_vi_hyp = sem_asr_proc.tokenizer.batch_decode(ids_asr, skip_special_tokens=True)[0].strip()
                 mt_en_hyp = sem_src.translate([asr_vi_hyp or "."])[0]
-                h_sem, l_sem = sem_src.states([asr_vi_hyp or "."], [mt_en_hyp])
+                if sem_cfg.get("unit", "token") == "char":
+                    h_sem, l_sem = sem_src.char_states([asr_vi_hyp or "."], [mt_en_hyp])
+                else:
+                    h_sem, l_sem = sem_src.states([asr_vi_hyp or "."], [mt_en_hyp])
                 gen_mel = model.inference(h_sem.to(dtype=dtype), speaker_emb=spk_emb, num_steps=args.num_steps,
                                           src_lengths=l_sem)
             else:

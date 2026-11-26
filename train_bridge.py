@@ -606,7 +606,9 @@ class MASBridge(nn.Module):
     is_mas = True
 
     def __init__(self, in_dim=1024, hidden_dim=512, num_layers=4, n_heads=8, refine_blocks=4, dropout=0.1,
-                 prior_sigma=0.15, prior_weight=1.0):
+                 prior_sigma=0.15, prior_weight=1.0, char_vocab=0):
+        """char_vocab > 0: đầu vào là đơn vị KÝ TỰ — kênh cuối của x là id ký tự (embedding riêng),
+        các kênh còn lại là trạng thái NLLB của token chứa ký tự đó (in_dim đã gồm cả kênh id)."""
         super().__init__()
         self.hidden_dim = hidden_dim
         # Prior căn chỉnh gần ĐƯỜNG CHÉO (kiểu RAD-TTS / "One TTS Alignment to Rule Them All"): thưởng khi token n
@@ -616,7 +618,10 @@ class MASBridge(nn.Module):
         # thuộc tính tương thích với CrossAttentionBridge (meta / loader / log)
         self.query_mode, self.norm_mode, self.ctc_vocab, self.ctc_head = "mas", "prenorm", 0, None
         self.dur_range = (1.0, 1.0)
-        self.src_proj = nn.Linear(in_dim, hidden_dim)
+        self.char_vocab = int(char_vocab or 0)
+        self.in_dim = int(in_dim)
+        self.src_proj = nn.Linear(in_dim - 1 if self.char_vocab > 0 else in_dim, hidden_dim)
+        self.char_emb = nn.Embedding(self.char_vocab, hidden_dim) if self.char_vocab > 0 else None
         layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
                                            dropout=dropout, batch_first=True, activation="gelu", norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(hidden_dim),
@@ -671,7 +676,12 @@ class MASBridge(nn.Module):
         dev = x.device
         n_lens = [int(v) for v in src_lengths] if src_lengths is not None else [N] * B
         keep = (torch.arange(N, device=dev).view(1, -1) < torch.tensor(n_lens, device=dev).view(-1, 1))
-        h = self.src_proj(x) + self._pos(N, self.hidden_dim, dev).to(x.dtype).unsqueeze(0)
+        if self.char_emb is not None:
+            cid = x[..., -1].round().long().clamp(0, self.char_vocab - 1)
+            h = self.src_proj(x[..., :-1]) + self.char_emb(cid).to(x.dtype)
+        else:
+            h = self.src_proj(x)
+        h = h + self._pos(N, self.hidden_dim, dev).to(x.dtype).unsqueeze(0)
         h = self.encoder(h, src_key_padding_mask=~keep)
         mu = self.mu_proj(h) * keep.unsqueeze(-1).to(h.dtype)    # [B, N, D]
         keepf = keep.to(torch.float32)
@@ -744,13 +754,14 @@ class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
                  bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0,
-                 bridge_in_dim=None, dur_range=(0.8, 2.2), bridge_type="cross"):
+                 bridge_in_dim=None, dur_range=(0.8, 2.2), bridge_type="cross", bridge_char_vocab=0):
         """bridge_in_dim: số chiều đầu vào Bridge (None = encoder_dim). Chế độ ngữ nghĩa: = d_model của decoder dịch
         (NLLB-600M: 1024). spk_encoder / teacher_cond_proj vẫn dùng encoder_dim (đặc trưng PhoWhisper)."""
         super().__init__()
         self.n_mels = n_mels
         if bridge_type == "mas":
-            self.bridge = MASBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim)
+            self.bridge = MASBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
+                                    char_vocab=bridge_char_vocab)
         else:
             self.bridge = CrossAttentionBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
                                                num_layers=bridge_layers, query_mode=bridge_query_mode,
@@ -1021,6 +1032,42 @@ class NLLBSemanticSource:
         h = out.last_hidden_state.float() * dec_mask.unsqueeze(-1)                   # phần đệm = 0
         return h, [int(x) for x in lens.tolist()]
 
+    @torch.no_grad()
+    def char_states(self, vi_texts, en_texts):
+        """Đơn vị KÝ TỰ cho MAS (mỗi ký tự ~7 frame, như Glow-TTS/Matcha-TTS; token NLLB = cả từ ~20-40 frame,
+        1 vector/token không tả được âm thay đổi trong từ -> overfit MAS theo token chỉ tới L1 0.31).
+        Mỗi ký tự = [trạng thái ẩn decoder NLLB của token chứa nó (sau khi đã "đọc" token đó) | id ký tự].
+        -> (x [B, C, d_model + 1] — kênh cuối là id ký tự (float), độ dài ký tự từng câu)."""
+        from train_utils import EN_CTC_CHARS
+        cidx = {c: i + 1 for i, c in enumerate(EN_CTC_CHARS)}
+        h, lens = self.states(vi_texts, en_texts)                                  # [B, L, D]
+        lab, _ = self._ids(en_texts, self.tgt_id)
+        special = {self.tgt_id, self.eos_id, self.pad_id}
+        rows = []
+        for b in range(h.shape[0]):
+            L = lens[b]
+            toks = self.tok.convert_ids_to_tokens(lab[b, :L].tolist())
+            ids_b, src_b = [], []
+            for j, (tid, piece) in enumerate(zip(lab[b, :L].tolist(), toks)):
+                if tid in special:
+                    continue
+                for ch in str(piece).replace("\u2581", " ").lower():
+                    if ch in cidx and not (ch == " " and (not ids_b or ids_b[-1] == cidx[" "])):
+                        ids_b.append(cidx[ch])
+                        src_b.append(min(j + 1, L - 1))   # trạng thái ở vị trí j+1 = đã đọc xong token j
+            if not ids_b:
+                ids_b, src_b = [cidx[" "]], [0]
+            rows.append((ids_b, src_b))
+        C = max(len(r[0]) for r in rows)
+        x = h.new_zeros(h.shape[0], C, h.shape[2] + 1)
+        clens = []
+        for b, (ids_b, src_b) in enumerate(rows):
+            n = len(ids_b)
+            x[b, :n, :-1] = h[b, torch.tensor(src_b, device=h.device)]
+            x[b, :n, -1] = torch.tensor(ids_b, device=h.device, dtype=h.dtype)
+            clens.append(n)
+        return x, clens
+
 
 def load_stage2_into(model, ckpt_path, device):
     """Nạp checkpoint Stage 2 (Bridge + decoder đóng băng + spk_encoder) — dựng decoder đúng kiến trúc đã lưu."""
@@ -1040,7 +1087,8 @@ def load_stage2_into(model, ckpt_path, device):
     bt = meta.get("bridge_type", "cross")
     if bt == "mas":
         ref_b = model.bridge
-        model.bridge = MASBridge(in_dim=bi, hidden_dim=ref_b.hidden_dim).to(device=ref.device, dtype=ref.dtype)
+        model.bridge = MASBridge(in_dim=bi, hidden_dim=ref_b.hidden_dim,
+                                 char_vocab=int(meta.get("bridge_char_vocab", 0))).to(device=ref.device, dtype=ref.dtype)
     elif (qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab
             or bi != model.bridge.src_proj.in_features or dr != model.bridge.dur_range
             or getattr(model.bridge, "is_mas", False)):
@@ -1307,16 +1355,23 @@ def main():
         sem_src = NLLBSemanticSource(sem_id, device, dtype)
         print(f"✓ Đầu vào Bridge = trạng thái ẩn decoder NLLB ({sem_src.dim} chiều/token) | văn bản Anh lúc train: "
               f"'{sem_cfg.get('train_text', 'ref')}' | lúc đánh giá ASR-BLEU: '{sem_cfg.get('eval_text', 'mt')}'")
-    bridge_in_dim = sem_src.dim if sem_src is not None else None
+    sem_unit = sem_cfg.get("unit", "token") if sem_src is not None else None
+    bridge_in_dim = (sem_src.dim + (1 if sem_unit == "char" else 0)) if sem_src is not None else None
+    bridge_char_vocab = EN_CTC_VOCAB if sem_unit == "char" else 0
     dur_range = tuple(sem_cfg.get("dur_range", (4.0, 80.0))) if sem_src is not None else (0.8, 2.2)
     bridge_type = cfg["model"].get("bridge_type", "cross")
+    if sem_unit == "char" and bridge_type != "mas":
+        raise RuntimeError("semantic.unit 'char' chỉ dùng với bridge_type 'mas'.")
     if bridge_type == "mas" and sem_src is None:
         raise RuntimeError("bridge_type 'mas' cần nguồn ngữ nghĩa (model.semantic.source = nllb).")
 
     def semantic_feats(vi_texts, en_texts, mode):
         """mode 'ref': câu Anh tham chiếu (cận trên: dịch hoàn hảo) | 'mt': NLLB tự dịch câu Việt (thực tế hơn)."""
         en_use = list(en_texts) if mode == "ref" else sem_src.translate(vi_texts)
-        h, lens = sem_src.states(vi_texts, en_use)
+        if sem_unit == "char":
+            h, lens = sem_src.char_states(vi_texts, en_use)
+        else:
+            h, lens = sem_src.states(vi_texts, en_use)
         return h.to(dtype=dtype), lens, en_use
 
     # 2. Khởi tạo mô hình ViEnS2STSystem
@@ -1336,11 +1391,13 @@ def main():
         bridge_in_dim=bridge_in_dim,
         dur_range=dur_range,
         bridge_type=bridge_type,
+        bridge_char_vocab=bridge_char_vocab,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
     if bridge_type == "mas":
-        print("🌉 Bridge MAS: token -> μ -> căn chỉnh đơn điệu (MAS lúc train, thời lượng dự đoán theo token lúc suy luận)")
+        print(f"🌉 Bridge MAS theo {'KÝ TỰ (id ký tự + trạng thái NLLB của token chứa nó)' if sem_unit == 'char' else 'TOKEN'}"
+              f" -> μ -> căn chỉnh đơn điệu (MAS lúc train, thời lượng dự đoán lúc suy luận)")
     print(f"🌉 Bridge query mode: {model.bridge.query_mode} | norm: {model.bridge.norm_mode} | "
           f"CTC phụ (ký tự Anh): {'BẬT, ' + str(bridge_ctc_vocab) + ' ký hiệu' if use_ctc else 'tắt'}")
 
@@ -1864,7 +1921,7 @@ def main():
                             "bridge_query_mode": bridge_query_mode, "bridge_norm": bridge_norm,
                             "bridge_ctc_vocab": bridge_ctc_vocab,
                             "bridge_in_dim": model.bridge.src_proj.in_features, "dur_range": list(dur_range),
-                            "bridge_type": bridge_type,
+                            "bridge_type": bridge_type, "bridge_char_vocab": bridge_char_vocab,
                             "semantic": sem_cfg if sem_src is not None else None,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
