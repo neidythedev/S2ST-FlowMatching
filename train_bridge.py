@@ -1189,6 +1189,37 @@ def load_stage2_into(model, ckpt_path, device):
 # 3. PIPELINE DỮ LIỆU ÂM THANH THẬT STREAMING (GOOGLE FLEURS VI -> EN)
 # ==============================================================================
 
+def warp_by_units(c_b, d_a, d_b):
+    """Kéo c_b [D, T_b] sang trục thời gian của bản ghi a theo TỪNG ĐƠN VỊ (ký tự / lặng): đơn vị k chiếm d_a[k] frame
+    ở a và d_b[k] frame ở b -> lấy mẫu tuyến tính trong đoạn của b. -> [D, sum(d_a)]."""
+    import numpy as np
+    da = np.asarray(d_a, dtype=np.int64)
+    db = np.asarray(d_b, dtype=np.int64)
+    sb = np.concatenate([[0], np.cumsum(db)[:-1]])
+    idx = []
+    for k in range(len(da)):
+        if da[k] <= 0:
+            continue
+        if db[k] <= 0:                                   # đơn vị không có frame ở b -> dùng frame gần nhất
+            j = min(int(sb[k]), c_b.shape[-1] - 1)
+            idx += [j] * int(da[k])
+            continue
+        pos = (np.arange(da[k]) + 0.5) * (db[k] / da[k])
+        idx += [min(int(sb[k] + np.floor(q)), c_b.shape[-1] - 1) for q in pos]
+    return c_b[:, torch.as_tensor(idx, dtype=torch.long, device=c_b.device)]
+
+
+def unit_ids_from_text(text):
+    """Chuỗi đơn vị ký tự (như char_states): [LẶNG] + ký tự (gộp dấu cách) + [LẶNG]."""
+    from train_utils import EN_CTC_CHARS, normalize_en
+    cidx = {c: i + 1 for i, c in enumerate(EN_CTC_CHARS)}
+    ids = []
+    for ch in normalize_en(text):
+        if ch in cidx and not (ch == " " and (not ids or ids[-1] == cidx[" "])):
+            ids.append(cidx[ch])
+    return [0] + (ids or [cidx[" "]]) + [0]
+
+
 class RealStreamingSpeechPipeline:
     """Nạp dữ liệu âm thanh thật trực tuyến Vi-En với căn chỉnh song song bằng trường 'id' (FLoRes)."""
     def __init__(self, split='train', max_sec=12.0, src_lang='vi_vn', tgt_lang='en_us',
@@ -1368,6 +1399,85 @@ class RealStreamingSpeechPipeline:
 # 4. CHƯƠNG TRÌNH HUẤN LUYỆN CHÍNH (MAIN TRAINER)
 # ==============================================================================
 
+def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligner, has_teacher, device, dtype):
+    """SÀN của L1(·, c*): cùng một câu, hai người đọc khác nhau. c*_b được kéo theo căn chỉnh ký tự (wav2vec2) sang
+    trục thời gian của a, rồi đo L1(c*_b->a, c*_a). Mọi thứ Bridge biết (văn bản + thời lượng) đều giống nhau ở hai bản
+    ghi, nên phần chênh lệch này là thông tin RIÊNG của bản ghi (giọng, kênh thu, ngữ điệu) mà Bridge không thể đoán."""
+    from datasets import load_dataset, Audio
+    if not has_teacher or feat_tgt is None or enc_tgt is None:
+        raise RuntimeError("Đo sàn cần teacher c* (cond_proj Stage 1) và encoder đích.")
+    if aligner is None:
+        print("⏳ Nạp bộ căn chỉnh wav2vec2-base-960h...")
+        aligner = CTCCharAligner("facebook/wav2vec2-base-960h", device=device)
+    reader = object.__new__(RealStreamingSpeechPipeline)
+    reader.max_sec = max_sec
+    print("\n" + "=" * 75)
+    print(f"📏 ĐO SÀN L1(·, c*): {n_pairs} cặp (cùng câu FLEURS {tgt_l}, 2 bản ghi khác nhau)")
+    print("=" * 75)
+    by_id, groups = {}, []
+    for split in ("validation", "train"):
+        ds = load_dataset('google/fleurs', tgt_l, split=split, streaming=True)
+        try:
+            ds = ds.cast_column('audio', Audio(decode=False))
+        except Exception:
+            pass
+        for item in ds:
+            fid = item.get('id')
+            if fid is None:
+                continue
+            by_id.setdefault((split, fid), []).append(item)
+            if len(by_id[(split, fid)]) == 2:
+                groups.append(by_id[(split, fid)])
+                if len(groups) >= n_pairs:
+                    break
+        if len(groups) >= n_pairs:
+            break
+    print(f"✓ Tìm được {len(groups)} câu có ≥ 2 bản ghi")
+
+    def one(item):
+        w = reader._extract_audio_tensor(item['audio'])
+        T = mel_lengths([w.shape[-1]])[0]
+        lat = encode_whisper(w.unsqueeze(0), feat_tgt, enc_tgt, device, dtype)
+        with torch.no_grad():
+            c = model.teacher_condition(lat, T)[0].float()                    # [D, T]
+        return w, c, T
+
+    floors, trivials, uniforms, rows = [], [], [], []
+    for gi, (ia, ib) in enumerate(groups):
+        try:
+            wa, ca, Ta = one(ia)
+            wb, cb, Tb = one(ib)
+        except Exception as e:
+            print(f"   [Bỏ qua cặp {gi}] {e}")
+            continue
+        ids = unit_ids_from_text(ia.get('transcription', ''))
+        da = aligner.durations(wa, ids, Ta)
+        db = aligner.durations(wb, ids, Tb)
+        cb_a = warp_by_units(cb, da, db)
+        L = min(cb_a.shape[-1], ca.shape[-1])
+        floor = (cb_a[:, :L] - ca[:, :L]).abs().mean().item()
+        # tham chiếu: kéo giãn đều (không căn ký tự) và mốc 'đoán trung bình theo thời gian'
+        cb_u = F.interpolate(cb.unsqueeze(0), size=Ta, mode='linear', align_corners=False)[0]
+        uni = (cb_u - ca).abs().mean().item()
+        triv = (ca.mean(-1, keepdim=True) - ca).abs().mean().item()
+        floors.append(floor); uniforms.append(uni); trivials.append(triv)
+        rows.append((ia.get('transcription', '')[:50], floor, uni, triv))
+    if not floors:
+        raise RuntimeError("Không đo được cặp nào.")
+    import numpy as np
+    f_m, u_m, t_m = float(np.mean(floors)), float(np.mean(uniforms)), float(np.mean(trivials))
+    for txt, f_, u_, t_ in rows[:5]:
+        print(f"   • \"{txt}...\" | sàn {f_:.3f} | kéo đều {u_:.3f} | trung bình {t_:.3f}")
+    print("-" * 75)
+    print(f"📏 Mốc 'đoán trung bình theo thời gian'       : {t_m:.4f}")
+    print(f"📏 Bản ghi khác, KÉO GIÃN ĐỀU (không căn chỉnh): {u_m:.4f}")
+    print(f"📏 SÀN: bản ghi khác, căn theo ký tự (wav2vec2): {f_m:.4f}  (± {float(np.std(floors)):.3f}, {len(floors)} cặp)")
+    gap = t_m - f_m
+    print(f"ℹ️ Phần Cond giảm được nhờ nội dung + thời điểm: {t_m:.3f} -> {f_m:.3f} (khoảng {gap:.3f}).")
+    print(f"   Ví dụ: Bridge có val Cond = x thì đã lấy được (mốc − x) / {gap:.3f} phần khoảng này.")
+    print("=" * 75)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Huấn luyện CrossAttentionBridge S2ST Vi -> En")
     parser.add_argument("--config", type=str, default="configs/stage2_bridge.yaml")
@@ -1378,6 +1488,9 @@ def main():
     parser.add_argument("--overfit-16", action="store_true",
                         help="Sanity Check #3: Huấn luyện overfit 500 bước trên 16 cặp câu Vi-En và xuất audio")
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--measure-floor", type=int, default=0, metavar="N",
+                        help="Đo SÀN của L1(·, c*): c* của 2 bản ghi KHÁC nhau cùng một câu FLEURS (căn theo ký tự bằng "
+                             "wav2vec2) trên N cặp — mức Cond không thể xuống dưới khi chỉ biết văn bản")
     parser.add_argument("--cfm-ckpt", type=str, default="checkpoints/cfm_en-best.pth")
     parser.add_argument("--no-freeze-cfm", action="store_true")
     parser.add_argument("--overfit-steps", type=int, default=800,
@@ -1626,6 +1739,7 @@ def main():
     start_epoch = 0
     global_step = 0
     best_loss = float("inf")
+    best_bleu = -1.0
     history = []
 
     ckpt_path = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
@@ -1644,12 +1758,19 @@ def main():
         global_step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
         history = ckpt.get("history", [])
+        best_bleu = max([h_.get("val_bleu") for h_ in history if h_.get("val_bleu") is not None] or [-1.0])
         print(f"✓ [Resume] Đã nạp thành công từ Epoch {start_epoch - 1}, Step {global_step}!")
 
     # 3. Pipeline Dữ liệu
     max_sec = cfg["data"].get("max_audio_sec", 12.0)
     src_l = cfg["data"].get("src_lang", "vi_vn")
     tgt_l = cfg["data"].get("tgt_lang", "en_us")
+
+    if args.measure_floor:
+        measure_cond_floor(int(args.measure_floor), tgt_l, max_sec, model, feat_tgt, enc_tgt, aligner,
+                           has_teacher, device, dtype)
+        return
+
     data_pipeline = RealStreamingSpeechPipeline(
         split='train', max_sec=max_sec, src_lang=src_l, tgt_lang=tgt_l,
         allow_synthetic=args.smoke_test,
@@ -2056,10 +2177,22 @@ def main():
         synced = [last_p]
         if val_loss < best_loss:
             best_loss = val_loss
+        # Best theo ASR-BLEU (chỉ số thật của bài toán); val loss tổng chọn nhầm epoch 2 (26/11: BLEU epoch 19 = 21.1).
+        # Chưa có lần đo BLEU nào -> tạm theo val loss.
+        best_by = train_cfg.get("best_metric", "asr_bleu")
+        is_best = False
+        if best_by == "asr_bleu" and val_bleu is not None:
+            if val_bleu > best_bleu:
+                best_bleu, is_best = val_bleu, True
+        elif best_by != "asr_bleu" or best_bleu < 0:
+            is_best = val_loss <= best_loss
+        ckpt_data["best_bleu"] = best_bleu
+        if is_best:
             best_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
             torch.save(ckpt_data, best_p)
             synced.append(best_p)
-            print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best (val): {best_loss:.4f}")
+            how = f"ASR-BLEU {best_bleu:.2f}" if (best_by == "asr_bleu" and best_bleu >= 0) else f"val {val_loss:.4f}"
+            print(f"⭐ [Epoch {epoch:02d}] Đã cập nhật Model Best ({how})")
         sync_to_drive(synced, args.exp_name, enabled=sync_enabled)
 
     print("\n🎉 HUẤN LUYỆN CROSS-ATTENTION BRIDGE (VI -> EN) HOÀN TẤT THÀNH CÔNG!")

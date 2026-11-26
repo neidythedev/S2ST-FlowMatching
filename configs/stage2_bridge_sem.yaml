@@ -46,7 +46,8 @@ training:
   learning_rate: 2.0e-4
   min_lr: 1.0e-5
   weight_decay: 1.0e-4
-  epochs: 20
+  epochs: 60              # 26/11: ASR-BLEU 4.8 -> 21.1 qua 20 epoch, chưa bão hòa
+  best_metric: asr_bleu   # chọn best theo ASR-BLEU (val loss tổng chọn nhầm epoch 2)
   warmup_steps: 150
   max_grad_norm: 1.0
   bf16: true

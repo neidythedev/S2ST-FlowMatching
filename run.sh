@@ -172,6 +172,12 @@ case "$ACTION" in
         python sanity_and_eda_suite.py --all
         ;;
 
+    floor)
+        # Đo SÀN của L1(·, c*): 2 bản ghi khác nhau cùng một câu FLEURS. VD: bash run.sh floor 40
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        python -u train_bridge.py --config configs/stage2_bridge_sem.yaml --measure-floor "${2:-40}"
+        ;;
+
     overfit)
         TARGET="${2:-bridge}"
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
