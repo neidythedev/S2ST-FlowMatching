@@ -1427,7 +1427,7 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
                 continue
             by_id.setdefault((split, fid), []).append(item)
             if len(by_id[(split, fid)]) == 2:
-                groups.append(by_id[(split, fid)])
+                groups.append(tuple(by_id[(split, fid)][:2]))   # bản sao: danh sách gốc còn nhận thêm bản ghi thứ 3+
                 if len(groups) >= n_pairs:
                     break
         if len(groups) >= n_pairs:
@@ -1443,7 +1443,8 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
         return w, c, T
 
     floors, trivials, uniforms, rows = [], [], [], []
-    for gi, (ia, ib) in enumerate(groups):
+    for gi, grp in enumerate(groups):
+        ia, ib = grp[0], grp[1]
         try:
             wa, ca, Ta = one(ia)
             wb, cb, Tb = one(ib)
