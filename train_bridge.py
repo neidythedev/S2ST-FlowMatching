@@ -381,8 +381,12 @@ def resample_24k_to_16k(audio_24k):
 
 class DurationPredictor(nn.Module):
     """Dự đoán tỷ lệ co dãn thời lượng (duration scale) từ tiếng Việt sang tiếng Anh."""
-    def __init__(self, in_dim=512):
+    def __init__(self, in_dim=512, min_scale=0.8, max_scale=2.2):
+        """Tỉ lệ = frame Mel đích / độ dài nguồn. Nguồn = frame PhoWhisper (50 fps) -> ~1.9, khoảng [0.8, 2.2];
+        nguồn = TOKEN tiếng Anh (chế độ ngữ nghĩa) -> ~20-40 frame/token, khoảng rộng [4, 80] và loss tính trên log."""
         super().__init__()
+        self.min_scale, self.max_scale = float(min_scale), float(max_scale)
+        self.log_loss = self.max_scale / max(1e-6, self.min_scale) > 4.0
         self.conv = nn.Sequential(
             nn.Conv1d(in_dim, 256, kernel_size=3, padding=1),
             nn.GELU(),
@@ -398,14 +402,14 @@ class DurationPredictor(nn.Module):
             h_mean = (h * keep).sum(dim=-1) / keep.sum(dim=-1).clamp(min=1.0)
         else:
             h_mean = h.mean(dim=-1)
-        return torch.sigmoid(h_mean) * 1.4 + 0.8  # scale trong khoảng [0.8, 2.2]
+        return torch.sigmoid(h_mean) * (self.max_scale - self.min_scale) + self.min_scale
 
 class CrossAttentionBridge(nn.Module):
     """Cầu nối dịch thuật Non-Autoregressive sử dụng Cross-Attention Transformer Decoder.
     Giải quyết triệt để vấn đề đảo ngữ pháp (non-monotonic word reordering) giữa Tiếng Việt và Tiếng Anh.
     """
     def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, query_mode="interp",
-                 norm_mode="prenorm_skip", ctc_vocab=0):
+                 norm_mode="prenorm_skip", ctc_vocab=0, dur_range=(0.8, 2.2)):
         """query_mode:
           'interp'  (mặc định): query đích = memory nguồn nội suy theo thời gian sang độ dài đích + mã hóa vị trí
                     TƯƠNG ĐỐI (0→1) ở cả 2 phía -> ngay từ đầu frame i đã "nhìn" đúng vùng tương ứng của câu nguồn,
@@ -448,7 +452,9 @@ class CrossAttentionBridge(nn.Module):
                                              norm=nn.LayerNorm(hidden_dim) if pre else None)
 
         # Bộ dự đoán tỷ lệ co dãn thời lượng
-        self.duration_predictor = DurationPredictor(in_dim=hidden_dim)
+        self.dur_range = (float(dur_range[0]), float(dur_range[1]))
+        self.duration_predictor = DurationPredictor(in_dim=hidden_dim, min_scale=self.dur_range[0],
+                                                    max_scale=self.dur_range[1])
 
         # Positional Embeddings học được cho Query đích
         self.pos_emb = nn.Embedding(4096, hidden_dim)
@@ -563,12 +569,15 @@ class AcousticSpeakerEncoder(nn.Module):
 class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
-                 bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0):
+                 bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0,
+                 bridge_in_dim=None, dur_range=(0.8, 2.2)):
+        """bridge_in_dim: số chiều đầu vào Bridge (None = encoder_dim). Chế độ ngữ nghĩa: = d_model của decoder dịch
+        (NLLB-600M: 1024). spk_encoder / teacher_cond_proj vẫn dùng encoder_dim (đặc trưng PhoWhisper)."""
         super().__init__()
         self.n_mels = n_mels
-        self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers,
-                                           query_mode=bridge_query_mode, norm_mode=bridge_norm,
-                                           ctc_vocab=bridge_ctc_vocab)
+        self.bridge = CrossAttentionBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
+                                           num_layers=bridge_layers, query_mode=bridge_query_mode,
+                                           norm_mode=bridge_norm, ctc_vocab=bridge_ctc_vocab, dur_range=dur_range)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
@@ -648,7 +657,11 @@ class ViEnS2STSystem(nn.Module):
 
         # 2. Duration Loss
         if target_dur_ratio is not None:
-            dur_loss = F.smooth_l1_loss(dur_scale.float().view(-1), target_dur_ratio.float().view(-1))
+            if getattr(self.bridge.duration_predictor, "log_loss", False):
+                dur_loss = F.smooth_l1_loss(dur_scale.float().clamp(min=1e-4).log().view(-1),
+                                            target_dur_ratio.float().clamp(min=1e-4).log().view(-1))
+            else:
+                dur_loss = F.smooth_l1_loss(dur_scale.float().view(-1), target_dur_ratio.float().view(-1))
         else:
             dur_loss = torch.tensor(0.0, device=target_mel.device, dtype=target_mel.dtype)
 
@@ -677,9 +690,11 @@ class ViEnS2STSystem(nn.Module):
         return total_loss, cfm_loss, dur_loss, cond_loss
 
     @torch.no_grad()
-    def inference(self, src_whisper, speaker_emb=None, target_len=None, num_steps=32):
+    def inference(self, src_whisper, speaker_emb=None, target_len=None, num_steps=32, src_lengths=None):
         self.eval()
         src_whisper, speaker_emb = self._in(src_whisper), self._in(speaker_emb)
+        if src_lengths is not None:              # 1 câu: cắt phần đệm nguồn
+            src_whisper = src_whisper[:, :int(max(src_lengths))]
         with self._amp():
             out = self._inference(src_whisper, speaker_emb, target_len, num_steps)
         return out.float()
@@ -753,6 +768,66 @@ def load_stage1_into(model, ckpt_path, device, allow_legacy=False):
           f"| spk_encoder {'✓' if full and any(k.startswith('spk_encoder.') for k in full) else '✗'}")
     return has_teacher
 
+class NLLBSemanticSource:
+    """Nguồn NGỮ NGHĨA cho Bridge (hướng "hai lượt" kiểu UnitY): trạng thái ẩn lớp cuối của DECODER dịch máy
+    NLLB-200 (đóng băng) cho từng token câu tiếng Anh -> [B, N_token, d_model].
+    Kiến thức dịch nằm ở decoder pretrain này; Bridge chỉ còn học "ngữ nghĩa token -> điều kiện âm học c theo frame"
+    (giống front-end TTS), không phải tự học dịch từ ~3 nghìn cặp câu.
+      states(vi, en): teacher-forcing decoder trên câu Anh cho trước (en = tham chiếu hoặc bản dịch NLLB).
+      translate(vi):  NLLB dịch văn bản Việt -> Anh (dùng lúc đánh giá/suy luận thực tế)."""
+
+    def __init__(self, model_id, device, dtype, src_lang="vie_Latn", tgt_lang="eng_Latn"):
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        self.device, self.dtype = device, dtype
+        self.tok = AutoTokenizer.from_pretrained(model_id)
+        self.mt = AutoModelForSeq2SeqLM.from_pretrained(model_id).eval().to(device=device, dtype=dtype)
+        for prm in self.mt.parameters():
+            prm.requires_grad = False
+        self.dim = int(self.mt.config.d_model)
+        # Tự ghép token đặc biệt (cách tokenizer tự chèn mã ngôn ngữ khác nhau giữa các phiên bản transformers;
+        # bản 5.x không chèn và còn thêm <unk>): nguồn = <vie_Latn> ... </s>, nhãn đích = <eng_Latn> ... </s>
+        self.src_id = int(self.tok.convert_tokens_to_ids(src_lang))
+        self.tgt_id = int(self.tok.convert_tokens_to_ids(tgt_lang))
+        if self.tok.unk_token_id is not None and self.tok.unk_token_id in (self.src_id, self.tgt_id):
+            raise RuntimeError(f"Tokenizer {model_id} không có mã ngôn ngữ {src_lang}/{tgt_lang}")
+        self.eos_id = int(self.tok.eos_token_id)
+        self.start_id = int(self.mt.config.decoder_start_token_id)
+        self.pad_id = int(self.tok.pad_token_id)
+
+    def _ids(self, texts, lang_id, max_len=254):
+        """list câu -> (ids [B, L] = <lang> token... </s> <pad>..., độ dài thật từng câu)."""
+        seqs = [[lang_id] + self.tok(str(x), add_special_tokens=False).input_ids[:max_len] + [self.eos_id] for x in texts]
+        L = max(len(q) for q in seqs)
+        ids = torch.full((len(seqs), L), self.pad_id, dtype=torch.long)
+        for i, q in enumerate(seqs):
+            ids[i, :len(q)] = torch.tensor(q)
+        lens = torch.tensor([len(q) for q in seqs])
+        return ids.to(self.device), lens.to(self.device)
+
+    def _enc(self, vi_texts):
+        ids, lens = self._ids(vi_texts, self.src_id)
+        att = (torch.arange(ids.shape[1], device=ids.device).view(1, -1) < lens.view(-1, 1)).long()
+        return ids, att
+
+    @torch.no_grad()
+    def translate(self, vi_texts, max_new_tokens=160, num_beams=4):
+        ids, att = self._enc(vi_texts)
+        out = self.mt.generate(input_ids=ids, attention_mask=att, forced_bos_token_id=self.tgt_id,
+                               max_new_tokens=max_new_tokens, num_beams=num_beams)
+        return self.tok.batch_decode(out, skip_special_tokens=True)
+
+    @torch.no_grad()
+    def states(self, vi_texts, en_texts):
+        ids, att = self._enc(vi_texts)
+        lab, lens = self._ids(en_texts, self.tgt_id)                             # [B, L]: <eng_Latn> ... </s> <pad>
+        dec_in = torch.cat([torch.full_like(lab[:, :1], self.start_id), lab[:, :-1]], dim=1)
+        dec_mask = (torch.arange(lab.shape[1], device=lab.device).view(1, -1) < lens.view(-1, 1)).long()
+        out = self.mt.model(input_ids=ids, attention_mask=att,
+                            decoder_input_ids=dec_in, decoder_attention_mask=dec_mask)
+        h = out.last_hidden_state.float() * dec_mask.unsqueeze(-1)                   # phần đệm = 0
+        return h, [int(x) for x in lens.tolist()]
+
+
 def load_stage2_into(model, ckpt_path, device):
     """Nạp checkpoint Stage 2 (Bridge + decoder đóng băng + spk_encoder) — dựng decoder đúng kiến trúc đã lưu."""
     ck = torch.load(ckpt_path, map_location=device)
@@ -766,11 +841,14 @@ def load_stage2_into(model, ckpt_path, device):
     qm = meta.get("bridge_query_mode", "learned")   # checkpoint trước khi có tùy chọn này dùng query 'learned'
     nm = meta.get("bridge_norm", "postnorm")         # checkpoint trước 26/11/2026 dùng post-norm
     cv = int(meta.get("bridge_ctc_vocab", 0))        # checkpoint chưa có CTC = 0
-    if qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab:
+    bi = int(meta.get("bridge_in_dim", model.bridge.src_proj.in_features))
+    dr = tuple(meta.get("dur_range", (0.8, 2.2)))
+    if (qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab
+            or bi != model.bridge.src_proj.in_features or dr != model.bridge.dur_range):
         b = model.bridge
-        model.bridge = CrossAttentionBridge(in_dim=b.src_proj.in_features, hidden_dim=b.hidden_dim,
+        model.bridge = CrossAttentionBridge(in_dim=bi, hidden_dim=b.hidden_dim,
                                             num_layers=len(b.decoder.layers), query_mode=qm,
-                                            norm_mode=nm, ctc_vocab=cv).to(device=ref.device, dtype=ref.dtype)
+                                            norm_mode=nm, ctc_vocab=cv, dur_range=dr).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
     model.target_encoder_id = meta.get("target_encoder")
@@ -1020,6 +1098,24 @@ def main():
     except Exception as e:
         print(f"[Whisper Warning] Chưa thể nạp transformers ({e}). Sẽ dùng đặc trưng mô phỏng.")
 
+    # 1b. Nguồn NGỮ NGHĨA (tùy chọn): trạng thái ẩn decoder dịch NLLB thay cho latent PhoWhisper làm đầu vào Bridge
+    sem_cfg = cfg["model"].get("semantic") or {}
+    sem_src = None
+    if sem_cfg.get("source", "none") == "nllb":
+        sem_id = sem_cfg.get("model", "facebook/nllb-200-distilled-600M")
+        print(f"⏳ Nạp nguồn NGỮ NGHĨA: decoder dịch {sem_id} (đóng băng)...")
+        sem_src = NLLBSemanticSource(sem_id, device, dtype)
+        print(f"✓ Đầu vào Bridge = trạng thái ẩn decoder NLLB ({sem_src.dim} chiều/token) | văn bản Anh lúc train: "
+              f"'{sem_cfg.get('train_text', 'ref')}' | lúc đánh giá ASR-BLEU: '{sem_cfg.get('eval_text', 'mt')}'")
+    bridge_in_dim = sem_src.dim if sem_src is not None else None
+    dur_range = tuple(sem_cfg.get("dur_range", (4.0, 80.0))) if sem_src is not None else (0.8, 2.2)
+
+    def semantic_feats(vi_texts, en_texts, mode):
+        """mode 'ref': câu Anh tham chiếu (cận trên: dịch hoàn hảo) | 'mt': NLLB tự dịch câu Việt (thực tế hơn)."""
+        en_use = list(en_texts) if mode == "ref" else sem_src.translate(vi_texts)
+        h, lens = sem_src.states(vi_texts, en_use)
+        return h.to(dtype=dtype), lens, en_use
+
     # 2. Khởi tạo mô hình ViEnS2STSystem
     bridge_query_mode = cfg["model"].get("bridge_query_mode", "interp")
     bridge_norm = cfg["model"].get("bridge_norm", "prenorm_skip")
@@ -1034,6 +1130,8 @@ def main():
         bridge_query_mode=bridge_query_mode,
         bridge_norm=bridge_norm,
         bridge_ctc_vocab=bridge_ctc_vocab,
+        bridge_in_dim=bridge_in_dim,
+        dur_range=dur_range,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
@@ -1126,18 +1224,23 @@ def main():
         betas=(0.9, 0.98)
     )
 
-    def featurize(src_16k, tgt_16k, src_lens, tgt_lens):
-        """-> (latent Vi, Mel En đích, mask, dur_ratio từng câu, c* hoặc None, speaker của audio ĐÍCH hoặc None)."""
-        if feat_extractor is not None and whisper_enc is not None:
+    def featurize(src_16k, tgt_16k, src_lens, tgt_lens, vi_texts=None, en_texts=None, sem_mode=None):
+        """-> (đầu vào Bridge, Mel En đích, mask, dur_ratio từng câu, c* hoặc None, speaker audio ĐÍCH hoặc None,
+               độ dài nguồn thật từng câu). Đầu vào Bridge = latent PhoWhisper(audio Vi) [độ dài = frame]
+               hoặc, ở chế độ ngữ nghĩa, trạng thái ẩn decoder NLLB [độ dài = token]."""
+        if sem_src is not None:
+            s_lat, l_lens, _ = semantic_feats(vi_texts, en_texts, sem_mode or sem_cfg.get("train_text", "ref"))
+        elif feat_extractor is not None and whisper_enc is not None:
             s_lat = encode_whisper(src_16k, feat_extractor, whisper_enc, device, dtype)
+            l_lens = latent_lengths(src_lens)
         else:
             s_lat = torch.randn(src_16k.shape[0], 100, 768, device=device, dtype=dtype)
+            l_lens = latent_lengths(src_lens)
         t24 = resample_16k_to_24k(tgt_16k.to(device=device, dtype=torch.float32))
         t_mel = extract_100_mel(t24, mel_fb).to(dtype=dtype)
         m_lens = mel_lengths(tgt_lens)
         mask = length_mask(m_lens, t_mel.shape[-1], device)
-        # Tỉ lệ thời lượng THẬT của từng câu: frame Mel đích / frame latent nguồn
-        l_lens = latent_lengths(src_lens)
+        # Tỉ lệ thời lượng THẬT của từng câu: frame Mel đích / độ dài nguồn (frame hoặc token)
         d_ratio = torch.tensor([m / max(1, l) for m, l in zip(m_lens, l_lens)], device=device, dtype=dtype)
         c_star, spk_tgt = None, None
         if has_teacher and feat_tgt is not None and enc_tgt is not None:
@@ -1145,7 +1248,7 @@ def main():
             with torch.no_grad():
                 c_star = model.teacher_condition(t_lat, t_mel.shape[-1])
                 spk_tgt = model.speaker(t_lat)
-        return s_lat, t_mel, mask, d_ratio, c_star, spk_tgt
+        return s_lat, t_mel, mask, d_ratio, c_star, spk_tgt, list(l_lens)
 
     start_epoch = 0
     global_step = 0
@@ -1190,10 +1293,11 @@ def main():
         print("=" * 75)
         model.train()
         fix_src, fix_tgt, fix_en_texts, fix_vi_texts = data_pipeline.fetch_batch(batch_size=num_samples)
-        s_lat, tgt_m, fix_mask, d_ratio, c_star, spk_tgt = featurize(
-            fix_src, fix_tgt, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths)
-        fix_src_lat_lens = latent_lengths(data_pipeline.last_src_lengths)
-        print(f"✓ Latent tiếng Việt [Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
+        s_lat, tgt_m, fix_mask, d_ratio, c_star, spk_tgt, fix_src_lat_lens = featurize(
+            fix_src, fix_tgt, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths,
+            vi_texts=fix_vi_texts, en_texts=fix_en_texts)
+        print(f"✓ Đầu vào Bridge {'(ngữ nghĩa NLLB, theo token)' if sem_src is not None else '(latent tiếng Việt)'} "
+              f"[Shape: {list(s_lat.shape)}] | Teacher c*: {'có' if c_star is not None else 'không'}")
 
         # ---- Các biến thể chẩn đoán ----
         variant = []
@@ -1349,13 +1453,16 @@ def main():
                 # Suy luận đúng như lúc dùng thật: speaker = giọng NGUỒN, độ dài = DurationPredictor
                 with torch.no_grad():
                     spk_src = speaker_from_audio(fix_src, data_pipeline.last_src_lengths)
-                gen_mels = model.inference(s_lat, speaker_emb=spk_src, num_steps=32)
-                gen_mels_oracle = model.inference(s_lat, speaker_emb=spk_src, target_len=tgt_m.shape[-1], num_steps=32)
+                m_true = fix_mask.sum(-1).long().tolist()
                 with torch.no_grad():
                     print(f"\n🎧 ĐANG GIẢI MÃ VÀ XUẤT TOÀN BỘ {len(fix_src)} FILE AUDIO VI -> EN QUA VOCOS...")
                     for idx in range(len(fix_src)):
-                        pred_wav = vocos.decode(gen_mels[idx:idx+1].float()).squeeze().cpu()
-                        pred_oracle_wav = vocos.decode(gen_mels_oracle[idx:idx+1].float()).squeeze().cpu()
+                        sl = [fix_src_lat_lens[idx]]
+                        gm = model.inference(s_lat[idx:idx+1], speaker_emb=spk_src[idx:idx+1], num_steps=32, src_lengths=sl)
+                        gmo = model.inference(s_lat[idx:idx+1], speaker_emb=spk_src[idx:idx+1], target_len=m_true[idx],
+                                              num_steps=32, src_lengths=sl)
+                        pred_wav = vocos.decode(gm.float()).squeeze().cpu()
+                        pred_oracle_wav = vocos.decode(gmo.float()).squeeze().cpu()
                         vocos_upper_wav = vocos.decode(tgt_m[idx:idx+1].float()).squeeze().cpu()
                         gt_wav = resample_16k_to_24k(fix_tgt[idx:idx+1].float()).squeeze().cpu()
                         src_wav_16k = fix_src[idx].cpu()
@@ -1411,12 +1518,21 @@ def main():
     val_set = []
     g = torch.Generator(device="cpu").manual_seed(1234)
     for _ in range((val_pairs + batch_size - 1) // batch_size):
-        v_src, v_tgt, v_en, _ = val_pipeline.fetch_batch(batch_size=batch_size)
-        feats = featurize(v_src, v_tgt, val_pipeline.last_src_lengths, val_pipeline.last_tgt_lengths)
+        v_src, v_tgt, v_en, v_vi = val_pipeline.fetch_batch(batch_size=batch_size)
+        feats = featurize(v_src, v_tgt, val_pipeline.last_src_lengths, val_pipeline.last_tgt_lengths,
+                          vi_texts=v_vi, en_texts=v_en)
         tt = torch.rand(v_src.shape[0], generator=g)
         x0 = torch.randn(feats[1].shape, generator=g)
-        val_set.append((v_src, list(val_pipeline.last_src_lengths), v_en, feats, tt, x0))
+        # Đầu vào cho ASR-BLEU (suy luận như thật): chế độ ngữ nghĩa dùng bản dịch NLLB ('mt') thay cho tham chiếu
+        eval_in = (feats[0], feats[6], None)
+        if sem_src is not None and sem_cfg.get("eval_text", "mt") != sem_cfg.get("train_text", "ref"):
+            eh, el, e_txt = semantic_feats(v_vi, v_en, sem_cfg.get("eval_text", "mt"))
+            eval_in = (eh, el, e_txt)
+        val_set.append((v_src, list(val_pipeline.last_src_lengths), v_en, feats, tt, x0, eval_in))
     print(f"✓ Tập validation cố định: {sum(v[0].shape[0] for v in val_set)} cặp (FLEURS validation, seed 1234)")
+    if val_set and val_set[0][6][2] is not None:
+        for r_, h_ in list(zip(val_set[0][2], val_set[0][6][2]))[:2]:
+            print(f"   🔁 NLLB dịch (dùng cho ASR-BLEU) | ref: {r_[:70]}\n                                   | mt : {h_[:70]}")
 
     eval_bleu_every = int(train_cfg.get("eval_asr_every", 5))
     en_asr = EnglishASR(device)
@@ -1435,13 +1551,14 @@ def main():
         for step in range(steps_per_epoch):
             optimizer.zero_grad()
             src_audio_16k, tgt_audio_16k, en_texts, vi_texts = data_pipeline.fetch_batch(batch_size=batch_size)
-            src_latents, tgt_mel, mel_mask, dur_ratio, c_star, spk_tgt = featurize(
-                src_audio_16k, tgt_audio_16k, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths)
+            src_latents, tgt_mel, mel_mask, dur_ratio, c_star, spk_tgt, src_lens_b = featurize(
+                src_audio_16k, tgt_audio_16k, data_pipeline.last_src_lengths, data_pipeline.last_tgt_lengths,
+                vi_texts=vi_texts, en_texts=en_texts)
 
             total_loss, cfm_l, dur_l, cond_l = model.compute_loss(
                 src_latents, tgt_mel, speaker_emb=spk_tgt, target_dur_ratio=dur_ratio,
                 loss_weights=loss_weights, mel_mask=mel_mask, cond_target=c_star,
-                src_lengths=latent_lengths(data_pipeline.last_src_lengths), ctc_targets=ctc_ids(en_texts)
+                src_lengths=src_lens_b, ctc_targets=ctc_ids(en_texts)
             )
 
             total_loss.backward()
@@ -1469,11 +1586,11 @@ def main():
         v_tot = v_cfm = v_dur = v_cond = v_ctc = 0.0
         v_ctc_hyp, v_ctc_ref = [], []
         with torch.no_grad():
-            for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk), tt, x0 in val_set:
+            for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk, s_lens), tt, x0, _ in val_set:
                 lt, lc, ld, lco = model.compute_loss(
                     s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
                     mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype),
-                    src_lengths=latent_lengths(v_lens), ctc_targets=ctc_ids(v_en))
+                    src_lengths=s_lens, ctc_targets=ctc_ids(v_en))
                 v_tot += lt.item(); v_cfm += lc.item(); v_dur += ld.item(); v_cond += lco.item()
                 if model.last_ctc_loss is not None:
                     v_ctc += model.last_ctc_loss.item()
@@ -1498,12 +1615,12 @@ def main():
                     vocos_eval = load_vocos_safely("charactr/vocos-mel-24khz", device=device)
                     vocos_eval.eval()
                 hyps, refs = [], []
-                for v_src, v_lens, v_en, (s_lat, *_), _, _ in val_set:
+                for v_src, v_lens, v_en, _, _, _, (e_lat, e_lens, _) in val_set:
                     for i in range(v_src.shape[0]):
-                        li = latent_lengths([v_lens[i]])[0]
+                        li = int(e_lens[i])
                         with torch.no_grad():
                             spk_i = speaker_from_audio(v_src[i:i + 1], [v_lens[i]])
-                        mel = model.inference(s_lat[i:i + 1, :max(10, li)], speaker_emb=spk_i, num_steps=32)
+                        mel = model.inference(e_lat[i:i + 1], speaker_emb=spk_i, num_steps=32, src_lengths=[li])
                         with torch.no_grad():
                             w24 = vocos_eval.decode(mel.float()).squeeze().cpu()
                         hyps.append(en_asr.transcribe(resample_24k_to_16k_fft(w24)))
@@ -1536,6 +1653,8 @@ def main():
                             "source_encoder": whisper_id, "target_encoder": tgt_enc_id,
                             "bridge_query_mode": bridge_query_mode, "bridge_norm": bridge_norm,
                             "bridge_ctc_vocab": bridge_ctc_vocab,
+                            "bridge_in_dim": model.bridge.src_proj.in_features, "dur_range": list(dur_range),
+                            "semantic": sem_cfg if sem_src is not None else None,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,

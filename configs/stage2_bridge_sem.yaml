@@ -1,0 +1,63 @@
+# ==============================================================================
+# CẤU HÌNH STAGE 2 "HAI LƯỢT" (NGỮ NGHĨA): NLLB decoder -> Bridge -> c -> CFM
+# Bản trực tiếp (stage2_bridge.yaml) thất bại 26/11: ~2.9k cặp không đủ để Bridge tự học dịch
+# (Cond kẹt mốc trung bình, CTC kẹt mức tần suất ký tự, ASR-BLEU 0). Ở đây kiến thức dịch lấy từ NLLB pretrain.
+# Tuân thủ quy chuẩn SKILL2.md cho Molab GPU Runtime
+# ==============================================================================
+
+model:
+  whisper_model: "vinai/PhoWhisper-small" # PhoWhisper-small tối ưu cho nhận diện đặc trưng âm học tiếng Việt (WER 9.0% vs 20.6% Whisper-small)
+  encoder_dim: 768
+  bridge_dim: 512
+  bridge_layers: 6
+  bridge_heads: 8
+  bridge_query_mode: "interp"   # interp (query = nguồn nội suy + vị trí tương đối) | learned (cũ, ablation)
+  bridge_norm: "prenorm_skip"   # prenorm_skip (pre-norm + đường tắt query->đầu ra) | postnorm (cũ: sụp về hằng số theo thời gian)
+  semantic:
+    source: "nllb"                                # none = latent PhoWhisper (bản trực tiếp) | nllb = trạng thái ẩn decoder NLLB
+    model: "facebook/nllb-200-distilled-600M"     # đóng băng, d_model 1024
+    train_text: "ref"                             # câu Anh dùng để teacher-force lúc train: ref = tham chiếu FLEURS
+    eval_text: "mt"                               # ASR-BLEU: mt = NLLB tự dịch văn bản Việt (thực tế hơn) | ref = cận trên
+    dur_range: [4.0, 80.0]                        # frame Mel / token (~20-40); loss duration tính trên log
+  n_mels: 100
+  spk_dim: 192
+  decoder_hidden: 384
+  use_tone_head: false
+  num_tones: 0
+
+loss_weights:
+  cfm_weight: 1.0
+  dur_weight: 0.1
+  cond_weight: 1.0        # L1(Bridge, c*) — c* = cond_proj Stage 1 trên audio TIẾNG ANH đích (chưng cất)
+  ctc_weight: 0.0         # CTC phụ: Bridge dự đoán chuỗi KÝ TỰ tiếng Anh (FLEURS transcript) — không cần căn chỉnh frame.
+                          # Chỉ là loss lúc train (suy luận không cần text). 0 = tắt (bản 26/11 không CTC: Cond kẹt ở mốc trung bình)
+
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 2.0e-4
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  epochs: 20
+  warmup_steps: 150
+  max_grad_norm: 1.0
+  bf16: true
+  save_interval_steps: 250
+  log_interval_steps: 20
+  val_pairs: 16           # tập validation CỐ ĐỊNH (FLEURS validation) để chọn best
+  eval_asr_every: 5       # mỗi 5 epoch: ASR-BLEU nhanh trên tập val
+  max_train_pairs: 4000   # dùng toàn bộ cặp FLEURS train (trước chỉ 600)
+  sync_drive: true
+
+data:
+  dataset_name: "google/fleurs"
+  src_lang: "vi_vn"
+  tgt_lang: "en_us"
+  sample_rate_src: 16000
+  sample_rate_tgt: 24000
+  max_audio_sec: 12.0
+  streaming: true
+
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
