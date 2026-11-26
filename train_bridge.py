@@ -2195,7 +2195,6 @@ def main():
             "config": cfg,
         }
         last_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-last.pth")
-        torch.save(ckpt_data, last_p)
         synced = [last_p]
         if val_loss < best_loss:
             best_loss = val_loss
@@ -2209,6 +2208,12 @@ def main():
         elif best_by != "asr_bleu" or best_bleu < 0:
             is_best = val_loss <= best_loss
         ckpt_data["best_bleu"] = best_bleu
+        torch.save(ckpt_data, last_p)                     # lưu SAU khi đã có best_bleu (trước đây last.pth thiếu khóa này)
+        # Mỗi lần đo ASR-BLEU: giữ thêm một bản chỉ có trọng số (resume ghi đè last.pth -> 26/11 mất bản epoch 19, BLEU 21.1)
+        if val_bleu is not None and train_cfg.get("keep_bleu_snapshots", True):
+            snap_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-e{epoch:02d}.pth")
+            torch.save({k: v for k, v in ckpt_data.items() if k != "optimizer_state_dict"}, snap_p)
+            synced.append(snap_p)
         if is_best:
             best_p = os.path.join(paths["checkpoint_dir"], f"{args.exp_name}-best.pth")
             torch.save(ckpt_data, best_p)
