@@ -21,6 +21,8 @@ loss_weights:
   cfm_weight: 1.0
   dur_weight: 0.1
   cond_weight: 1.0        # L1(Bridge, c*) — c* = cond_proj Stage 1 trên audio TIẾNG ANH đích (chưng cất)
+  ctc_weight: 0.5         # CTC phụ: Bridge dự đoán chuỗi KÝ TỰ tiếng Anh (FLEURS transcript) — không cần căn chỉnh frame.
+                          # Chỉ là loss lúc train (suy luận không cần text). 0 = tắt (bản 26/11 không CTC: Cond kẹt ở mốc trung bình)
 
 training:
   batch_size: 8

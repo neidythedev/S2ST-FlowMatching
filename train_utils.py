@@ -301,6 +301,44 @@ def normalize_en(text):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ---- CTC phụ trên văn bản tiếng Anh (chỉ dùng làm loss lúc train; suy luận KHÔNG cần text) ----
+EN_CTC_CHARS = " abcdefghijklmnopqrstuvwxyz'0123456789"   # id 0 = blank, ký tự thứ k -> id k+1
+EN_CTC_VOCAB = len(EN_CTC_CHARS) + 1
+_EN_CTC_IDX = {c: i + 1 for i, c in enumerate(EN_CTC_CHARS)}
+
+
+def en_text_to_ids(text):
+    """Văn bản Anh -> list id ký tự (chuẩn hóa như ASR-BLEU; ký tự ngoài bảng bị bỏ)."""
+    return [_EN_CTC_IDX[c] for c in normalize_en(text) if c in _EN_CTC_IDX]
+
+
+def ctc_greedy_decode(ids):
+    """Giải mã tham lam CTC: gộp ký tự lặp liên tiếp, bỏ blank -> chuỗi."""
+    out, prev = [], 0
+    for i in ids:
+        i = int(i)
+        if i != prev and i != 0:
+            out.append(EN_CTC_CHARS[i - 1])
+        prev = i
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def char_error_rate(hyps, refs):
+    """CER gộp trên toàn tập (edit distance theo ký tự / tổng ký tự tham chiếu), sau normalize_en."""
+    errs = tot = 0
+    for h, r in zip(hyps, refs):
+        h, r = normalize_en(h), normalize_en(r)
+        prev = list(range(len(h) + 1))
+        for i in range(1, len(r) + 1):
+            cur = [i] + [0] * len(h)
+            for j in range(1, len(h) + 1):
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r[i - 1] != h[j - 1]))
+            prev = cur
+        errs += prev[-1]
+        tot += len(r)
+    return errs / max(1, tot)
+
+
 def word_errors(hyp, ref):
     """(số lỗi edit distance theo từ, số từ tham chiếu)."""
     h, r = normalize_en(hyp).split(), normalize_en(ref).split()

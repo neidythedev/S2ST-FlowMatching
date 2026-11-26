@@ -102,6 +102,7 @@ from train_utils import (
     FlowMatchingTargetDecoder, ResidualBlock1D,
     encode_whisper, latent_lengths, mel_lengths, length_mask, masked_mse, masked_l1,
     EnglishASR, corpus_wer, resample_24k_to_16k_fft, sync_to_drive,
+    EN_CTC_VOCAB, en_text_to_ids, ctc_greedy_decode, char_error_rate,
 )
 
 # Tee output để vừa hiển thị terminal vừa ghi log file
@@ -148,6 +149,7 @@ def load_yaml_config(config_path):
             "cfm_weight": 1.0,
             "dur_weight": 0.1,
             "cond_weight": 1.0,
+            "ctc_weight": 0.0,
         },
         "training": {
             "batch_size": 4,
@@ -403,7 +405,7 @@ class CrossAttentionBridge(nn.Module):
     Giải quyết triệt để vấn đề đảo ngữ pháp (non-monotonic word reordering) giữa Tiếng Việt và Tiếng Anh.
     """
     def __init__(self, in_dim=768, hidden_dim=512, num_layers=6, n_heads=8, query_mode="interp",
-                 norm_mode="prenorm_skip"):
+                 norm_mode="prenorm_skip", ctc_vocab=0):
         """query_mode:
           'interp'  (mặc định): query đích = memory nguồn nội suy theo thời gian sang độ dài đích + mã hóa vị trí
                     TƯƠNG ĐỐI (0→1) ở cả 2 phía -> ngay từ đầu frame i đã "nhìn" đúng vùng tương ứng của câu nguồn,
@@ -457,6 +459,10 @@ class CrossAttentionBridge(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         # Đường tắt: query (đã căn chỉnh theo thời gian) -> đầu ra, để Bridge không thể "quên" cấu trúc từng frame
         self.skip_proj = nn.Linear(hidden_dim, hidden_dim) if pre else None
+        # Đầu CTC phụ: từ trạng thái ẩn của decoder dự đoán chuỗi KÝ TỰ tiếng Anh (không cần căn chỉnh theo frame)
+        # -> ép Bridge mã hóa NỘI DUNG câu đích. Chỉ dùng làm loss lúc train (kiểu Translatotron 2 / UnitY).
+        self.ctc_vocab = int(ctc_vocab or 0)
+        self.ctc_head = nn.Linear(hidden_dim, self.ctc_vocab) if self.ctc_vocab > 0 else None
 
     def _rel_pos(self, lengths, T, device, dtype):
         """Mã hóa vị trí TƯƠNG ĐỐI: frame j của câu dài L có vị trí p = j/(L-1) ∈ [0, 1];
@@ -488,7 +494,7 @@ class CrossAttentionBridge(nn.Module):
         lens = torch.as_tensor(lengths, device=device).view(-1, 1)
         return torch.arange(T, device=device).view(1, -1) >= lens       # True = phần đệm
 
-    def forward(self, whisper_features, target_len=None, src_lengths=None, tgt_lengths=None):
+    def forward(self, whisper_features, target_len=None, src_lengths=None, tgt_lengths=None, return_ctc=False):
         """
         whisper_features: [B, T_src, in_dim]
         target_len: Số frame Mel đích T_tgt (lúc train) hoặc None (lúc inference)
@@ -524,9 +530,12 @@ class CrossAttentionBridge(nn.Module):
         tgt_pad = self._pad_mask(tgt_lengths, target_len, dev)
         latents = self.decoder(tgt=queries, memory=memory,
                                tgt_key_padding_mask=tgt_pad, memory_key_padding_mask=src_pad)
+        ctc_logits = self.ctc_head(latents) if (return_ctc and self.ctc_head is not None) else None
         latents = self.out_proj(latents)
         if self.skip_proj is not None:
             latents = latents + self.skip_proj(queries)
+        if return_ctc:
+            return latents, dur_scale, ctc_logits     # ctc_logits: [B, T_tgt, V] hoặc None
         return latents, dur_scale
 
 # Alias tương thích ngược
@@ -554,11 +563,12 @@ class AcousticSpeakerEncoder(nn.Module):
 class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
-                 bridge_query_mode="interp", bridge_norm="prenorm_skip"):
+                 bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0):
         super().__init__()
         self.n_mels = n_mels
         self.bridge = CrossAttentionBridge(in_dim=encoder_dim, hidden_dim=bridge_dim, num_layers=bridge_layers,
-                                           query_mode=bridge_query_mode, norm_mode=bridge_norm)
+                                           query_mode=bridge_query_mode, norm_mode=bridge_norm,
+                                           ctc_vocab=bridge_ctc_vocab)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
@@ -592,27 +602,31 @@ class ViEnS2STSystem(nn.Module):
         return F.interpolate(c.float().transpose(1, 2), size=T_tgt, mode='linear', align_corners=False)
 
     def compute_loss(self, src_whisper, target_mel, speaker_emb=None, target_dur_ratio=None, loss_weights=None,
-                     mel_mask=None, cond_target=None, t=None, x_0=None, src_lengths=None, **kwargs):
-        """Trả về (total, cfm, dur, cond).
+                     mel_mask=None, cond_target=None, t=None, x_0=None, src_lengths=None, ctc_targets=None, **kwargs):
+        """Trả về (total, cfm, dur, cond). CTC loss (nếu bật) đã cộng vào total và lưu ở self.last_ctc_loss;
+        log-prob CTC lưu ở self.last_ctc_logp [B, T, V] (để giải mã kiểm tra).
+        ctc_targets: list id ký tự tiếng Anh từng câu (en_text_to_ids) hoặc None = tắt.
         speaker_emb: lúc TRAIN nên là embedding của audio ĐÍCH (người đọc tiếng Anh) để decoder tái tạo đúng Mel đích.
         cond_target: c* từ teacher_condition() -> loss chưng cất L1 (None = tắt).
         mel_mask: [B, T_tgt] bỏ qua phần đệm. t / x_0: truyền vào để val loss cố định."""
-        weights = {"cfm_weight": 1.0, "dur_weight": 0.1, "cond_weight": 0.0}
+        weights = {"cfm_weight": 1.0, "dur_weight": 0.1, "cond_weight": 0.0, "ctc_weight": 0.0}
         weights.update(loss_weights or {})
         B, _, T_tgt = target_mel.shape
         src_whisper, target_mel = self._in(src_whisper), self._in(target_mel)
         speaker_emb, t, x_0 = self._in(speaker_emb), self._in(t), self._in(x_0)
         with self._amp():
             return self._compute_loss(src_whisper, target_mel, speaker_emb, target_dur_ratio, weights,
-                                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt)
+                                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt, ctc_targets)
 
     def _compute_loss(self, src_whisper, target_mel, speaker_emb, target_dur_ratio, weights,
-                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt):
+                      mel_mask, cond_target, t, x_0, src_lengths, B, T_tgt, ctc_targets=None):
 
         # Truyền target_len=T_tgt để Cross-Attention sinh đúng kích thước Mel đích; độ dài thật -> mask phần đệm
         tgt_lengths = mel_mask.sum(dim=-1).long() if mel_mask is not None else None
-        translated_latents, dur_scale = self.bridge(src_whisper, target_len=T_tgt,
-                                                    src_lengths=src_lengths, tgt_lengths=tgt_lengths)
+        use_ctc = (ctc_targets is not None and weights.get("ctc_weight", 0) > 0
+                   and getattr(self.bridge, "ctc_head", None) is not None)
+        translated_latents, dur_scale, ctc_logits = self.bridge(src_whisper, target_len=T_tgt, src_lengths=src_lengths,
+                                                                tgt_lengths=tgt_lengths, return_ctc=True)
 
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
@@ -646,6 +660,20 @@ class ViEnS2STSystem(nn.Module):
 
         total_loss = (weights["cfm_weight"] * cfm_loss + weights["dur_weight"] * dur_loss
                       + weights["cond_weight"] * cond_loss)
+
+        # 4. CTC phụ: chuỗi ký tự tiếng Anh từ trạng thái ẩn của Bridge (không cần căn chỉnh frame)
+        self.last_ctc_loss, self.last_ctc_logp = None, None
+        if use_ctc:
+            logp = F.log_softmax(ctc_logits.float(), dim=-1)                       # [B, T, V], fp32
+            in_lens = (tgt_lengths if tgt_lengths is not None
+                       else torch.full((B,), T_tgt, device=logp.device)).long().cpu()
+            tgt_lens = torch.tensor([len(x) for x in ctc_targets], dtype=torch.long)
+            flat = torch.tensor([i for x in ctc_targets for i in x], dtype=torch.long)
+            ctc_loss = F.ctc_loss(logp.transpose(0, 1), flat, in_lens, tgt_lens,
+                                  blank=0, reduction="mean", zero_infinity=True)
+            total_loss = total_loss + weights["ctc_weight"] * ctc_loss
+            self.last_ctc_loss, self.last_ctc_logp = ctc_loss.detach(), logp.detach()
+            self.last_ctc_lens = in_lens
         return total_loss, cfm_loss, dur_loss, cond_loss
 
     @torch.no_grad()
@@ -737,11 +765,12 @@ def load_stage2_into(model, ckpt_path, device):
         model.decoder = FlowMatchingTargetDecoder(**dec_cfg).to(device=ref.device, dtype=ref.dtype)
     qm = meta.get("bridge_query_mode", "learned")   # checkpoint trước khi có tùy chọn này dùng query 'learned'
     nm = meta.get("bridge_norm", "postnorm")         # checkpoint trước 26/11/2026 dùng post-norm
-    if qm != model.bridge.query_mode or nm != model.bridge.norm_mode:
+    cv = int(meta.get("bridge_ctc_vocab", 0))        # checkpoint chưa có CTC = 0
+    if qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab:
         b = model.bridge
         model.bridge = CrossAttentionBridge(in_dim=b.src_proj.in_features, hidden_dim=b.hidden_dim,
                                             num_layers=len(b.decoder.layers), query_mode=qm,
-                                            norm_mode=nm).to(device=ref.device, dtype=ref.dtype)
+                                            norm_mode=nm, ctc_vocab=cv).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
     model.target_encoder_id = meta.get("target_encoder")
@@ -994,6 +1023,8 @@ def main():
     # 2. Khởi tạo mô hình ViEnS2STSystem
     bridge_query_mode = cfg["model"].get("bridge_query_mode", "interp")
     bridge_norm = cfg["model"].get("bridge_norm", "prenorm_skip")
+    use_ctc = float(loss_weights.get("ctc_weight", 0.0)) > 0
+    bridge_ctc_vocab = EN_CTC_VOCAB if use_ctc else 0
     model = ViEnS2STSystem(
         encoder_dim=cfg["model"]["encoder_dim"],
         bridge_dim=cfg["model"]["bridge_dim"],
@@ -1002,10 +1033,12 @@ def main():
         spk_dim=cfg["model"]["spk_dim"],
         bridge_query_mode=bridge_query_mode,
         bridge_norm=bridge_norm,
+        bridge_ctc_vocab=bridge_ctc_vocab,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
-    print(f"🌉 Bridge query mode: {bridge_query_mode} | norm: {bridge_norm}")
+    print(f"🌉 Bridge query mode: {bridge_query_mode} | norm: {bridge_norm} | "
+          f"CTC phụ (ký tự Anh): {'BẬT, ' + str(bridge_ctc_vocab) + ' ký hiệu' if use_ctc else 'tắt'}")
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
 
@@ -1066,7 +1099,20 @@ def main():
             p.requires_grad = False
         print("🔒 Đóng băng spk_encoder Stage 1 | Train: speaker = audio ĐÍCH (En) | Suy luận: speaker = giọng NGUỒN (Vi)")
     print(f"ℹ️ Loss: {loss_weights.get('cfm_weight', 1.0)}·CFM + {loss_weights.get('dur_weight', 0.1)}·Dur "
-          f"+ {loss_weights.get('cond_weight', 0.0)}·L1(Bridge, c*)")
+          f"+ {loss_weights.get('cond_weight', 0.0)}·L1(Bridge, c*) + {loss_weights.get('ctc_weight', 0.0)}·CTC(ký tự Anh)")
+
+    def ctc_ids(texts):
+        return [en_text_to_ids(x) for x in texts] if use_ctc else None
+
+    def ctc_decode_batch(n=None):
+        """Giải mã tham lam CTC từ lần compute_loss gần nhất -> list chuỗi (độ dài thật theo mask)."""
+        lp = getattr(model, "last_ctc_logp", None)
+        if lp is None:
+            return None
+        ids = lp.argmax(-1).cpu()
+        lens = getattr(model, "last_ctc_lens", None)
+        k = ids.shape[0] if n is None else min(n, ids.shape[0])
+        return [ctc_greedy_decode(ids[i, :int(lens[i])] if lens is not None else ids[i]) for i in range(k)]
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_trainable = sum(p.numel() for p in trainable_params)
@@ -1213,7 +1259,7 @@ def main():
             optimizer.zero_grad()
             l_tot, cfm_l, d_l, c_l = model.compute_loss(
                 s_lat, tgt_m, speaker_emb=spk_tgt, target_dur_ratio=d_ratio, loss_weights=ovf_weights,
-                mel_mask=fix_mask, cond_target=c_star, src_lengths=fix_src_lat_lens)
+                mel_mask=fix_mask, cond_target=c_star, src_lengths=fix_src_lat_lens, ctc_targets=ctc_ids(fix_en_texts))
             l_tot.backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -1222,11 +1268,19 @@ def main():
             if st == 0: initial_loss = l_tot.item()
             log_interval = max(50, num_steps // 16) if is_deep else 10
             if (st + 1) % log_interval == 0 or st == 0:
+                ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
                 print(f"   [Overfit Step {st+1:04d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
-                      f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f} | LR: {scheduler.get_last_lr()[0]:.1e}")
+                      f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f}{ctc_s} | LR: {scheduler.get_last_lr()[0]:.1e}")
             final_loss = l_tot.item()
 
         print("-" * 75)
+        if use_ctc:
+            dec = ctc_decode_batch()
+            if dec:
+                cer = char_error_rate(dec, fix_en_texts[:len(dec)])
+                print(f"🔤 CTC (giải mã tham lam, train 16 câu): CER = {cer*100:.1f}%")
+                for i in range(min(2, len(dec))):
+                    print(f"      ref : {fix_en_texts[i][:90]}\n      ctc : {dec[i][:90]}")
         print(f"📉 Loss tổng: {initial_loss:.4f} -> {final_loss:.4f} (giảm {(1.0 - final_loss/initial_loss)*100.0:.1f}%) "
               f"trong {time.time()-t_start:.1f}s. (CFM loss có sàn nhiễu nên KHÔNG dùng % này để kết luận — xem phần dưới)")
 
@@ -1387,7 +1441,7 @@ def main():
             total_loss, cfm_l, dur_l, cond_l = model.compute_loss(
                 src_latents, tgt_mel, speaker_emb=spk_tgt, target_dur_ratio=dur_ratio,
                 loss_weights=loss_weights, mel_mask=mel_mask, cond_target=c_star,
-                src_lengths=latent_lengths(data_pipeline.last_src_lengths)
+                src_lengths=latent_lengths(data_pipeline.last_src_lengths), ctc_targets=ctc_ids(en_texts)
             )
 
             total_loss.backward()
@@ -1400,8 +1454,9 @@ def main():
 
             if global_step % 10 == 0 or args.smoke_test:
                 cur_lr = scheduler.get_last_lr()[0]
+                ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
                 print(f"   [E{epoch:02d}|Step {global_step:04d}] Total: {total_loss.item():.4f} | "
-                      f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | Cond: {cond_l.item():.4f} | LR: {cur_lr:.2e}")
+                      f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | Cond: {cond_l.item():.4f}{ctc_s} | LR: {cur_lr:.2e}")
 
         avg_loss = epoch_loss / max(1, steps_per_epoch)
         elapsed = time.time() - t0
@@ -1411,18 +1466,29 @@ def main():
 
         # Validation cố định
         model.eval()
-        v_tot = v_cfm = v_dur = v_cond = 0.0
+        v_tot = v_cfm = v_dur = v_cond = v_ctc = 0.0
+        v_ctc_hyp, v_ctc_ref = [], []
         with torch.no_grad():
             for v_src, v_lens, v_en, (s_lat, t_mel, msk, dr, cs, spk), tt, x0 in val_set:
                 lt, lc, ld, lco = model.compute_loss(
                     s_lat, t_mel, speaker_emb=spk, target_dur_ratio=dr, loss_weights=loss_weights,
                     mel_mask=msk, cond_target=cs, t=tt.to(device=device, dtype=dtype), x_0=x0.to(device=device, dtype=dtype),
-                    src_lengths=latent_lengths(v_lens))
+                    src_lengths=latent_lengths(v_lens), ctc_targets=ctc_ids(v_en))
                 v_tot += lt.item(); v_cfm += lc.item(); v_dur += ld.item(); v_cond += lco.item()
+                if model.last_ctc_loss is not None:
+                    v_ctc += model.last_ctc_loss.item()
+                    v_ctc_hyp += ctc_decode_batch(); v_ctc_ref += list(v_en)
         nv = max(1, len(val_set))
         val_loss = v_tot / nv
-        print(f"   Val (cố định): Total {val_loss:.4f} | CFM {v_cfm/nv:.4f} | Dur {v_dur/nv:.4f} | Cond {v_cond/nv:.4f} "
+        ctc_s = ""
+        if v_ctc_hyp:
+            v_cer = char_error_rate(v_ctc_hyp, v_ctc_ref)
+            ctc_s = f" | CTC {v_ctc/nv:.3f} (CER {v_cer*100:.1f}%)"
+        print(f"   Val (cố định): Total {val_loss:.4f} | CFM {v_cfm/nv:.4f} | Dur {v_dur/nv:.4f} | Cond {v_cond/nv:.4f}{ctc_s} "
               f"| Best: {min(best_loss, val_loss):.4f}")
+        if v_ctc_hyp:
+            # Bridge "hiểu" câu đích đến đâu (độc lập với chất lượng âm thanh): giải mã CTC 1 câu val
+            print(f"      ctc ref : {v_ctc_ref[0][:90]}\n      ctc pred: {v_ctc_hyp[0][:90]}")
 
         # ASR-BLEU nhanh trên tập val (suy luận như thật: độ dài dự đoán + giọng nguồn)
         val_bleu = None
@@ -1469,6 +1535,7 @@ def main():
             "stage2_meta": {"src": src_l, "tgt": tgt_l, "cfm_ckpt": found_cfm, "has_teacher": has_teacher,
                             "source_encoder": whisper_id, "target_encoder": tgt_enc_id,
                             "bridge_query_mode": bridge_query_mode, "bridge_norm": bridge_norm,
+                            "bridge_ctc_vocab": bridge_ctc_vocab,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
             "config": cfg,
