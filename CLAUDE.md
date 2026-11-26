@@ -30,41 +30,41 @@
 
 ---
 
-## 🏗️ 2. KIẾN TRÚC MÔ HÌNH (`ViEnS2STSystem`)
+## 🏗️ 2. KIẾN TRÚC MÔ HÌNH (`ViEnS2STSystem`) — HIỆN TẠI: HAI LƯỢT NGỮ NGHĨA (từ 26/11/2026)
 
-Hệ thống S2ST hoàn chỉnh hoạt động trực tiếp không qua văn bản trung gian (Direct Speech-to-Speech):
+> Bản trực tiếp (PhoWhisper(audio Việt) → `CrossAttentionBridge` → c) **đã thất bại** (val L1 kẹt 0.44, ASR-BLEU 0, cả khi thêm CTC) và chỉ còn là baseline/ablation (`configs/stage2_bridge.yaml`). Lịch sử đầy đủ: `docs/worklog/2026-11-26.md`.
 
-$$\text{Vi Audio (16kHz)} \xrightarrow{\text{PhoWhisper Encoder}} H_{src} \xrightarrow{\text{CrossAttentionBridge}} c \xrightarrow{\text{OT-CFM Decoder (ODE)}} \text{100-Mel} \xrightarrow{\text{Vocos}} \text{En Audio (24kHz)}$$
+Suy luận: Vi Audio 16 kHz → **PhoWhisper-small** (ASR Việt) → **NLLB-200-distilled-600M** (dịch Vi→En, rồi chạy lại decoder trên câu Anh để lấy trạng thái ẩn 1024 chiều/token) → tách thành **đơn vị KÝ TỰ** (trạng thái NLLB của token chứa ký tự + id ký tự; thêm đơn vị **LẶNG** id 0 ở đầu/cuối) → **`MASBridge`** (Transformer pre-norm trên ký tự → μ → **bộ dự đoán thời lượng nhận vector giọng** → kéo dài μ theo frame → refiner conv) → c [B, 512, T] → **CFM Stage 1** (đóng băng, ODE 32 bước) → Mel 100 → **Vocos** → En Audio 24 kHz. Giọng: `spk_encoder(encoder_đích(audio Việt nguồn))`.
 
-| Khối module | Class / Pretrained | Số tham số | Trạng thái train | Vai trò kỹ thuật |
+| Khối | Class / Pretrained | Tham số | Trạng thái | Vai trò |
 | :--- | :--- | :---: | :---: | :--- |
-| **Speech Encoder** | `vinai/PhoWhisper-small` | ~100M | 🔒 Đóng băng | Trích xuất ngữ nghĩa âm học tiếng Việt ($H_{src} \in \mathbb{R}^{B \times T_{src} \times 768}$). WER 9.0%. |
-| **Speaker Encoder** | `AcousticSpeakerEncoder` | ~0.33M | 🔥 Trainable | Rút trích d-vector âm sắc 192d từ Mean/Std của $H_{src}$ để giữ giọng nói gốc. |
-| **Translation Bridge** | `CrossAttentionBridge` | ~35M | 🔥 Trainable | 6 tầng Transformer Decoder + Cross-Attention ánh xạ ngữ pháp Việt sang điều kiện tiếng Anh $c \in \mathbb{R}^{B \times 512 \times T_{tgt}}$. Kèm `DurationPredictor`. |
-| **Acoustic Decoder** | `FlowMatchingTargetDecoder` | ~4.6M | 🔥 Stage 1 / 🔒 Stage 2 | Mạng 1D Conv ResNet (4 blocks, $d=384$) giải mã hạt nhiễu $x_0 \sim \mathcal{N}(0, I)$ thành Mel 100 kênh. |
-| **Neural Vocoder** | `charactr/vocos-mel-24khz` | ~13M | 🔒 Đóng băng | ConvNeXt + iSTFT chuyển đổi Mel 100 kênh sang sóng âm 24kHz trong trẻo trong vài mili-giây. |
-
-* **Tổng tham số cần train (Stage 2):** **~35M – 40M** (Cực nhẹ, ăn **< 6GB VRAM**, không bao giờ bị OOM).
+| ASR Việt | `vinai/PhoWhisper-small` | ~240M | 🔒 | Chép lời tiếng Việt; encoder cũng tạo c\* và vector giọng |
+| Dịch máy | `facebook/nllb-200-distilled-600M` | 600M | 🔒 | Kiến thức dịch; ngữ nghĩa câu Anh theo token |
+| Bridge | `MASBridge` (`bridge_type: mas`, `semantic.unit: char`) | ~20.4M | 🔥 Stage 2 | Ký tự → điều kiện âm học theo thời gian (nói gì, lúc nào, bao lâu) |
+| Căn chỉnh (chỉ train) | `CTCCharAligner` = `facebook/wav2vec2-base-960h` | ~95M | 🔒 | Forced alignment ký tự trên audio Anh đích (Viterbi CTC tự viết) → thời lượng từng ký tự |
+| Decoder âm học | `FlowMatchingTargetDecoder` preset v2 | ~20.5M | 🔥 Stage 1 / 🔒 Stage 2 | OT-CFM sinh Mel; ở Stage 2 làm giám khảo âm học khả vi |
+| Teacher / giọng | `cond_proj`, `spk_encoder` (Stage 1) | ~0.4M / 0.33M | 🔒 | Nhãn c\*, vector giọng 192 chiều |
+| Vocoder | `charactr/vocos-mel-24khz` | ~13M | 🔒 | Mel → sóng âm |
 
 ---
 
 ## ⚡ 3. CHIẾN LƯỢC HUẤN LUYỆN 2 GIAI ĐOẠN & HÀM LOSS
 
-### Stage 1: Huấn luyện CFM Decoder tiếng Anh (`train_cfm.py`)
-* **Mục tiêu:** Dạy mạng CFM học quy luật khử nhiễu để sinh ra phổ Mel tiếng Anh chuẩn.
-* **Hàm loss:** $\mathcal{L}_{\text{CFM}} = \text{MSE}\big(v_\theta(x_t, t, c, s), \; (x_1 - x_0)\big)$ trên đường thẳng Optimal Transport.
-* **Lệnh:** `bash run.sh start cfm_en` $\rightarrow$ Checkpoint lưu tại `checkpoints/cfm_en-best.pth`.
+### Stage 1: Huấn luyện CFM Decoder tiếng Anh (`train_cfm.py`) — ✅ XONG
+* $\mathcal{L}_{\text{CFM}} = \text{MSE}\big(v_\theta(x_t, t, c, s), \; (x_1 - x_0)\big)$, $c$ = interp(`cond_proj`(PhoWhisper_enc(audio Anh))).
+* `bash run.sh start cfm_en` → `checkpoints/cfm_en-best.pth` (chỉ FLEURS; WER tái tạo **29.2%**, audio gốc 9.2%). Drive: `gdrive:runs/cfm_en/checkpoints/`.
 
-### Stage 2: Huấn luyện Cross-Attention Bridge Việt $\rightarrow$ Anh (`train_bridge.py`)
-* **Mục tiêu:** Dạy Bridge học cách dịch ngữ nghĩa sóng âm tiếng Việt sang biểu diễn điều kiện mà CFM tiếng Anh có thể phát âm được.
-* **Cơ chế gradient:** Đóng băng PhoWhisper và CFM Decoder. Gradient từ sai số âm thanh tiếng Anh $\mathcal{L}_{\text{CFM}}$ chạy xuyên qua CFM Decoder đóng băng (đóng vai trò **Differentiable Acoustic Critic**) truyền thẳng về cập nhật trọng số của Bridge!
-* **Hàm loss tổng:** 
-  $$\mathcal{L}_{\text{total}} = 1.0 \times \mathcal{L}_{\text{CFM}} + 0.1 \times \mathcal{L}_{\text{dur}} + 1.0 \times \mathcal{L}_{\text{cond}}$$
-  * $\mathcal{L}_{\text{dur}} = \text{SmoothL1}(\text{dur\_scale}, \; \text{target\_dur\_ratio})$: Dự đoán độ dài câu đích (tỉ lệ tính **theo từng câu**, không theo batch đệm).
-  * $\mathcal{L}_{\text{cond}} = \text{L1}(\text{Bridge}(H_{vi}), \; c^*)$ — **chưng cất**: $c^*$ = `cond_proj` của Stage 1 áp lên PhoWhisper(audio **tiếng Anh đích**), tức đúng điều kiện CFM Stage 1 đã quen. FLEURS có audio En song song nên Bridge có nhãn trực tiếp.
-  * **Speaker:** lúc train dùng embedding của audio **đích** (`spk_encoder` Stage 1, đóng băng); lúc suy luận dùng giọng **nguồn** → giữ giọng.
-  * Mọi loss có **mask phần đệm**; decoder dùng `MaskedGroupNorm` nên train (batch có đệm) và suy luận (1 câu) nhất quán.
-* **Lệnh:** `bash run.sh start bridge_vien` $\rightarrow$ Checkpoint lưu tại `checkpoints/bridge_vien-best.pth`.
+### Stage 2: Huấn luyện MASBridge (`train_bridge.py --config configs/stage2_bridge_sem.yaml`)
+* Đóng băng mọi thứ trừ Bridge. Văn bản Anh lúc train = tham chiếu (`train_text: ref`); lúc đo ASR-BLEU = bản dịch NLLB (`eval_text: mt`).
+* $\mathcal{L}_{\text{total}} = 1.0\,\mathcal{L}_{\text{CFM}} + 1.0\,\mathcal{L}_{\text{cond}} + 1.0\,\mathcal{L}_{\text{prior}} + 1.0\,\mathcal{L}_{\text{prior\_mel}} + 0.1\,\mathcal{L}_{\text{dur}}$ (CTC = 0)
+  * $\mathcal{L}_{\text{CFM}}$ qua decoder đóng băng; $\mathcal{L}_{\text{cond}}$ = L1(c, c\*), c\* = `teacher_condition`(PhoWhisper_enc(audio **Anh đích**)).
+  * $\mathcal{L}_{\text{prior}}$ = L1(μ kéo dài, c\*); $\mathcal{L}_{\text{prior\_mel}}$ = L1(`mel_head`(μ) kéo dài, Mel chuẩn hóa).
+  * $\mathcal{L}_{\text{dur}}$ = MSE(log d̂, log d), d = thời lượng **forced alignment wav2vec2** (`semantic.alignment: w2v`; `mas` = MAS tự học, đã thất bại trên dữ liệu đầy đủ).
+  * Speaker lúc train = audio **đích**; suy luận = giọng **nguồn**. Mọi loss mask phần đệm.
+* **Chỉ số quyết định: ASR-BLEU / WER** (mỗi `eval_asr_every` epoch) và CFM so với 2 mốc (c\* ≈ 0.65, c = 0 ≈ 1.10). **Val Cond có sàn cao** (c\* chứa thông tin riêng của bản ghi) nên không dùng để kết luận; đo sàn bằng `bash run.sh floor 40`.
+* Best checkpoint theo **ASR-BLEU** (`training.best_metric: asr_bleu`).
+* Kết quả 26/11 (20 epoch, `bridge_vien_mas`): ASR-BLEU 4.8 → 9.6 → 13.8 → **21.1** (WER 68%), chưa bão hòa → config 60 epoch.
+* Lệnh: overfit `bash run.sh overfit bridge --config configs/stage2_bridge_sem.yaml --overfit-steps 2000`; train `bash run.sh start bridge_vien_mas --fresh` (tên exp có `mas` → run.sh tự dùng config sem).
 
 ---
 
@@ -132,17 +132,11 @@ Tất cả nằm trong [`sanity_and_eda_suite.py`](file:///d:/Github/ai%20biet/S
 
 ## 🎯 8. KẾ HOẠCH HÀNH ĐỘNG TIẾP THEO (NEXT PRIORITIES)
 
-Khi tiếp tục phiên làm việc, hãy ưu tiên các nhiệm vụ theo thứ tự sau:
+Trạng thái và việc dở dang mới nhất luôn ở **mục cuối của file mới nhất trong `docs/worklog/`** — đọc trước khi làm tiếp. Tóm tắt (26/11 chiều):
 
-1. **Kiểm tra kết quả Benchmark SOTA Baselines:**
-   * Chạy: `bash run.sh eval sota both 10`.
-   * Chạy: `bash run.sh upload` để đẩy audio sinh ra lên GitHub kiểm tra chất lượng nghe thực tế của XTTS-v2 và F5-TTS.
-2. **Tiến hành Huấn luyện Stage 1 OT-CFM Tiếng Anh:**
-   * Chạy: `bash run.sh start cfm_en`.
-   * Theo dõi **WER tái tạo** (in mỗi 5 epoch, so với WER của audio gốc) thay vì ngưỡng val loss. Checkpoint `checkpoints/cfm_en-best.pth` — Stage 2 và eval tự tìm đúng tên này, KHÔNG cần copy.
-3. **Tiến hành Huấn luyện Stage 2 Cross-Attention Bridge:**
-   * Chạy: `bash run.sh start bridge_vien`.
-   * Mô hình sẽ tự nạp CFM checkpoint từ Stage 1, đóng băng CFM và chỉ train Bridge trên cặp câu FLEURS Vi $\rightarrow$ En.
-4. **Đánh giá Toàn Diện Case 4 Đề Xuất so với Toàn Bộ Baseline:**
-   * Chạy: `bash run.sh eval all both 30`.
-   * Thu thập bảng số liệu chính thức: ASR-BLEU, RTF, SECS, Mel L1 để hoàn tất Khóa luận Tốt nghiệp hoặc nộp bài báo khoa học.
+1. Đo sàn Cond: `bash run.sh floor 40`.
+2. Train Stage 2 lên 60 epoch: `bash run.sh start bridge_vien_mas --resume` (hoặc `--fresh`), theo dõi ASR-BLEU.
+3. Đo S2TT-BLEU của PhoWhisper + NLLB (cận trên của ASR-BLEU).
+4. Benchmark Case 4 (checkpoint ngữ nghĩa) so với baseline: `bash run.sh eval all both 30`.
+5. Nếu BLEU bão hòa thấp: thêm dữ liệu phía Anh cho Stage 2 (PhoST, LibriTTS).
+6. Gia hạn token rclone ~30/11, thu hồi token đã lộ.
