@@ -1421,7 +1421,7 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
     reader = object.__new__(RealStreamingSpeechPipeline)
     reader.max_sec = max_sec
     print("\n" + "=" * 75)
-    print(f"📏 ĐO SÀN L1(·, c*): {n_pairs} cặp (cùng câu FLEURS {tgt_l}, 2 bản ghi khác nhau)")
+    print(f"📏 ĐO SÀN L1(·, c*): {n_pairs} câu FLEURS {tgt_l}, mỗi câu 3 bản ghi khác nhau")
     print("=" * 75)
     # Cần câu có ≥ 3 bản ghi: so mỗi bản ghi với TRUNG BÌNH của k bản ghi còn lại (k = 1, 2) rồi ngoại suy k -> ∞.
     # (Bản 26/11 đầu so với đúng 1 bản ghi khác: tính nhiễu của CẢ HAI bản ghi -> "sàn" 0.427 còn cao hơn Bridge 0.395.)
