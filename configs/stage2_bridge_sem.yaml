@@ -13,6 +13,8 @@ model:
   bridge_heads: 8
   bridge_query_mode: "interp"   # interp (query = nguồn nội suy + vị trí tương đối) | learned (cũ, ablation)
   bridge_norm: "prenorm_skip"   # prenorm_skip (pre-norm + đường tắt query->đầu ra) | postnorm (cũ: sụp về hằng số theo thời gian)
+  bridge_type: "mas"            # mas = căn chỉnh token->frame bằng MAS + thời lượng theo token (Glow-TTS/Matcha-TTS)
+                                # cross = Bridge cũ (kéo giãn đều + cross-attention): kẹt val Cond 0.44 ngày 26/11
   semantic:
     source: "nllb"                                # none = latent PhoWhisper (bản trực tiếp) | nllb = trạng thái ẩn decoder NLLB
     model: "facebook/nllb-200-distilled-600M"     # đóng băng, d_model 1024

@@ -547,6 +547,180 @@ class CrossAttentionBridge(nn.Module):
 # Alias tương thích ngược
 ToneAwareBridge = CrossAttentionBridge
 
+
+# ==============================================================================
+# CĂN CHỈNH ĐƠN ĐIỆU (MAS — Monotonic Alignment Search, Glow-TTS / VITS / Matcha-TTS)
+# ==============================================================================
+def maximum_path(loglik, n_lens, t_lens):
+    """Quy hoạch động tìm đường căn chỉnh ĐƠN ĐIỆU tốt nhất token -> frame (mỗi frame thuộc đúng 1 token,
+    token đi theo thứ tự, mỗi token >= 1 frame).
+    loglik [B, N, T] (log-likelihood frame t thuộc token n); n_lens / t_lens: độ dài thật.
+    -> path [B, N, T] nhị phân (float, cùng device). Không có gradient (giống Glow-TTS)."""
+    import numpy as np
+    ll = loglik.detach().float().cpu().numpy()
+    B, N, T = ll.shape
+    path = np.zeros((B, N, T), dtype=np.float32)
+    neg = -1e9
+    for b in range(B):
+        n_b, t_b = int(n_lens[b]), int(t_lens[b])
+        if n_b <= 0 or t_b <= 0:
+            continue
+        if t_b < n_b:                       # ít frame hơn token (gần như không xảy ra): chia đều
+            idx = np.minimum((np.arange(t_b) * n_b) // t_b, n_b - 1)
+            path[b, idx, np.arange(t_b)] = 1.0
+            continue
+        x = ll[b, :n_b, :t_b]
+        Q = np.full((n_b, t_b), neg, dtype=np.float32)
+        Q[0, 0] = x[0, 0]
+        for t in range(1, t_b):
+            stay = Q[:, t - 1]
+            move = np.concatenate([[neg], Q[:-1, t - 1]])
+            Q[:, t] = x[:, t] + np.maximum(stay, move)
+            # token n chỉ hợp lệ ở frame t >= n và còn đủ frame cho các token sau: t <= t_b - (n_b - n)
+            if t < n_b:
+                Q[t + 1:, t] = neg
+        n = n_b - 1
+        for t in range(t_b - 1, -1, -1):
+            path[b, n, t] = 1.0
+            if n > 0 and t > 0 and (n == t or Q[n - 1, t - 1] > Q[n, t - 1]):
+                n -= 1
+    return torch.from_numpy(path).to(loglik.device)
+
+
+def durations_to_path(dur, T):
+    """dur [B, N] (số frame nguyên của từng token, 0 ở token đệm) -> path [B, N, T] nhị phân."""
+    cum = torch.cumsum(dur, dim=1)                              # [B, N]
+    start = cum - dur
+    t = torch.arange(T, device=dur.device).view(1, 1, -1)
+    return ((t >= start.unsqueeze(-1)) & (t < cum.unsqueeze(-1))).to(torch.float32)
+
+
+class MASBridge(nn.Module):
+    """Bridge NGỮ NGHĨA có căn chỉnh tường minh (kiểu Glow-TTS / Matcha-TTS):
+      token (trạng thái ẩn decoder NLLB) -> Transformer encoder -> μ_n (mỗi token 1 vector trong không gian c)
+      TRAIN  : MAS tìm thời lượng THẬT của từng token trên c* (đường đơn điệu khớp nhất) -> kéo dài μ theo đó
+      INFER  : bộ dự đoán thời lượng theo TỪNG TOKEN (log số frame) -> kéo dài μ
+      -> refiner conv theo frame (làm mượt biên token) -> c [B, T, 512].
+    Lý do: bản cũ chỉ biết TỔNG độ dài rồi kéo giãn đều -> lệch thời điểm từng từ -> L1 sụp về trung bình
+    (26/11/2026: kể cả khi biết câu Anh đúng, val Cond vẫn kẹt 0.44 = mốc trung bình)."""
+    is_mas = True
+
+    def __init__(self, in_dim=1024, hidden_dim=512, num_layers=4, n_heads=8, refine_blocks=4, dropout=0.1,
+                 prior_sigma=0.15, prior_weight=1.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        # Prior căn chỉnh gần ĐƯỜNG CHÉO (kiểu RAD-TTS / "One TTS Alignment to Rule Them All"): thưởng khi token n
+        # rơi gần vị trí tương đối n/N của câu. Không có prior, MAS bị "khóa" vào căn chỉnh sai ngay từ đầu (μ ngẫu nhiên
+        # -> căn đại -> μ học theo -> tự củng cố; thử CPU: lệch 59% số frame). Chỉ dùng lúc train.
+        self.prior_sigma, self.prior_weight = float(prior_sigma), float(prior_weight)
+        # thuộc tính tương thích với CrossAttentionBridge (meta / loader / log)
+        self.query_mode, self.norm_mode, self.ctc_vocab, self.ctc_head = "mas", "prenorm", 0, None
+        self.dur_range = (1.0, 1.0)
+        self.src_proj = nn.Linear(in_dim, hidden_dim)
+        layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 4,
+                                           dropout=dropout, batch_first=True, activation="gelu", norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(hidden_dim),
+                                             enable_nested_tensor=False)
+        self.mu_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Dự đoán log(số frame) của TỪNG token (trên đầu ra encoder đã detach, như Glow-TTS)
+        self.dp_conv1 = nn.Conv1d(hidden_dim, 256, 3, padding=1)
+        self.dp_norm1 = nn.LayerNorm(256)
+        self.dp_conv2 = nn.Conv1d(256, 256, 3, padding=1)
+        self.dp_norm2 = nn.LayerNorm(256)
+        self.dp_out = nn.Conv1d(256, 1, 1)
+        self.dp_drop = nn.Dropout(dropout)
+        # Refiner theo frame: residual conv, nhánh cuối khởi tạo 0 -> ban đầu c = μ kéo dài
+        self.ref_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(refine_blocks)])
+        self.ref_c1 = nn.ModuleList([nn.Conv1d(hidden_dim, hidden_dim, 5, padding=2) for _ in range(refine_blocks)])
+        self.ref_c2 = nn.ModuleList([nn.Conv1d(hidden_dim, hidden_dim, 1) for _ in range(refine_blocks)])
+        for c2 in self.ref_c2:
+            nn.init.zeros_(c2.weight)
+            nn.init.zeros_(c2.bias)
+        self.last_logw = self.last_logw_target = self.last_mu_frames = self.last_src_mask = None
+
+    @staticmethod
+    def _pos(N, D, device):
+        pos = torch.arange(N, device=device, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / D))
+        pe = torch.zeros(N, D, device=device)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe
+
+    def _dp(self, h, keep):
+        x = h.detach().transpose(1, 2) * keep.unsqueeze(1)
+        x = F.relu(self.dp_conv1(x))
+        x = self.dp_drop(self.dp_norm1(x.transpose(1, 2)).transpose(1, 2)) * keep.unsqueeze(1)
+        x = F.relu(self.dp_conv2(x))
+        x = self.dp_drop(self.dp_norm2(x.transpose(1, 2)).transpose(1, 2)) * keep.unsqueeze(1)
+        return self.dp_out(x).squeeze(1) * keep                  # [B, N] log(số frame)
+
+    def _refine(self, x, fmask):
+        """x [B, T, D]; fmask [B, T] (1 = frame thật)."""
+        m = fmask.unsqueeze(1).to(x.dtype)
+        y = x.transpose(1, 2) * m
+        for ln, c1, c2 in zip(self.ref_norms, self.ref_c1, self.ref_c2):
+            z = ln(y.transpose(1, 2)).transpose(1, 2) * m
+            y = y + c2(F.gelu(c1(z))) * m
+        return y.transpose(1, 2)
+
+    def forward(self, x, target_len=None, src_lengths=None, tgt_lengths=None, return_ctc=False, align_target=None):
+        """x [B, N, in_dim] trạng thái ẩn token; align_target: c* [B, D, T] (chỉ lúc train) -> căn chỉnh bằng MAS.
+        Không có align_target: dùng thời lượng dự đoán (co giãn về target_len / tgt_lengths nếu cho)."""
+        B, N, _ = x.shape
+        dev = x.device
+        n_lens = [int(v) for v in src_lengths] if src_lengths is not None else [N] * B
+        keep = (torch.arange(N, device=dev).view(1, -1) < torch.tensor(n_lens, device=dev).view(-1, 1))
+        h = self.src_proj(x) + self._pos(N, self.hidden_dim, dev).to(x.dtype).unsqueeze(0)
+        h = self.encoder(h, src_key_padding_mask=~keep)
+        mu = self.mu_proj(h) * keep.unsqueeze(-1).to(h.dtype)    # [B, N, D]
+        keepf = keep.to(torch.float32)
+        logw = self._dp(h, keep.to(h.dtype)).float()              # [B, N]
+        self.last_logw, self.last_src_mask = logw, keepf
+
+        if align_target is not None:
+            T = align_target.shape[-1]
+            t_lens = [int(v) for v in tgt_lengths] if tgt_lengths is not None else [T] * B
+            with torch.no_grad():
+                c = align_target.float().transpose(1, 2)                          # [B, T, D]
+                m = mu.float()
+                # log-likelihood Gaussian đơn vị: -0.5 ||c_t - μ_n||^2  -> [B, N, T]
+                ll = -0.5 * ((m * m).sum(-1, keepdim=True) - 2.0 * m @ c.transpose(1, 2)
+                             + (c * c).sum(-1).unsqueeze(1)) / m.shape[-1]       # chuẩn hóa theo số chiều
+                if self.prior_weight > 0:
+                    nl = torch.tensor(n_lens, device=dev, dtype=torch.float32).view(B, 1, 1)
+                    tl = torch.tensor(t_lens, device=dev, dtype=torch.float32).view(B, 1, 1)
+                    pn = (torch.arange(N, device=dev, dtype=torch.float32).view(1, -1, 1) + 0.5) / nl
+                    pt = (torch.arange(T, device=dev, dtype=torch.float32).view(1, 1, -1) + 0.5) / tl
+                    ll = ll - self.prior_weight * (pn - pt) ** 2 / (2.0 * self.prior_sigma ** 2)
+                path = maximum_path(ll, n_lens, t_lens)
+            dur = path.sum(-1)                                                    # [B, N] frame thật / token
+            self.last_logw_target = torch.log(dur.clamp(min=1.0)) * keepf
+        else:
+            w = torch.exp(logw).clamp(min=1.0) * keepf
+            if tgt_lengths is not None or target_len is not None:
+                tot = (torch.as_tensor([int(v) for v in tgt_lengths], device=dev, dtype=torch.float32)
+                       if tgt_lengths is not None else torch.full((B,), float(target_len), device=dev))
+                w = w * (tot / w.sum(-1).clamp(min=1e-6)).unsqueeze(-1)          # co giãn về đúng tổng độ dài
+            dur = torch.floor(w).clamp(min=0) * keepf
+            dur = dur + keepf * (dur == 0).float() * keepf                        # mỗi token thật >= 1 frame
+            if tgt_lengths is not None or target_len is not None:                # dồn phần dư vào token cuối
+                diff = tot - dur.sum(-1)
+                last = (torch.tensor(n_lens, device=dev) - 1).clamp(min=0)
+                dur[torch.arange(B, device=dev), last] += diff.clamp(min=-1e9)
+                dur = dur.clamp(min=0)
+            T = int(target_len) if target_len is not None else int(max(20, min(2048, dur.sum(-1).max().item())))
+            path = durations_to_path(dur.round().long(), T)
+            self.last_logw_target = None
+        frames = path.transpose(1, 2).to(mu.dtype) @ mu                          # [B, T, D] μ kéo dài theo token
+        fmask = path.sum(1) > 0                                                   # [B, T]
+        self.last_mu_frames, self.last_frame_mask = frames, fmask
+        out = self._refine(frames, fmask)
+        dur_scale = dur.sum(-1) / torch.tensor(n_lens, device=dev, dtype=torch.float32).clamp(min=1)
+        if return_ctc:
+            return out, dur_scale, None
+        return out, dur_scale
+
 class AcousticSpeakerEncoder(nn.Module):
     """Trích xuất d-vector âm sắc (Speaker Timbre Embedding - 192d) qua Mean/Std statistics."""
     def __init__(self, feat_dim=768, spk_dim=192):
@@ -570,14 +744,17 @@ class ViEnS2STSystem(nn.Module):
     """Hệ thống tích hợp toàn diện Vi -> En: Whisper -> CrossAttentionBridge -> CFM Decoder -> 100 Mel."""
     def __init__(self, encoder_dim=768, bridge_dim=512, bridge_layers=6, n_mels=100, spk_dim=192,
                  bridge_query_mode="interp", bridge_norm="prenorm_skip", bridge_ctc_vocab=0,
-                 bridge_in_dim=None, dur_range=(0.8, 2.2)):
+                 bridge_in_dim=None, dur_range=(0.8, 2.2), bridge_type="cross"):
         """bridge_in_dim: số chiều đầu vào Bridge (None = encoder_dim). Chế độ ngữ nghĩa: = d_model của decoder dịch
         (NLLB-600M: 1024). spk_encoder / teacher_cond_proj vẫn dùng encoder_dim (đặc trưng PhoWhisper)."""
         super().__init__()
         self.n_mels = n_mels
-        self.bridge = CrossAttentionBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
-                                           num_layers=bridge_layers, query_mode=bridge_query_mode,
-                                           norm_mode=bridge_norm, ctc_vocab=bridge_ctc_vocab, dur_range=dur_range)
+        if bridge_type == "mas":
+            self.bridge = MASBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim)
+        else:
+            self.bridge = CrossAttentionBridge(in_dim=bridge_in_dim or encoder_dim, hidden_dim=bridge_dim,
+                                               num_layers=bridge_layers, query_mode=bridge_query_mode,
+                                               norm_mode=bridge_norm, ctc_vocab=bridge_ctc_vocab, dur_range=dur_range)
         self.spk_encoder = AcousticSpeakerEncoder(feat_dim=encoder_dim, spk_dim=spk_dim)
         # Kiến trúc mặc định = preset mặc định của train_utils; khi nạp Stage 1 sẽ dựng lại ĐÚNG kiến trúc đã lưu
         self.decoder = FlowMatchingTargetDecoder(n_mels=n_mels, cond_dim=bridge_dim, spk_dim=spk_dim)
@@ -634,8 +811,16 @@ class ViEnS2STSystem(nn.Module):
         tgt_lengths = mel_mask.sum(dim=-1).long() if mel_mask is not None else None
         use_ctc = (ctc_targets is not None and weights.get("ctc_weight", 0) > 0
                    and getattr(self.bridge, "ctc_head", None) is not None)
-        translated_latents, dur_scale, ctc_logits = self.bridge(src_whisper, target_len=T_tgt, src_lengths=src_lengths,
-                                                                tgt_lengths=tgt_lengths, return_ctc=True)
+        is_mas = getattr(self.bridge, "is_mas", False)
+        if is_mas:
+            if cond_target is None:
+                raise RuntimeError("MASBridge cần c* (teacher Stage 1) để căn chỉnh lúc train.")
+            translated_latents, dur_scale, ctc_logits = self.bridge(
+                src_whisper, target_len=T_tgt, src_lengths=src_lengths, tgt_lengths=tgt_lengths,
+                return_ctc=True, align_target=cond_target)
+        else:
+            translated_latents, dur_scale, ctc_logits = self.bridge(src_whisper, target_len=T_tgt, src_lengths=src_lengths,
+                                                                    tgt_lengths=tgt_lengths, return_ctc=True)
 
         if speaker_emb is None:
             speaker_emb = self.spk_encoder(src_whisper)
@@ -655,8 +840,11 @@ class ViEnS2STSystem(nn.Module):
         v_pred = self.decoder(x_t, t, cond, speaker_emb, mask=mel_mask)
         cfm_loss = masked_mse(v_pred, u_t, mel_mask)
 
-        # 2. Duration Loss
-        if target_dur_ratio is not None:
+        # 2. Duration Loss (MAS: MSE log(số frame) TỪNG token so với thời lượng MAS tìm được)
+        if is_mas:
+            km = self.bridge.last_src_mask
+            dur_loss = (((self.bridge.last_logw - self.bridge.last_logw_target) ** 2) * km).sum() / km.sum().clamp(min=1.0)
+        elif target_dur_ratio is not None:
             if getattr(self.bridge.duration_predictor, "log_loss", False):
                 dur_loss = F.smooth_l1_loss(dur_scale.float().clamp(min=1e-4).log().view(-1),
                                             target_dur_ratio.float().clamp(min=1e-4).log().view(-1))
@@ -673,6 +861,12 @@ class ViEnS2STSystem(nn.Module):
 
         total_loss = (weights["cfm_weight"] * cfm_loss + weights["dur_weight"] * dur_loss
                       + weights["cond_weight"] * cond_loss)
+        # MAS: "prior" — μ kéo dài (trước refiner) cũng phải gần c* -> MAS các bước sau căn chỉnh tốt hơn
+        self.last_prior_loss = None
+        if is_mas and cond_target is not None and weights["cond_weight"] > 0:
+            prior = masked_l1(self.bridge.last_mu_frames.transpose(1, 2), cond_target, mel_mask)
+            total_loss = total_loss + weights["cond_weight"] * prior
+            self.last_prior_loss = prior.detach()
 
         # 4. CTC phụ: chuỗi ký tự tiếng Anh từ trạng thái ẩn của Bridge (không cần căn chỉnh frame)
         self.last_ctc_loss, self.last_ctc_logp = None, None
@@ -843,11 +1037,17 @@ def load_stage2_into(model, ckpt_path, device):
     cv = int(meta.get("bridge_ctc_vocab", 0))        # checkpoint chưa có CTC = 0
     bi = int(meta.get("bridge_in_dim", model.bridge.src_proj.in_features))
     dr = tuple(meta.get("dur_range", (0.8, 2.2)))
-    if (qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab
-            or bi != model.bridge.src_proj.in_features or dr != model.bridge.dur_range):
+    bt = meta.get("bridge_type", "cross")
+    if bt == "mas":
+        ref_b = model.bridge
+        model.bridge = MASBridge(in_dim=bi, hidden_dim=ref_b.hidden_dim).to(device=ref.device, dtype=ref.dtype)
+    elif (qm != model.bridge.query_mode or nm != model.bridge.norm_mode or cv != model.bridge.ctc_vocab
+            or bi != model.bridge.src_proj.in_features or dr != model.bridge.dur_range
+            or getattr(model.bridge, "is_mas", False)):
         b = model.bridge
         model.bridge = CrossAttentionBridge(in_dim=bi, hidden_dim=b.hidden_dim,
-                                            num_layers=len(b.decoder.layers), query_mode=qm,
+                                            num_layers=len(b.decoder.layers) if hasattr(b, "decoder") else 6,
+                                            query_mode=qm,
                                             norm_mode=nm, ctc_vocab=cv, dur_range=dr).to(device=ref.device, dtype=ref.dtype)
     model.load_state_dict(ck["model_state_dict"], strict=True)
     model.has_teacher = bool(meta.get("has_teacher"))
@@ -1109,6 +1309,9 @@ def main():
               f"'{sem_cfg.get('train_text', 'ref')}' | lúc đánh giá ASR-BLEU: '{sem_cfg.get('eval_text', 'mt')}'")
     bridge_in_dim = sem_src.dim if sem_src is not None else None
     dur_range = tuple(sem_cfg.get("dur_range", (4.0, 80.0))) if sem_src is not None else (0.8, 2.2)
+    bridge_type = cfg["model"].get("bridge_type", "cross")
+    if bridge_type == "mas" and sem_src is None:
+        raise RuntimeError("bridge_type 'mas' cần nguồn ngữ nghĩa (model.semantic.source = nllb).")
 
     def semantic_feats(vi_texts, en_texts, mode):
         """mode 'ref': câu Anh tham chiếu (cận trên: dịch hoàn hảo) | 'mt': NLLB tự dịch câu Việt (thực tế hơn)."""
@@ -1132,10 +1335,13 @@ def main():
         bridge_ctc_vocab=bridge_ctc_vocab,
         bridge_in_dim=bridge_in_dim,
         dur_range=dur_range,
+        bridge_type=bridge_type,
     ).to(device=device)                                  # trọng số fp32
     model.amp_dtype = dtype if dtype == torch.bfloat16 else None
     print(f"⚙️ Mixed precision: trọng số fp32 | tính toán {'bf16 (autocast)' if model.amp_dtype else 'fp32'}")
-    print(f"🌉 Bridge query mode: {bridge_query_mode} | norm: {bridge_norm} | "
+    if bridge_type == "mas":
+        print("🌉 Bridge MAS: token -> μ -> căn chỉnh đơn điệu (MAS lúc train, thời lượng dự đoán theo token lúc suy luận)")
+    print(f"🌉 Bridge query mode: {model.bridge.query_mode} | norm: {model.bridge.norm_mode} | "
           f"CTC phụ (ký tự Anh): {'BẬT, ' + str(bridge_ctc_vocab) + ' ký hiệu' if use_ctc else 'tắt'}")
 
     mel_fb = build_mel_filterbank(sr=24000, n_mels=100, device=device)
@@ -1373,6 +1579,8 @@ def main():
             log_interval = max(50, num_steps // 16) if is_deep else 10
             if (st + 1) % log_interval == 0 or st == 0:
                 ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
+                if getattr(model, "last_prior_loss", None) is not None:
+                    ctc_s += f" | Prior: {model.last_prior_loss.item():.4f}"
                 print(f"   [Overfit Step {st+1:04d}/{num_steps}] Total: {l_tot.item():.4f} | CFM: {cfm_l.item():.4f} "
                       f"| Dur: {d_l.item():.4f} | Cond: {c_l.item():.4f}{ctc_s} | LR: {scheduler.get_last_lr()[0]:.1e}")
             final_loss = l_tot.item()
@@ -1572,6 +1780,8 @@ def main():
             if global_step % 10 == 0 or args.smoke_test:
                 cur_lr = scheduler.get_last_lr()[0]
                 ctc_s = f" | CTC: {model.last_ctc_loss.item():.3f}" if model.last_ctc_loss is not None else ""
+                if getattr(model, "last_prior_loss", None) is not None:
+                    ctc_s += f" | Prior: {model.last_prior_loss.item():.4f}"
                 print(f"   [E{epoch:02d}|Step {global_step:04d}] Total: {total_loss.item():.4f} | "
                       f"CFM: {cfm_l.item():.4f} | Dur: {dur_l.item():.4f} | Cond: {cond_l.item():.4f}{ctc_s} | LR: {cur_lr:.2e}")
 
@@ -1654,6 +1864,7 @@ def main():
                             "bridge_query_mode": bridge_query_mode, "bridge_norm": bridge_norm,
                             "bridge_ctc_vocab": bridge_ctc_vocab,
                             "bridge_in_dim": model.bridge.src_proj.in_features, "dur_range": list(dur_range),
+                            "bridge_type": bridge_type,
                             "semantic": sem_cfg if sem_src is not None else None,
                             "decoder_config": model.decoder.config,
                             "loss_weights": loss_weights, "version": 2},
