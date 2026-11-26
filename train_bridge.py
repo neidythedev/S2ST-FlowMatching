@@ -712,13 +712,10 @@ class MASBridge(nn.Module):
                 tot = (torch.as_tensor([int(v) for v in tgt_lengths], device=dev, dtype=torch.float32)
                        if tgt_lengths is not None else torch.full((B,), float(target_len), device=dev))
                 w = w * (tot / w.sum(-1).clamp(min=1e-6)).unsqueeze(-1)          # co giãn về đúng tổng độ dài
-            dur = torch.floor(w).clamp(min=0) * keepf
-            dur = dur + keepf * (dur == 0).float() * keepf                        # mỗi token thật >= 1 frame
-            if tgt_lengths is not None or target_len is not None:                # dồn phần dư vào token cuối
-                diff = tot - dur.sum(-1)
-                last = (torch.tensor(n_lens, device=dev) - 1).clamp(min=0)
-                dur[torch.arange(B, device=dev), last] += diff.clamp(min=-1e9)
-                dur = dur.clamp(min=0)
+            # Làm tròn trên TỔNG TÍCH LŨY (không làm tròn từng đơn vị): floor từng ký tự mất ~0.5 frame/ký tự
+            # -> ~160 ký tự trôi ~80 frame về cuối câu (overfit theo ký tự: L1 0.458 dù Dur loss chỉ 0.024).
+            cum = torch.round(torch.cumsum(w, dim=-1))
+            dur = (cum - F.pad(cum, (1, 0))[:, :-1]).clamp(min=0) * keepf
             T = int(target_len) if target_len is not None else int(max(20, min(2048, dur.sum(-1).max().item())))
             path = durations_to_path(dur.round().long(), T)
             self.last_logw_target = None
