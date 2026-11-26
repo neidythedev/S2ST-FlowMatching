@@ -172,6 +172,14 @@ case "$ACTION" in
         python sanity_and_eda_suite.py --all
         ;;
 
+    eda)
+        # EDA FLEURS Vi->En: ảnh PNG + summary.md ở outputs/eda/. VD: bash run.sh eda | bash run.sh eda --quick
+        pip uninstall torchaudio -y >/dev/null 2>&1 || true
+        pip install "datasets<4.0.0" soundfile matplotlib sentencepiece -q 2>/dev/null || true
+        python -u tools/eda_s2st.py "${@:2}"
+        echo "👉 Đẩy ảnh lên GitHub để phân tích: bash run.sh upload"
+        ;;
+
     floor)
         # Đo SÀN của L1(·, c*): 2 bản ghi khác nhau cùng một câu FLEURS. VD: bash run.sh floor 40
         pip uninstall torchaudio -y >/dev/null 2>&1 || true
