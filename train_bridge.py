@@ -1209,6 +1209,15 @@ def warp_by_units(c_b, d_a, d_b):
     return c_b[:, torch.as_tensor(idx, dtype=torch.long, device=c_b.device)]
 
 
+def extrapolate_floor(lk):
+    """lk: {k: L1(c*_a, trung bình k bản ghi khác)}. Nếu c* = nội dung chung + nhiễu riêng độc lập (độ lệch σ) và L1 ∝ σ:
+    L(k) = F·sqrt(1 + 1/k), F = L1 khi đoán đúng nội dung chung (k -> ∞). Bình phương tối thiểu theo F."""
+    import math
+    num = sum(v * math.sqrt(1 + 1 / k) for k, v in lk.items())
+    den = sum(1 + 1 / k for k in lk)
+    return num / den
+
+
 def unit_ids_from_text(text):
     """Chuỗi đơn vị ký tự (như char_states): [LẶNG] + ký tự (gộp dấu cách) + [LẶNG]."""
     from train_utils import EN_CTC_CHARS, normalize_en
@@ -1414,6 +1423,8 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
     print("\n" + "=" * 75)
     print(f"📏 ĐO SÀN L1(·, c*): {n_pairs} cặp (cùng câu FLEURS {tgt_l}, 2 bản ghi khác nhau)")
     print("=" * 75)
+    # Cần câu có ≥ 3 bản ghi: so mỗi bản ghi với TRUNG BÌNH của k bản ghi còn lại (k = 1, 2) rồi ngoại suy k -> ∞.
+    # (Bản 26/11 đầu so với đúng 1 bản ghi khác: tính nhiễu của CẢ HAI bản ghi -> "sàn" 0.427 còn cao hơn Bridge 0.395.)
     by_id, groups = {}, []
     for split in ("validation", "train"):
         ds = load_dataset('google/fleurs', tgt_l, split=split, streaming=True)
@@ -1426,13 +1437,13 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
             if fid is None:
                 continue
             by_id.setdefault((split, fid), []).append(item)
-            if len(by_id[(split, fid)]) == 2:
-                groups.append(tuple(by_id[(split, fid)][:2]))   # bản sao: danh sách gốc còn nhận thêm bản ghi thứ 3+
+            if len(by_id[(split, fid)]) == 3:
+                groups.append(tuple(by_id[(split, fid)][:3]))   # bản sao: danh sách gốc còn nhận thêm bản ghi
                 if len(groups) >= n_pairs:
                     break
         if len(groups) >= n_pairs:
             break
-    print(f"✓ Tìm được {len(groups)} câu có ≥ 2 bản ghi")
+    print(f"✓ Tìm được {len(groups)} câu có ≥ 3 bản ghi")
 
     def one(item):
         w = reader._extract_audio_tensor(item['audio'])
@@ -1442,40 +1453,50 @@ def measure_cond_floor(n_pairs, tgt_l, max_sec, model, feat_tgt, enc_tgt, aligne
             c = model.teacher_condition(lat, T)[0].float()                    # [D, T]
         return w, c, T
 
-    floors, trivials, uniforms, rows = [], [], [], []
-    for gi, grp in enumerate(groups):
-        ia, ib = grp[0], grp[1]
-        try:
-            wa, ca, Ta = one(ia)
-            wb, cb, Tb = one(ib)
-        except Exception as e:
-            print(f"   [Bỏ qua cặp {gi}] {e}")
-            continue
-        ids = unit_ids_from_text(ia.get('transcription', ''))
-        da = aligner.durations(wa, ids, Ta)
-        db = aligner.durations(wb, ids, Tb)
-        cb_a = warp_by_units(cb, da, db)
-        L = min(cb_a.shape[-1], ca.shape[-1])
-        floor = (cb_a[:, :L] - ca[:, :L]).abs().mean().item()
-        # tham chiếu: kéo giãn đều (không căn ký tự) và mốc 'đoán trung bình theo thời gian'
-        cb_u = F.interpolate(cb.unsqueeze(0), size=Ta, mode='linear', align_corners=False)[0]
-        uni = (cb_u - ca).abs().mean().item()
-        triv = (ca.mean(-1, keepdim=True) - ca).abs().mean().item()
-        floors.append(floor); uniforms.append(uni); trivials.append(triv)
-        rows.append((ia.get('transcription', '')[:50], floor, uni, triv))
-    if not floors:
-        raise RuntimeError("Không đo được cặp nào.")
     import numpy as np
-    f_m, u_m, t_m = float(np.mean(floors)), float(np.mean(uniforms)), float(np.mean(trivials))
-    for txt, f_, u_, t_ in rows[:5]:
-        print(f"   • \"{txt}...\" | sàn {f_:.3f} | kéo đều {u_:.3f} | trung bình {t_:.3f}")
+    l1s, l2s, trivials, uniforms, rows = [], [], [], [], []
+    for gi, grp in enumerate(groups):
+        try:
+            recs = [one(it) for it in grp]
+        except Exception as e:
+            print(f"   [Bỏ qua câu {gi}] {e}")
+            continue
+        ids = unit_ids_from_text(grp[0].get('transcription', ''))
+        durs = [aligner.durations(w, ids, T) for (w, _, T) in recs]
+        for ai in range(3):
+            wa, ca, Ta = recs[ai]
+            others = [j for j in range(3) if j != ai]
+            warped = [warp_by_units(recs[j][1], durs[ai], durs[j]) for j in others]
+            L = min([ca.shape[-1]] + [x.shape[-1] for x in warped])
+            ca_ = ca[:, :L]
+            k1 = float(np.mean([(x[:, :L] - ca_).abs().mean().item() for x in warped]))
+            k2 = (torch.stack([x[:, :L] for x in warped]).mean(0) - ca_).abs().mean().item()
+            cu = F.interpolate(recs[others[0]][1].unsqueeze(0), size=Ta, mode='linear', align_corners=False)[0]
+            l1s.append(k1); l2s.append(k2)
+            uniforms.append((cu - ca).abs().mean().item())
+            trivials.append((ca.mean(-1, keepdim=True) - ca).abs().mean().item())
+            if ai == 0:
+                rows.append((grp[0].get('transcription', '')[:50], k1, k2))
+    if not l1s:
+        raise RuntimeError("Không đo được câu nào.")
+    L1m, L2m = float(np.mean(l1s)), float(np.mean(l2s))
+    t_m, u_m = float(np.mean(trivials)), float(np.mean(uniforms))
+    F_inf = extrapolate_floor({1: L1m, 2: L2m})
+    for txt, a_, b_ in rows[:5]:
+        print(f"   • \"{txt}...\" | 1 bản ghi khác {a_:.3f} | trung bình 2 bản ghi {b_:.3f}")
     print("-" * 75)
-    print(f"📏 Mốc 'đoán trung bình theo thời gian'       : {t_m:.4f}")
-    print(f"📏 Bản ghi khác, KÉO GIÃN ĐỀU (không căn chỉnh): {u_m:.4f}")
-    print(f"📏 SÀN: bản ghi khác, căn theo ký tự (wav2vec2): {f_m:.4f}  (± {float(np.std(floors)):.3f}, {len(floors)} cặp)")
-    gap = t_m - f_m
-    print(f"ℹ️ Phần Cond giảm được nhờ nội dung + thời điểm: {t_m:.3f} -> {f_m:.3f} (khoảng {gap:.3f}).")
-    print(f"   Ví dụ: Bridge có val Cond = x thì đã lấy được (mốc − x) / {gap:.3f} phần khoảng này.")
+    print(f"📏 Mốc 'đoán trung bình theo thời gian'            : {t_m:.4f}")
+    print(f"📏 1 bản ghi khác, KÉO GIÃN ĐỀU (không căn chỉnh)    : {u_m:.4f}")
+    print(f"📏 1 bản ghi khác, căn theo ký tự (wav2vec2)         : {L1m:.4f}")
+    print(f"📏 Trung bình 2 bản ghi khác, căn theo ký tự         : {L2m:.4f}")
+    print(f"📏 SÀN ngoại suy (trung bình vô hạn bản ghi, k -> ∞) : {F_inf:.4f}  ({len(l1s) // 3} câu × 3 bản ghi)")
+    ratio = L1m / max(L2m, 1e-9)
+    print(f"ℹ️ Kiểm tra mô hình nhiễu: L(1)/L(2) = {ratio:.3f} (nếu khác biệt chỉ là nhiễu riêng bản ghi thì ≈ 1.155)")
+    gap = t_m - F_inf
+    print(f"ℹ️ Khoảng Cond giảm được nhờ nội dung + thời điểm: {t_m:.3f} -> {F_inf:.3f} (khoảng {gap:.3f}).")
+    print(f"   Bridge có val Cond = x thì đã lấy được (mốc − x) / {gap:.3f} khoảng này"
+          f" (ví dụ x = 0.395 -> {(t_m - 0.395) / max(gap, 1e-9) * 100:.0f}%).")
+    print("   ⚠️ Ngoại suy giả định khác biệt giữa các bản ghi là nhiễu độc lập (L1 ∝ độ lệch chuẩn) — là ước lượng.")
     print("=" * 75)
 
 
